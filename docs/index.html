@@ -1,0 +1,684 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>PCM Transport — Linux FLAC/WAV Player with GTK, ALSA and DSP Studio</title>
+  <meta name="description" content="PCM Transport is a lightweight open-source Linux audio player with native FLAC playback through libFLAC, direct ALSA output, GTK interface, DSP Studio and transparent signal-path diagnostics.">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+
+  <meta name="google-site-verification" content="LaX8w2fVCSqvaE7lpvXAm_Dbg1c70HW8lHM2qU0yz1k">
+
+  <link rel="canonical" href="https://andreyberestov.github.io/pcm-transport/">
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="PCM Transport — Linux FLAC/WAV Player">
+  <meta property="og:description" content="A lightweight open-source Linux audio player with native FLAC playback, direct ALSA output, DSP Studio and transparent signal-path diagnostics.">
+  <meta property="og:url" content="https://andreyberestov.github.io/pcm-transport/">
+  <meta property="og:site_name" content="PCM Transport">
+  <meta property="og:image" content="https://raw.githubusercontent.com/andreyberestov/pcm-transport/refs/heads/main/screenshots/main.png">
+  <meta property="og:image:alt" content="PCM Transport main window showing playback controls and diagnostics">
+
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="PCM Transport — Linux FLAC/WAV Player">
+  <meta name="twitter:description" content="Native FLAC via libFLAC, direct ALSA output, DSP Studio and honest playback diagnostics for Linux.">
+  <meta name="twitter:image" content="https://raw.githubusercontent.com/andreyberestov/pcm-transport/refs/heads/main/screenshots/main.png">
+
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    "name": "PCM Transport",
+    "applicationCategory": "MultimediaApplication",
+    "operatingSystem": "Linux",
+    "softwareVersion": "0.9.77",
+    "description": "PCM Transport is a lightweight open-source Linux audio player with native FLAC playback through libFLAC, direct ALSA output, GTK interface, DSP Studio and transparent signal-path diagnostics.",
+    "author": {
+      "@type": "Person",
+      "name": "Andrey Berestov"
+    },
+    "license": "https://www.gnu.org/licenses/gpl-3.0.en.html",
+    "codeRepository": "https://github.com/andreyberestov/pcm-transport",
+    "url": "https://andreyberestov.github.io/pcm-transport/",
+    "downloadUrl": "https://github.com/andreyberestov/pcm-transport/releases",
+    "image": "https://raw.githubusercontent.com/andreyberestov/pcm-transport/refs/heads/main/screenshots/main.png",
+    "programmingLanguage": "C++",
+    "isAccessibleForFree": true
+  }
+  </script>
+
+  <style>
+    :root {
+      --bg: #f6f6f3;
+      --text: #1f2933;
+      --muted: #4b5563;
+      --soft: #6b7280;
+      --card: #ffffff;
+      --border: #e4e4df;
+      --code-bg: #17212b;
+      --code-text: #eef2f7;
+      --accent: #1f2933;
+      --icon: #2d9a84;
+      --icon-soft: rgba(45, 154, 132, 0.14);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+    }
+
+    a {
+      color: inherit;
+    }
+
+    .wrap {
+      max-width: 1080px;
+      margin: 0 auto;
+      padding: 48px 22px 64px;
+    }
+
+    .hero {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 22px;
+      padding: 44px;
+      box-shadow: 0 10px 30px rgba(0,0,0,.04);
+    }
+
+    .brand-title {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      margin: 0 0 14px;
+    }
+
+    .brand-mark {
+      width: clamp(42px, 6vw, 58px);
+      height: clamp(42px, 6vw, 58px);
+      flex: 0 0 auto;
+      border: 3px solid var(--accent);
+      border-radius: 16px;
+      background: #fff;
+      position: relative;
+      box-shadow: 0 6px 16px rgba(0,0,0,.04);
+    }
+
+    .brand-mark::before {
+      content: "";
+      position: absolute;
+      left: 38%;
+      top: 28%;
+      width: 0;
+      height: 0;
+      border-top: 11px solid transparent;
+      border-bottom: 11px solid transparent;
+      border-left: 17px solid var(--accent);
+    }
+
+    .brand-title h1 {
+      margin: 0;
+    }
+
+    .eyebrow {
+      margin: 0 0 12px;
+      color: var(--soft);
+      font-size: 14px;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      font-weight: 700;
+    }
+
+    h1 {
+      margin: 0 0 14px;
+      font-size: clamp(36px, 6vw, 58px);
+      line-height: 1.08;
+      letter-spacing: -0.04em;
+    }
+
+    h2 {
+      margin: 48px 0 14px;
+      font-size: 28px;
+      line-height: 1.25;
+      letter-spacing: -0.02em;
+    }
+
+    h3 {
+      margin: 0 0 8px;
+      font-size: 18px;
+    }
+
+    p {
+      margin: 0 0 16px;
+    }
+
+    .subtitle {
+      font-size: 20px;
+      color: var(--muted);
+      max-width: 820px;
+    }
+
+    .buttons {
+      margin-top: 30px;
+      display: flex;
+      gap: 14px;
+      flex-wrap: wrap;
+    }
+
+    .button {
+      display: inline-block;
+      padding: 12px 18px;
+      border-radius: 12px;
+      text-decoration: none;
+      font-weight: 700;
+      border: 1px solid var(--accent);
+      transition: transform .15s ease, box-shadow .15s ease, background .15s ease;
+    }
+
+    .button:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 8px 18px rgba(0,0,0,.08);
+    }
+
+    .primary {
+      background: var(--accent);
+      color: #fff;
+    }
+
+    .secondary {
+      color: var(--accent);
+      background: #fff;
+    }
+
+    .section-intro {
+      max-width: 820px;
+      color: var(--muted);
+    }
+
+    .text-panel {
+      margin-top: 24px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 24px;
+      box-shadow: 0 8px 22px rgba(0,0,0,.025);
+    }
+
+    .text-panel p:last-child {
+      margin-bottom: 0;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(235px, 1fr));
+      gap: 18px;
+      margin-top: 24px;
+    }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 22px;
+      box-shadow: 0 8px 22px rgba(0,0,0,.025);
+    }
+
+    .card p {
+      color: var(--muted);
+      margin-bottom: 0;
+    }
+
+    .feature-icon {
+      width: 46px;
+      height: 46px;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+      background: #fafaf7;
+      margin-bottom: 16px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 4px 10px rgba(0,0,0,.025);
+    }
+
+    .feature-icon svg {
+      width: 28px;
+      height: 28px;
+      display: block;
+      stroke: var(--icon);
+      fill: none;
+      stroke-width: 2.2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    .screenshots {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 22px;
+      margin-top: 24px;
+    }
+
+    .shot {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 14px;
+      box-shadow: 0 10px 28px rgba(0,0,0,.045);
+    }
+
+    .shot img {
+      display: block;
+      width: 100%;
+      height: auto;
+      border-radius: 12px;
+      border: 1px solid #d8d8d2;
+      background: #ecece8;
+    }
+
+    .shot figcaption {
+      margin-top: 12px;
+      color: var(--soft);
+      font-size: 14px;
+      text-align: center;
+    }
+
+    .build-box {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      margin-top: 24px;
+      overflow: hidden;
+      box-shadow: 0 8px 22px rgba(0,0,0,.025);
+    }
+
+    .build-row {
+      display: grid;
+      grid-template-columns: 220px 1fr;
+      border-top: 1px solid var(--border);
+    }
+
+    .build-row:first-child {
+      border-top: 0;
+    }
+
+    .build-label {
+      padding: 20px;
+      background: #fafaf7;
+      border-right: 1px solid var(--border);
+    }
+
+    .build-label strong {
+      display: block;
+      margin-bottom: 4px;
+    }
+
+    .build-label span {
+      display: block;
+      color: var(--soft);
+      font-size: 14px;
+      line-height: 1.45;
+    }
+
+    .build-content {
+      padding: 20px;
+      min-width: 0;
+    }
+
+    pre {
+      margin: 0;
+      overflow-x: auto;
+      background: var(--code-bg);
+      color: var(--code-text);
+      padding: 18px;
+      border-radius: 14px;
+      line-height: 1.55;
+      font-size: 14px;
+    }
+
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+
+    .note {
+      color: var(--soft);
+      font-size: 14px;
+      margin-top: 10px;
+      margin-bottom: 0;
+    }
+
+    .license-box,
+    .support-box {
+      margin-top: 48px;
+      background: #ffffff;
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 24px;
+      box-shadow: 0 8px 22px rgba(0,0,0,.025);
+    }
+
+    .license-box h2,
+    .support-box h2 {
+      margin-top: 0;
+      margin-bottom: 10px;
+    }
+
+    .license-box p,
+    .support-box p {
+      color: var(--muted);
+    }
+
+    .wallet {
+      display: block;
+      margin-top: 14px;
+      padding: 14px 16px;
+      background: #fafaf7;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow-wrap: anywhere;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      font-size: 14px;
+      color: var(--text);
+    }
+
+    .footer {
+      margin-top: 56px;
+      padding-top: 24px;
+      border-top: 1px solid var(--border);
+      color: var(--soft);
+      font-size: 14px;
+    }
+
+    .footer p {
+      margin: 0 0 6px;
+    }
+
+    .footer a,
+    .license-box a {
+      color: var(--text);
+      text-decoration: none;
+      border-bottom: 1px solid rgba(31, 41, 51, 0.25);
+    }
+
+    .footer a:hover,
+    .license-box a:hover {
+      border-bottom-color: rgba(31, 41, 51, 0.7);
+    }
+
+    @media (max-width: 760px) {
+      .wrap {
+        padding-top: 28px;
+      }
+
+      .hero {
+        padding: 28px;
+      }
+
+      .brand-title {
+        gap: 12px;
+      }
+
+      .brand-mark {
+        border-radius: 14px;
+      }
+
+      .screenshots {
+        grid-template-columns: 1fr;
+      }
+
+      .build-row {
+        grid-template-columns: 1fr;
+      }
+
+      .build-label {
+        border-right: 0;
+        border-bottom: 1px solid var(--border);
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <main class="wrap">
+    <section class="hero">
+      <p class="eyebrow">Open-source Linux audio player</p>
+
+      <div class="brand-title">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <h1>PCM Transport</h1>
+      </div>
+
+      <p class="subtitle">
+        A lightweight Linux desktop audio player focused on transparent PCM transport,
+        native FLAC playback, direct ALSA output, predictable DSP and honest signal-path diagnostics.
+      </p>
+
+      <div class="buttons">
+        <a class="button primary" href="https://github.com/andreyberestov/pcm-transport/releases">Download release</a>
+        <a class="button secondary" href="https://github.com/andreyberestov/pcm-transport">View on GitHub</a>
+      </div>
+    </section>
+
+    <h2>Screenshots</h2>
+    <p class="section-intro">
+      PCM Transport keeps the interface compact while exposing the active playback path,
+      DSP state, level/clip diagnostics and processing controls.
+    </p>
+
+    <div class="screenshots">
+      <figure class="shot">
+        <img
+          src="https://raw.githubusercontent.com/andreyberestov/pcm-transport/refs/heads/main/screenshots/main.png"
+          alt="PCM Transport main window showing playback controls and diagnostics"
+          loading="lazy">
+        <figcaption>Main playback window</figcaption>
+      </figure>
+
+      <figure class="shot">
+        <img
+          src="https://raw.githubusercontent.com/andreyberestov/pcm-transport/refs/heads/main/screenshots/dsp.png"
+          alt="PCM Transport DSP Studio window with bass, treble, Deep Bass and diagnostics"
+          loading="lazy">
+        <figcaption>DSP Studio</figcaption>
+      </figure>
+    </div>
+
+    <h2>What it is</h2>
+    <p class="section-intro">
+      PCM Transport is a compact Linux desktop audio player focused on direct PCM playback,
+      transparent signal-path reporting, native FLAC decoding and optional DSP processing.
+    </p>
+
+    <div class="grid">
+      <div class="card">
+        <div class="feature-icon" aria-hidden="true">
+          <svg viewBox="0 0 32 32">
+            <path d="M4 16h3M10 16h2M15 16h2M20 16h2M25 16h3"/>
+            <path d="M8 11v10M13 7v18M18 10v12M23 5v22"/>
+          </svg>
+        </div>
+        <h3>Native FLAC playback</h3>
+        <p>Uses libFLAC for native FLAC decoding, with a clean playback path when no resampling or bit-depth conversion is required.</p>
+      </div>
+
+      <div class="card">
+        <div class="feature-icon" aria-hidden="true">
+          <svg viewBox="0 0 32 32">
+            <rect x="7" y="5" width="18" height="22" rx="3"/>
+            <path d="M11 9h2M19 9h2M11 14h2M19 14h2M11 19h2M19 19h2M11 24h2M19 24h2"/>
+          </svg>
+        </div>
+        <h3>Additional formats via FFmpeg</h3>
+        <p>Uses FFmpeg and FFprobe at runtime for MP3, M4A, WAV, APE, WV, metadata probing and conversion-based processing paths.</p>
+      </div>
+
+      <div class="card">
+        <div class="feature-icon" aria-hidden="true">
+          <svg viewBox="0 0 32 32">
+            <path d="M6 19h5l7 6V7l-7 6H6z"/>
+            <path d="M22 12c1.2 1 2 2.4 2 4s-.8 3-2 4"/>
+            <path d="M25 9c2 1.8 3 4.2 3 7s-1 5.2-3 7"/>
+          </svg>
+        </div>
+        <h3>Direct ALSA output</h3>
+        <p>Designed for Linux playback with GTK 3 and ALSA, without requiring a mandatory PulseAudio or PipeWire layer.</p>
+      </div>
+
+      <div class="card">
+        <div class="feature-icon" aria-hidden="true">
+          <svg viewBox="0 0 32 32">
+            <circle cx="7" cy="16" r="3"/>
+            <circle cx="16" cy="8" r="3"/>
+            <circle cx="25" cy="16" r="3"/>
+            <circle cx="16" cy="24" r="3"/>
+            <path d="M10 15l4-5M18 10l5 5M23 17l-5 5M14 22l-4-5"/>
+          </svg>
+        </div>
+        <h3>Transparent signal path</h3>
+        <p>Shows the real active playback chain, including ALSA negotiation, FLAC/libFLAC notes and possible conversion stages.</p>
+      </div>
+
+      <div class="card">
+        <div class="feature-icon" aria-hidden="true">
+          <svg viewBox="0 0 32 32">
+            <path d="M6 9h20M6 16h20M6 23h20"/>
+            <circle cx="12" cy="9" r="3"/>
+            <circle cx="20" cy="16" r="3"/>
+            <circle cx="15" cy="23" r="3"/>
+          </svg>
+        </div>
+        <h3>DSP Studio</h3>
+        <p>Includes Baxandall-like bass/treble, Deep Bass, soft volume, automatic Pre-EQ Headroom and optional processing rules.</p>
+      </div>
+
+      <div class="card">
+        <div class="feature-icon" aria-hidden="true">
+          <svg viewBox="0 0 32 32">
+            <path d="M7 24V14M13 24V10M19 24V6M25 24V17"/>
+            <path d="M5 24h22"/>
+            <path d="M8 7l5 3 6-5 5 4"/>
+          </svg>
+        </div>
+        <h3>Diagnostics and indicators</h3>
+        <p>Provides level metering, real clip detection, SIMD availability, self-test status and usage counters for runtime diagnostics.</p>
+      </div>
+    </div>
+
+    <h2>Why another Linux audio player?</h2>
+    <div class="text-panel">
+      <p>
+        PCM Transport is built for users who want a small Linux FLAC player with a visible signal path,
+        native libFLAC decoding, direct ALSA output and optional DSP that can be fully bypassed.
+      </p>
+      <p>
+        The goal is not to replace large music library managers. PCM Transport is closer to a focused
+        playback tool for local lossless audio: simple controls, honest runtime reporting and a clear
+        distinction between native playback, conversion paths and optional processing.
+      </p>
+      <p>
+        It may be useful for Linux users interested in a lightweight open-source audio player,
+        an ALSA-based FLAC player, a GTK desktop player, or a compact tool for experimenting with
+        transparent DSP and playback diagnostics.
+      </p>
+    </div>
+
+    <h2>Build and run</h2>
+    <p class="section-intro">
+      Build instructions follow the current project README. Install the required development packages,
+      build with CMake, then run the generated binary.
+    </p>
+
+    <div class="build-box">
+      <div class="build-row">
+        <div class="build-label">
+          <strong>Arch Linux</strong>
+          <span>Build dependencies</span>
+        </div>
+        <div class="build-content">
+          <pre><code>sudo pacman -S --needed base-devel cmake pkgconf alsa-lib flac gtk3 ffmpeg</code></pre>
+        </div>
+      </div>
+
+      <div class="build-row">
+        <div class="build-label">
+          <strong>Debian / Ubuntu</strong>
+          <span>Build dependencies</span>
+        </div>
+        <div class="build-content">
+          <pre><code>sudo apt install build-essential cmake pkg-config \
+    libasound2-dev libflac++-dev libgtk-3-dev ffmpeg</code></pre>
+        </div>
+      </div>
+
+      <div class="build-row">
+        <div class="build-label">
+          <strong>Build</strong>
+          <span>Configure and compile</span>
+        </div>
+        <div class="build-content">
+          <pre><code>cmake -S . -B build
+cmake --build build -j</code></pre>
+        </div>
+      </div>
+
+      <div class="build-row">
+        <div class="build-label">
+          <strong>Run</strong>
+          <span>Start the player</span>
+        </div>
+        <div class="build-content">
+          <pre><code>./build/pcm_transport</code></pre>
+        </div>
+      </div>
+    </div>
+
+    <p class="note">
+      Runtime dependencies include ALSA, GTK 3, libFLAC++, FFmpeg and FFprobe.
+      Native FLAC playback can work without FFmpeg. FFmpeg/FFprobe are required for MP3, M4A, WAV, APE, WV,
+      metadata probing and FLAC processing paths involving conversion.
+    </p>
+
+    <h2>Project goals</h2>
+    <p>
+      The project is developed as a small, understandable and conservative Linux player:
+      stable playback first, transparent signal path, predictable DSP behavior and no hidden processing.
+    </p>
+
+    <h2>Source code</h2>
+    <p>
+      Source code, changelog and releases are available on GitHub:
+      <a href="https://github.com/andreyberestov/pcm-transport">github.com/andreyberestov/pcm-transport</a>.
+    </p>
+
+    <section class="license-box">
+      <h2>License</h2>
+      <p>
+        PCM Transport is released under the GNU General Public License v3.0.
+        See the <a href="https://github.com/andreyberestov/pcm-transport/blob/main/LICENSE">LICENSE</a>
+        file in the repository for details.
+      </p>
+    </section>
+
+    <section class="support-box">
+      <h2>Support</h2>
+      <p>
+        PCM Transport is an independent open-source project. If you enjoy PCM Transport, you can buy the author a cup of coffee.
+      </p>
+      <span class="wallet">ETH (ERC-20): 0x37385DA1388F2921583d4750FB44Def7D76cAb23</span>
+    </section>
+
+    <footer class="footer">
+      <p>PCM Transport is an open-source Linux audio player project by Andrey Berestov.</p>
+      <p>Licensed under GNU GPL v3.0.</p>
+      <p>Feedback and bug reports: <a href="https://github.com/andreyberestov/pcm-transport/issues">GitHub Issues</a></p>
+      <p>© 2026 Andrey Berestov</p>
+    </footer>
+  </main>
+</body>
+</html>

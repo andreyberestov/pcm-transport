@@ -2926,11 +2926,6 @@ void GtkPlayerWindow::open_about_dialog() {
     gtk_label_set_xalign(GTK_LABEL(author), 0.5f);
     gtk_label_set_justify(GTK_LABEL(author), GTK_JUSTIFY_CENTER);
 
-    GtkWidget* email = gtk_label_new("pcmtransport@proton.me");
-    gtk_label_set_xalign(GTK_LABEL(email), 0.5f);
-    gtk_label_set_justify(GTK_LABEL(email), GTK_JUSTIFY_CENTER);
-    gtk_label_set_selectable(GTK_LABEL(email), TRUE);
-
     GtkWidget* website = gtk_label_new(nullptr);
     gtk_label_set_markup(GTK_LABEL(website), "<a href=\"https://andreyberestov.github.io/pcm-transport/\">https://andreyberestov.github.io/pcm-transport/</a>");
     gtk_label_set_xalign(GTK_LABEL(website), 0.5f);
@@ -2945,7 +2940,6 @@ void GtkPlayerWindow::open_about_dialog() {
     gtk_box_pack_start(GTK_BOX(box), title, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(box), subtitle, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(box), author, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(box), email, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(box), website, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(box), details, FALSE, FALSE, 0);
     gtk_widget_show_all(dialog);

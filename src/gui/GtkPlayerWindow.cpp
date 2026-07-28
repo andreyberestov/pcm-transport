@@ -527,8 +527,25 @@ enum PlaylistColumns {
     COL_ARTIST,
     COL_TITLE,
     COL_SOURCE,
+    COL_SEARCH_FOLDED,
     COL_COUNT
 };
+
+std::string build_playlist_search_folded(const std::string& artist, const std::string& title) {
+    gchar* folded_artist = g_utf8_casefold(artist.c_str(), -1);
+    gchar* folded_title = g_utf8_casefold(title.c_str(), -1);
+    std::string result;
+    if (folded_artist != nullptr) {
+        result.append(folded_artist);
+        g_free(folded_artist);
+    }
+    result.push_back('\n');
+    if (folded_title != nullptr) {
+        result.append(folded_title);
+        g_free(folded_title);
+    }
+    return result;
+}
 
 constexpr std::size_t kMetadataProbeWorkerCount = 3;
 constexpr std::size_t kMetadataDisplayRefreshStride = 8;
@@ -2267,10 +2284,6 @@ struct GtkPlayerWindow::SearchDelegate final : PlaylistSearchController::Delegat
 
     explicit SearchDelegate(GtkPlayerWindow* window) : self(window) {}
 
-    GtkWidget* window() override {
-        return self != nullptr ? self->window_ : nullptr;
-    }
-
     GtkListStore* playlist_store() override {
         return self != nullptr ? self->playlist_store_ : nullptr;
     }
@@ -2279,43 +2292,12 @@ struct GtkPlayerWindow::SearchDelegate final : PlaylistSearchController::Delegat
         return self != nullptr ? self->playlist_view_ : nullptr;
     }
 
-    GtkWidget* playlist_scrolled() override {
-        return self != nullptr ? self->playlist_scrolled_ : nullptr;
-    }
-
-    int col_artist() const override {
-        return COL_ARTIST;
-    }
-
-    int col_title() const override {
-        return COL_TITLE;
+    int col_search_folded() const override {
+        return COL_SEARCH_FOLDED;
     }
 
     bool ui_closing() const override {
         return self == nullptr || self->ui_closing_;
-    }
-
-    void select_playlist_row(std::size_t index) override {
-        if (self != nullptr) {
-            self->select_playlist_row(index);
-        }
-    }
-
-    void select_and_scroll_playlist_path(GtkTreePath* path, bool center_vertically) override {
-        if (self == nullptr || self->playlist_view_ == nullptr || path == nullptr) {
-            return;
-        }
-        GtkTreeView* view = GTK_TREE_VIEW(self->playlist_view_);
-        GtkTreeSelection* selection = gtk_tree_view_get_selection(view);
-        gtk_tree_selection_unselect_all(selection);
-        gtk_tree_selection_select_path(selection, path);
-        gtk_tree_view_set_cursor(view, path, nullptr, FALSE);
-        gtk_tree_view_scroll_to_cell(view,
-                                     path,
-                                     nullptr,
-                                     TRUE,
-                                     center_vertically ? 0.5f : 0.0f,
-                                     0.0f);
     }
 };
 
@@ -2364,7 +2346,7 @@ GtkPlayerWindow::GtkPlayerWindow(std::size_t transport_buffer_ms)
 GtkPlayerWindow::~GtkPlayerWindow() {
     ui_closing_ = true;
     if (search_controller_ != nullptr) {
-        search_controller_->invalidate_ui();
+        search_controller_->shutdown();
     }
     search_controller_.reset();
     search_delegate_.reset();
@@ -2486,6 +2468,7 @@ void GtkPlayerWindow::build_ui(GtkApplication* app) {
         ".display-track { font-size: 18px; }"
         ".display-time { font-size: 24px; font-weight: bold; }"
         ".transport-button { min-height: 42px; min-width: 46px; font-weight: bold; padding: 2px 8px; }"
+        ".playlist-search-entry { border-radius: 6px; min-height: 32px; }"
         ".transport-button-thin { min-height: 19px; min-width: 86px; font-weight: bold; padding: 1px 8px; }"
         ".transport-icon { font-size: 18px; color: #25313a; }"
         "treeview.view:selected, treeview.view:selected:focus { background-color: #6f7780; color: #ffffff; }"
@@ -2678,10 +2661,16 @@ void GtkPlayerWindow::build_ui(GtkApplication* app) {
     GtkWidget* content_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_box_pack_start(GTK_BOX(outer), content_row, TRUE, TRUE, 0);
 
-    GtkWidget* playlist_panel = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    GtkWidget* playlist_panel = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_box_pack_start(GTK_BOX(content_row), playlist_panel, TRUE, TRUE, 0);
 
-    playlist_store_ = gtk_list_store_new(COL_COUNT, G_TYPE_INT, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING);
+    playlist_store_ = gtk_list_store_new(COL_COUNT,
+                                          G_TYPE_INT,
+                                          G_TYPE_STRING,
+                                          G_TYPE_STRING,
+                                          G_TYPE_STRING,
+                                          G_TYPE_STRING,
+                                          G_TYPE_STRING);
     search_controller_->install_in_panel(GTK_BOX(playlist_panel));
 
     GtkWidget* scrolled = gtk_scrolled_window_new(nullptr, nullptr);
@@ -2883,7 +2872,7 @@ void GtkPlayerWindow::on_window_destroy(GtkWidget*, gpointer user_data) {
         self->controls_wrap_ = nullptr;
         self->soft_volume_scale_ = nullptr;
         if (self->search_controller_ != nullptr) {
-            self->search_controller_->invalidate_ui();
+            self->search_controller_->shutdown();
         }
         self->playlist_view_ = nullptr;
         self->playlist_store_ = nullptr;
@@ -3303,17 +3292,17 @@ gboolean GtkPlayerWindow::on_pending_seek_timer(gpointer user_data) {
     return G_SOURCE_REMOVE;
 }
 
-void GtkPlayerWindow::on_playlist_row_activated(GtkTreeView*, GtkTreePath* path, GtkTreeViewColumn*, gpointer user_data) {
+void GtkPlayerWindow::on_playlist_row_activated(GtkTreeView* view, GtkTreePath* path, GtkTreeViewColumn*, gpointer user_data) {
     auto* self = static_cast<GtkPlayerWindow*>(user_data);
-    const int* indices = gtk_tree_path_get_indices(path);
-    if (indices == nullptr) {
+    if (self == nullptr || view == nullptr || path == nullptr) {
         return;
     }
-    const int index = indices[0];
-    if (index < 0) {
+    std::size_t index = 0;
+    if (!patches::playlist_index_from_view_path(view, path, COL_INDEX, &index) ||
+        index >= self->playlist_.size()) {
         return;
     }
-    self->play_track_index(static_cast<std::size_t>(index));
+    self->play_track_index(index);
 }
 
 std::uint32_t GtkPlayerWindow::target_sample_rate_for(std::uint32_t source_rate) const {
@@ -5101,8 +5090,7 @@ void GtkPlayerWindow::start_current_track(bool restart_if_paused) {
     if (!playback_available()) {
         return;
     }
-    update_playlist_selection_from_ui();
-    if (playlist_.empty()) {
+    if (playlist_.empty() || current_track_index_ >= playlist_.size()) {
         return;
     }
 
@@ -7238,12 +7226,14 @@ void GtkPlayerWindow::rebuild_playlist_view() {
         const std::string artist = safe_utf8_for_display(entry.performer);
         const std::string title = safe_utf8_for_display(entry.title);
         const std::string source = safe_utf8_for_display(entry.source_label);
+        const std::string search_folded = build_playlist_search_folded(artist, title);
         gtk_list_store_set(playlist_store_, &iter,
                            COL_INDEX, static_cast<int>(i),
                            COL_TRACKNO, trackno.c_str(),
                            COL_ARTIST, artist.c_str(),
                            COL_TITLE, title.c_str(),
                            COL_SOURCE, source.c_str(),
+                           COL_SEARCH_FOLDED, search_folded.c_str(),
                            -1);
     }
     if (search_controller_ != nullptr) {
@@ -7271,12 +7261,14 @@ void GtkPlayerWindow::update_playlist_row(std::size_t index) {
         title += " [unavailable]";
     }
     const std::string source = safe_utf8_for_display(entry.source_label);
+    const std::string search_folded = build_playlist_search_folded(artist, title);
     gtk_list_store_set(playlist_store_, &iter,
                        COL_INDEX, static_cast<int>(index),
                        COL_TRACKNO, trackno.c_str(),
                        COL_ARTIST, artist.c_str(),
                        COL_TITLE, title.c_str(),
                        COL_SOURCE, source.c_str(),
+                       COL_SEARCH_FOLDED, search_folded.c_str(),
                        -1);
 }
 

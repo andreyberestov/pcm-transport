@@ -2,6 +2,8 @@
 
 #include <gtk/gtk.h>
 
+#include <cstddef>
+
 namespace pcmtp {
 
 class GtkPlayerWindow;
@@ -15,6 +17,10 @@ bool find_playlist_view_path_for_index(GtkTreeView* playlist_view,
                                        std::size_t index,
                                        int index_column,
                                        GtkTreePath** out_path);
+bool playlist_index_from_view_path(GtkTreeView* playlist_view,
+                                   GtkTreePath* path,
+                                   int index_column,
+                                   std::size_t* out_index);
 
 } // namespace patches
 } // namespace pcmtp

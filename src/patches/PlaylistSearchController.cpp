@@ -1,9 +1,14 @@
 #include "pcmtp/patches/PlaylistSearchController.hpp"
 
+#include <cstring>
+#include <string>
+
 #include <gtk/gtk.h>
 
 namespace pcmtp {
 namespace {
+
+constexpr guint kRefilterDebounceMs = 50;
 
 std::string utf8_casefold_copy(const std::string& text) {
     gchar* folded = g_utf8_casefold(text.c_str(), -1);
@@ -15,43 +20,25 @@ std::string utf8_casefold_copy(const std::string& text) {
     return result;
 }
 
-bool utf8_contains_casefold(const std::string& haystack, const std::string& needle_folded) {
-    if (needle_folded.empty()) {
-        return true;
-    }
-    return utf8_casefold_copy(haystack).find(needle_folded) != std::string::npos;
-}
-
-bool utf8_starts_with_casefold(const std::string& haystack, const std::string& prefix_folded) {
-    if (prefix_folded.empty()) {
-        return true;
-    }
-    const std::string hay_folded = utf8_casefold_copy(haystack);
-    return hay_folded.size() >= prefix_folded.size() &&
-           hay_folded.compare(0, prefix_folded.size(), prefix_folded) == 0;
-}
-
-bool playlist_row_matches_typeahead(const char* artist, const char* title, const std::string& key_folded) {
-    const std::string artist_text = artist != nullptr ? artist : "";
-    const std::string title_text = title != nullptr ? title : "";
-    return utf8_starts_with_casefold(artist_text, key_folded) ||
-           utf8_starts_with_casefold(title_text, key_folded) ||
-           utf8_contains_casefold(artist_text, key_folded) ||
-           utf8_contains_casefold(title_text, key_folded);
-}
-
 } // namespace
 
 PlaylistSearchController::PlaylistSearchController(Delegate& delegate) : delegate_(delegate) {}
+
+PlaylistSearchController::~PlaylistSearchController() {
+    shutdown();
+}
 
 void PlaylistSearchController::install_in_panel(GtkBox* playlist_panel) {
     if (playlist_panel == nullptr) {
         return;
     }
 
+    gtk_box_set_spacing(playlist_panel, 10);
+
     search_entry_ = gtk_search_entry_new();
     gtk_entry_set_placeholder_text(GTK_ENTRY(search_entry_), "Search title or artist");
-    gtk_widget_set_margin_bottom(search_entry_, 2);
+    GtkStyleContext* search_style = gtk_widget_get_style_context(search_entry_);
+    gtk_style_context_add_class(search_style, "playlist-search-entry");
     gtk_box_pack_start(playlist_panel, search_entry_, FALSE, FALSE, 0);
 
     GtkListStore* store = delegate_.playlist_store();
@@ -63,31 +50,15 @@ void PlaylistSearchController::install_in_panel(GtkBox* playlist_panel) {
                                                nullptr);
     }
 
-    g_signal_connect(search_entry_, "changed", G_CALLBACK(PlaylistSearchController::on_search_changed), this);
-
-    GtkWidget* window = delegate_.window();
-    typeahead_popup_ = gtk_window_new(GTK_WINDOW_POPUP);
-    gtk_window_set_decorated(GTK_WINDOW(typeahead_popup_), FALSE);
-    gtk_window_set_resizable(GTK_WINDOW(typeahead_popup_), FALSE);
-    gtk_window_set_skip_taskbar_hint(GTK_WINDOW(typeahead_popup_), TRUE);
-    gtk_window_set_skip_pager_hint(GTK_WINDOW(typeahead_popup_), TRUE);
-    gtk_window_set_type_hint(GTK_WINDOW(typeahead_popup_), GDK_WINDOW_TYPE_HINT_TOOLTIP);
-    if (window != nullptr) {
-        gtk_window_set_transient_for(GTK_WINDOW(typeahead_popup_), GTK_WINDOW(window));
-    }
-    gtk_container_set_border_width(GTK_CONTAINER(typeahead_popup_), 0);
-
-    typeahead_entry_ = gtk_entry_new();
-    gtk_entry_set_icon_from_icon_name(GTK_ENTRY(typeahead_entry_),
-                                      GTK_ENTRY_ICON_PRIMARY,
-                                      "edit-find-symbolic");
-    gtk_editable_set_editable(GTK_EDITABLE(typeahead_entry_), FALSE);
-    gtk_widget_set_can_focus(typeahead_entry_, FALSE);
-    gtk_container_add(GTK_CONTAINER(typeahead_popup_), typeahead_entry_);
+    search_changed_handler_id_ =
+        g_signal_connect(search_entry_, "changed", G_CALLBACK(PlaylistSearchController::on_search_changed), this);
+    search_key_press_handler_id_ = g_signal_connect(search_entry_,
+                                                    "key-press-event",
+                                                    G_CALLBACK(PlaylistSearchController::on_search_entry_key_press),
+                                                    this);
 }
 
 void PlaylistSearchController::clear_search() {
-    reset_typeahead();
     filter_text_.clear();
     if (search_entry_ != nullptr) {
         gtk_entry_set_text(GTK_ENTRY(search_entry_), "");
@@ -96,13 +67,33 @@ void PlaylistSearchController::clear_search() {
 }
 
 void PlaylistSearchController::refilter() {
-    if (filter_ != nullptr) {
+    if (filter_ != nullptr && !invalidated_) {
         gtk_tree_model_filter_refilter(filter_);
     }
 }
 
-gboolean PlaylistSearchController::on_key_press(GtkWidget* widget, GdkEventKey* event) {
-    if (event == nullptr || delegate_.ui_closing()) {
+void PlaylistSearchController::schedule_refilter() {
+    if (invalidated_) {
+        return;
+    }
+    if (refilter_timeout_id_ != 0) {
+        g_source_remove(refilter_timeout_id_);
+    }
+    refilter_timeout_id_ = g_timeout_add(kRefilterDebounceMs, PlaylistSearchController::on_refilter_timeout, this);
+}
+
+gboolean PlaylistSearchController::on_refilter_timeout(gpointer user_data) {
+    auto* self = static_cast<PlaylistSearchController*>(user_data);
+    if (self == nullptr || self->invalidated_) {
+        return G_SOURCE_REMOVE;
+    }
+    self->refilter_timeout_id_ = 0;
+    self->refilter();
+    return G_SOURCE_REMOVE;
+}
+
+gboolean PlaylistSearchController::on_playlist_key_press(GtkWidget* widget, GdkEventKey* event) {
+    if (event == nullptr || invalidated_ || delegate_.ui_closing()) {
         return FALSE;
     }
     if (search_entry_ != nullptr && gtk_widget_is_focus(search_entry_)) {
@@ -110,30 +101,29 @@ gboolean PlaylistSearchController::on_key_press(GtkWidget* widget, GdkEventKey* 
     }
 
     if (event->keyval == GDK_KEY_Escape) {
-        if (!typeahead_text_.empty()) {
-            reset_typeahead();
+        if (!filter_text_.empty()) {
+            clear_search();
             return TRUE;
         }
         return FALSE;
     }
 
     if (event->keyval == GDK_KEY_BackSpace) {
-        if (typeahead_text_.empty()) {
+        focus_search_entry();
+        if (search_entry_ == nullptr) {
             return FALSE;
         }
-        const char* text = typeahead_text_.c_str();
-        const char* prev = g_utf8_find_prev_char(text, text + typeahead_text_.size());
+        const gchar* text = gtk_entry_get_text(GTK_ENTRY(search_entry_));
+        if (text == nullptr || *text == '\0') {
+            return TRUE;
+        }
+        const char* end = text + std::strlen(text);
+        const char* prev = g_utf8_find_prev_char(text, end);
+        std::string next;
         if (prev != nullptr) {
-            typeahead_text_.resize(static_cast<std::size_t>(prev - text));
-        } else {
-            typeahead_text_.clear();
+            next.assign(text, static_cast<std::size_t>(prev - text));
         }
-        if (typeahead_timeout_id_ != 0) {
-            g_source_remove(typeahead_timeout_id_);
-        }
-        typeahead_timeout_id_ = g_timeout_add(1500, PlaylistSearchController::on_typeahead_clear_timeout, this);
-        update_typeahead_popup();
-        apply_typeahead_selection();
+        gtk_entry_set_text(GTK_ENTRY(search_entry_), next.c_str());
         return TRUE;
     }
 
@@ -151,166 +141,96 @@ gboolean PlaylistSearchController::on_key_press(GtkWidget* widget, GdkEventKey* 
     if (written <= 0) {
         return FALSE;
     }
-    typeahead_text_.append(buffer, static_cast<std::size_t>(written));
-    if (typeahead_timeout_id_ != 0) {
-        g_source_remove(typeahead_timeout_id_);
-    }
-    typeahead_timeout_id_ = g_timeout_add(1500, PlaylistSearchController::on_typeahead_clear_timeout, this);
-    update_typeahead_popup();
-    apply_typeahead_selection();
+    buffer[written] = '\0';
+    focus_search_entry();
+    append_to_search_entry(buffer);
     (void)widget;
     return TRUE;
 }
 
-void PlaylistSearchController::invalidate_ui() {
-    if (typeahead_timeout_id_ != 0) {
-        g_source_remove(typeahead_timeout_id_);
-        typeahead_timeout_id_ = 0;
+gboolean PlaylistSearchController::on_search_entry_key_press(GtkWidget* widget, GdkEventKey* event, gpointer user_data) {
+    auto* self = static_cast<PlaylistSearchController*>(user_data);
+    if (self == nullptr || event == nullptr || self->invalidated_) {
+        return FALSE;
     }
-    filter_ = nullptr;
+    if (event->keyval == GDK_KEY_Escape) {
+        if (!self->filter_text_.empty()) {
+            self->clear_search();
+            return TRUE;
+        }
+        return FALSE;
+    }
+    (void)widget;
+    return FALSE;
+}
+
+void PlaylistSearchController::shutdown() {
+    invalidated_ = true;
+    if (refilter_timeout_id_ != 0) {
+        g_source_remove(refilter_timeout_id_);
+        refilter_timeout_id_ = 0;
+    }
+    if (search_entry_ != nullptr) {
+        if (search_changed_handler_id_ != 0) {
+            g_signal_handler_disconnect(search_entry_, search_changed_handler_id_);
+            search_changed_handler_id_ = 0;
+        }
+        if (search_key_press_handler_id_ != 0) {
+            g_signal_handler_disconnect(search_entry_, search_key_press_handler_id_);
+            search_key_press_handler_id_ = 0;
+        }
+    }
+    if (filter_ != nullptr) {
+        gtk_tree_model_filter_set_visible_func(filter_, nullptr, nullptr, nullptr);
+        filter_ = nullptr;
+    }
     search_entry_ = nullptr;
-    typeahead_popup_ = nullptr;
-    typeahead_entry_ = nullptr;
 }
 
 void PlaylistSearchController::on_search_changed(GtkEditable* editable, gpointer user_data) {
     auto* self = static_cast<PlaylistSearchController*>(user_data);
-    if (self == nullptr) {
+    if (self == nullptr || self->invalidated_) {
         return;
     }
     const gchar* text = gtk_entry_get_text(GTK_ENTRY(editable));
     self->filter_text_ = text != nullptr ? utf8_casefold_copy(text) : std::string();
-    self->refilter();
+    self->schedule_refilter();
 }
 
 gboolean PlaylistSearchController::on_filter_visible(GtkTreeModel* model, GtkTreeIter* iter, gpointer user_data) {
     auto* self = static_cast<PlaylistSearchController*>(user_data);
-    if (self == nullptr || self->filter_text_.empty()) {
+    if (self == nullptr || self->invalidated_ || self->filter_text_.empty()) {
         return TRUE;
     }
-    gchar* artist = nullptr;
-    gchar* title = nullptr;
+
+    gchar* folded = nullptr;
     gtk_tree_model_get(model,
                        iter,
-                       self->delegate_.col_artist(), &artist,
-                       self->delegate_.col_title(), &title,
+                       self->delegate_.col_search_folded(),
+                       &folded,
                        -1);
-    const bool match = utf8_contains_casefold(artist != nullptr ? artist : "", self->filter_text_) ||
-                       utf8_contains_casefold(title != nullptr ? title : "", self->filter_text_);
-    g_free(artist);
-    g_free(title);
+    const bool match = folded != nullptr &&
+                       std::strstr(folded, self->filter_text_.c_str()) != nullptr;
+    g_free(folded);
     return match ? TRUE : FALSE;
 }
 
-void PlaylistSearchController::update_typeahead_popup() {
-    GtkWidget* scrolled = delegate_.playlist_scrolled();
-    if (typeahead_popup_ == nullptr || typeahead_entry_ == nullptr || scrolled == nullptr) {
+void PlaylistSearchController::focus_search_entry() {
+    if (search_entry_ == nullptr) {
         return;
     }
-    if (typeahead_text_.empty()) {
-        gtk_widget_hide(typeahead_popup_);
-        return;
-    }
-
-    gtk_entry_set_text(GTK_ENTRY(typeahead_entry_), typeahead_text_.c_str());
-    gtk_widget_show_all(typeahead_popup_);
-
-    if (!gtk_widget_get_realized(scrolled)) {
-        return;
-    }
-
-    GtkAllocation allocation{};
-    gtk_widget_get_allocation(scrolled, &allocation);
-
-    gint anchor_x = 0;
-    gint anchor_y = 0;
-    GdkWindow* anchor_window = gtk_widget_get_window(scrolled);
-    if (anchor_window == nullptr) {
-        return;
-    }
-    gdk_window_get_origin(anchor_window, &anchor_x, &anchor_y);
-
-    GdkRectangle anchor_rect{};
-    anchor_rect.x = anchor_x;
-    anchor_rect.y = anchor_y;
-    anchor_rect.width = allocation.width;
-    anchor_rect.height = allocation.height;
-
-    if (!gtk_widget_get_realized(typeahead_popup_)) {
-        gtk_widget_realize(typeahead_popup_);
-    }
-    GdkWindow* popup_window = gtk_widget_get_window(typeahead_popup_);
-    if (popup_window == nullptr) {
-        return;
-    }
-
-    gdk_window_move_to_rect(popup_window,
-                            &anchor_rect,
-                            GDK_GRAVITY_SOUTH_EAST,
-                            GDK_GRAVITY_SOUTH_EAST,
-                            static_cast<GdkAnchorHints>(GDK_ANCHOR_SLIDE | GDK_ANCHOR_FLIP_X | GDK_ANCHOR_FLIP_Y),
-                            -4,
-                            -4);
+    gtk_widget_grab_focus(search_entry_);
 }
 
-void PlaylistSearchController::reset_typeahead() {
-    typeahead_text_.clear();
-    if (typeahead_timeout_id_ != 0) {
-        g_source_remove(typeahead_timeout_id_);
-        typeahead_timeout_id_ = 0;
-    }
-    update_typeahead_popup();
-}
-
-gboolean PlaylistSearchController::on_typeahead_clear_timeout(gpointer user_data) {
-    auto* self = static_cast<PlaylistSearchController*>(user_data);
-    if (self == nullptr) {
-        return G_SOURCE_REMOVE;
-    }
-    self->typeahead_timeout_id_ = 0;
-    self->typeahead_text_.clear();
-    self->update_typeahead_popup();
-    return G_SOURCE_REMOVE;
-}
-
-void PlaylistSearchController::apply_typeahead_selection() {
-    if (typeahead_text_.empty()) {
+void PlaylistSearchController::append_to_search_entry(const char* text) {
+    if (search_entry_ == nullptr || text == nullptr || *text == '\0') {
         return;
     }
-    GtkWidget* view_widget = delegate_.playlist_view();
-    if (view_widget == nullptr) {
-        return;
-    }
-
-    const std::string key_folded = utf8_casefold_copy(typeahead_text_);
-    GtkTreeModel* model = gtk_tree_view_get_model(GTK_TREE_VIEW(view_widget));
-    if (model == nullptr) {
-        return;
-    }
-
-    GtkTreeIter iter;
-    if (!gtk_tree_model_get_iter_first(model, &iter)) {
-        return;
-    }
-
-    const int col_artist = delegate_.col_artist();
-    const int col_title = delegate_.col_title();
-    do {
-        gchar* artist = nullptr;
-        gchar* title = nullptr;
-        gtk_tree_model_get(model, &iter, col_artist, &artist, col_title, &title, -1);
-        const bool match = playlist_row_matches_typeahead(artist, title, key_folded);
-        g_free(artist);
-        g_free(title);
-        if (!match) {
-            continue;
-        }
-
-        GtkTreePath* path = gtk_tree_model_get_path(model, &iter);
-        delegate_.select_and_scroll_playlist_path(path, true);
-        gtk_tree_path_free(path);
-        return;
-    } while (gtk_tree_model_iter_next(model, &iter));
+    const gchar* current = gtk_entry_get_text(GTK_ENTRY(search_entry_));
+    std::string next = current != nullptr ? current : std::string();
+    next.append(text);
+    gtk_entry_set_text(GTK_ENTRY(search_entry_), next.c_str());
+    gtk_editable_set_position(GTK_EDITABLE(search_entry_), -1);
 }
 
 } // namespace pcmtp

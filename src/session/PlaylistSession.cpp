@@ -1,15 +1,25 @@
 #include "pcmtp/session/PlaylistSession.hpp"
 
+#include <glib.h>
+
 #include <cctype>
-#include <cstdlib>
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <sys/stat.h>
 #include <utility>
 
 namespace pcmtp {
 
 namespace {
+
+constexpr std::uint32_t kMaxSampleRate = 768000;
+constexpr std::uint16_t kMaxChannels = 32;
+constexpr std::uint16_t kMaxBitsPerSample = 32;
 
 std::string config_directory() {
     const char* home = std::getenv("HOME");
@@ -17,6 +27,23 @@ std::string config_directory() {
         return {};
     }
     return std::string(home) + "/.config/pcm_transport";
+}
+
+bool fits_uint16(std::uint64_t value) {
+    return value <= static_cast<std::uint64_t>(std::numeric_limits<std::uint16_t>::max());
+}
+
+bool fits_uint32(std::uint64_t value) {
+    return value <= static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max());
+}
+
+bool fits_size(std::uint64_t value) {
+    return value <= static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max());
+}
+
+bool utf8_valid(const std::string& value) {
+    return value.empty() ||
+           g_utf8_validate(value.data(), static_cast<gssize>(value.size()), nullptr);
 }
 
 std::string json_escape(const std::string& value) {
@@ -74,6 +101,8 @@ std::string serialize_track(const PlaylistSessionTrack& track) {
     out << '{';
     append_json_string(out, "audio_file_path", track.audio_file_path);
     out << ',';
+    append_json_string(out, "top_level_source_path", track.top_level_source_path);
+    out << ',';
     append_json_int(out, "track_number", track.track_number);
     out << ',';
     append_json_string(out, "title", track.title);
@@ -83,6 +112,16 @@ std::string serialize_track(const PlaylistSessionTrack& track) {
     append_json_uint64(out, "start_sample", track.start_sample);
     out << ',';
     append_json_uint64(out, "end_sample", track.end_sample);
+    out << ',';
+    append_json_uint64(out, "source_start_sample", track.source_start_sample);
+    out << ',';
+    append_json_uint64(out, "source_end_sample", track.source_end_sample);
+    out << ',';
+    append_json_uint64(out, "cue_start_frame_75", track.cue_start_frame_75);
+    out << ',';
+    append_json_uint64(out, "cue_end_frame_75", track.cue_end_frame_75);
+    out << ',';
+    append_json_bool(out, "cue_has_end_frame_75", track.cue_has_end_frame_75);
     out << ',';
     append_json_string(out, "source_label", track.source_label);
     out << ',';
@@ -95,6 +134,8 @@ std::string serialize_track(const PlaylistSessionTrack& track) {
     append_json_uint32(out, "source_sample_rate", track.source_sample_rate);
     out << ',';
     append_json_uint16(out, "source_bits_per_sample", track.source_bits_per_sample);
+    out << ',';
+    append_json_bool(out, "native_source_available", track.native_source_available);
     out << ',';
     append_json_bool(out, "native_decode", track.native_decode);
     out << ',';
@@ -112,18 +153,86 @@ std::string serialize_track(const PlaylistSessionTrack& track) {
     out << ',';
     append_json_string(out, "codec_name", track.codec_name);
     out << ',';
+    append_json_bool(out, "dsd_source", track.dsd_source);
+    out << ',';
+    append_json_uint32(out, "dsd_sample_rate", track.dsd_sample_rate);
+    out << ',';
     append_json_bool(out, "cue_track", track.cue_track);
     out << ',';
     append_json_uint64(out, "cue_album_end_sample", track.cue_album_end_sample);
+    out << ',';
+    append_json_uint64(out, "source_cue_album_end_sample", track.source_cue_album_end_sample);
+    out << ',';
+    append_json_int(out, "metadata_state", track.metadata_state);
     out << ',';
     append_json_bool(out, "is_stream", track.is_stream);
     out << '}';
     return out.str();
 }
 
+bool validate_track(const PlaylistSessionTrack& track) {
+    if (track.audio_file_path.empty() || !utf8_valid(track.audio_file_path) || !utf8_valid(track.top_level_source_path) ||
+        !utf8_valid(track.title) || !utf8_valid(track.performer) || !utf8_valid(track.source_label) ||
+        !utf8_valid(track.codec_name)) {
+        return false;
+    }
+    if (track.metadata_state < 0 || track.metadata_state > 2) {
+        return false;
+    }
+    if (track.metadata_state != 1) {
+        return true;
+    }
+    if (track.decoded_channels == 0 || track.decoded_channels > kMaxChannels) {
+        return false;
+    }
+    if (track.decoded_bits_per_sample == 0 || track.decoded_bits_per_sample > kMaxBitsPerSample) {
+        return false;
+    }
+    if (track.decoded_sample_rate == 0 || track.decoded_sample_rate > kMaxSampleRate) {
+        return false;
+    }
+    if (track.source_sample_rate > kMaxSampleRate || track.resampled_from_rate > kMaxSampleRate ||
+        track.dsd_sample_rate > kMaxSampleRate) {
+        return false;
+    }
+    if (track.source_bits_per_sample > kMaxBitsPerSample) {
+        return false;
+    }
+    if (track.end_sample > 0 && track.end_sample < track.start_sample) {
+        return false;
+    }
+    if (track.source_end_sample > 0 && track.source_end_sample < track.source_start_sample) {
+        return false;
+    }
+    return true;
+}
+
+bool validate_snapshot(const PlaylistSessionSnapshot& snapshot) {
+    if (snapshot.tracks.empty() || snapshot.tracks.size() > PlaylistSessionSnapshot::kMaxTrackCount) {
+        return false;
+    }
+    if (!fits_size(snapshot.current_track_index) || snapshot.current_track_index >= snapshot.tracks.size()) {
+        return false;
+    }
+    for (const PlaylistSessionTrack& track : snapshot.tracks) {
+        if (!validate_track(track)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 class JsonReader {
 public:
     explicit JsonReader(std::string text) : text_(std::move(text)) {}
+
+    bool fully_consumed() const {
+        std::size_t pos = pos_;
+        while (pos < text_.size() && std::isspace(static_cast<unsigned char>(text_[pos]))) {
+            ++pos;
+        }
+        return pos == text_.size();
+    }
 
     void skip_whitespace() {
         while (pos_ < text_.size() && std::isspace(static_cast<unsigned char>(text_[pos_]))) {
@@ -150,7 +259,7 @@ public:
         while (pos_ < text_.size()) {
             const char ch = text_[pos_++];
             if (ch == '"') {
-                return true;
+                return utf8_valid(out);
             }
             if (ch != '\\') {
                 out += ch;
@@ -172,6 +281,11 @@ public:
                 case 'u':
                     if (pos_ + 4 > text_.size()) {
                         return false;
+                    }
+                    for (int i = 0; i < 4; ++i) {
+                        if (!std::isxdigit(static_cast<unsigned char>(text_[pos_ + static_cast<std::size_t>(i)]))) {
+                            return false;
+                        }
                     }
                     out += '?';
                     pos_ += 4;
@@ -196,7 +310,8 @@ public:
             return false;
         }
         try {
-            out = static_cast<std::uint64_t>(std::stoull(text_.substr(begin, pos_ - begin)));
+            const unsigned long long value = std::stoull(text_.substr(begin, pos_ - begin));
+            out = static_cast<std::uint64_t>(value);
             return true;
         } catch (...) {
             return false;
@@ -230,7 +345,7 @@ public:
         return true;
     }
 
-    bool parse_track(PlaylistSessionTrack& track) {
+    bool parse_track(PlaylistSessionTrack& track, int format_version) {
         if (!consume('{')) {
             return false;
         }
@@ -238,7 +353,7 @@ public:
         while (true) {
             skip_whitespace();
             if (consume('}')) {
-                return true;
+                return validate_track(track);
             }
             if (!first && !consume(',')) {
                 return false;
@@ -252,6 +367,8 @@ public:
 
             if (key == "audio_file_path") {
                 if (!parse_string(track.audio_file_path)) return false;
+            } else if (key == "top_level_source_path") {
+                if (!parse_string(track.top_level_source_path)) return false;
             } else if (key == "track_number") {
                 std::uint64_t value = 0;
                 if (!parse_number(value)) return false;
@@ -264,28 +381,40 @@ public:
                 if (!parse_number(track.start_sample)) return false;
             } else if (key == "end_sample") {
                 if (!parse_number(track.end_sample)) return false;
+            } else if (key == "source_start_sample") {
+                if (!parse_number(track.source_start_sample)) return false;
+            } else if (key == "source_end_sample") {
+                if (!parse_number(track.source_end_sample)) return false;
+            } else if (key == "cue_start_frame_75") {
+                if (!parse_number(track.cue_start_frame_75)) return false;
+            } else if (key == "cue_end_frame_75") {
+                if (!parse_number(track.cue_end_frame_75)) return false;
+            } else if (key == "cue_has_end_frame_75") {
+                if (!parse_bool(track.cue_has_end_frame_75)) return false;
             } else if (key == "source_label") {
                 if (!parse_string(track.source_label)) return false;
             } else if (key == "decoded_sample_rate") {
                 std::uint64_t value = 0;
-                if (!parse_number(value)) return false;
+                if (!parse_number(value) || !fits_uint32(value)) return false;
                 track.decoded_sample_rate = static_cast<std::uint32_t>(value);
             } else if (key == "decoded_channels") {
                 std::uint64_t value = 0;
-                if (!parse_number(value)) return false;
+                if (!parse_number(value) || !fits_uint16(value)) return false;
                 track.decoded_channels = static_cast<std::uint16_t>(value);
             } else if (key == "decoded_bits_per_sample") {
                 std::uint64_t value = 0;
-                if (!parse_number(value)) return false;
+                if (!parse_number(value) || !fits_uint16(value)) return false;
                 track.decoded_bits_per_sample = static_cast<std::uint16_t>(value);
             } else if (key == "source_sample_rate") {
                 std::uint64_t value = 0;
-                if (!parse_number(value)) return false;
+                if (!parse_number(value) || !fits_uint32(value)) return false;
                 track.source_sample_rate = static_cast<std::uint32_t>(value);
             } else if (key == "source_bits_per_sample") {
                 std::uint64_t value = 0;
-                if (!parse_number(value)) return false;
+                if (!parse_number(value) || !fits_uint16(value)) return false;
                 track.source_bits_per_sample = static_cast<std::uint16_t>(value);
+            } else if (key == "native_source_available") {
+                if (!parse_bool(track.native_source_available)) return false;
             } else if (key == "native_decode") {
                 if (!parse_bool(track.native_decode)) return false;
             } else if (key == "lossless_source") {
@@ -296,7 +425,7 @@ public:
                 if (!parse_bool(track.resampled)) return false;
             } else if (key == "resampled_from_rate") {
                 std::uint64_t value = 0;
-                if (!parse_number(value)) return false;
+                if (!parse_number(value) || !fits_uint32(value)) return false;
                 track.resampled_from_rate = static_cast<std::uint32_t>(value);
             } else if (key == "bitdepth_converted") {
                 if (!parse_bool(track.bitdepth_converted)) return false;
@@ -304,15 +433,29 @@ public:
                 if (!parse_bool(track.processed_by_ffmpeg)) return false;
             } else if (key == "codec_name") {
                 if (!parse_string(track.codec_name)) return false;
+            } else if (key == "dsd_source") {
+                if (!parse_bool(track.dsd_source)) return false;
+            } else if (key == "dsd_sample_rate") {
+                std::uint64_t value = 0;
+                if (!parse_number(value) || !fits_uint32(value)) return false;
+                track.dsd_sample_rate = static_cast<std::uint32_t>(value);
             } else if (key == "cue_track") {
                 if (!parse_bool(track.cue_track)) return false;
             } else if (key == "cue_album_end_sample") {
                 if (!parse_number(track.cue_album_end_sample)) return false;
+            } else if (key == "source_cue_album_end_sample") {
+                if (!parse_number(track.source_cue_album_end_sample)) return false;
+            } else if (key == "metadata_state") {
+                std::uint64_t value = 0;
+                if (!parse_number(value) || value > 2) return false;
+                track.metadata_state = static_cast<int>(value);
             } else if (key == "is_stream") {
                 if (!parse_bool(track.is_stream)) return false;
             } else if (!skip_value()) {
                 return false;
             }
+
+            (void)format_version;
         }
     }
 
@@ -321,11 +464,13 @@ public:
             return false;
         }
 
+        int format_version = 0;
+        bool version_seen = false;
         bool first = true;
         while (true) {
             skip_whitespace();
             if (consume('}')) {
-                return true;
+                break;
             }
             if (!first && !consume(',')) {
                 return false;
@@ -339,12 +484,14 @@ public:
 
             if (key == "version") {
                 std::uint64_t version = 0;
-                if (!parse_number(version) || version != PlaylistSessionSnapshot::kFormatVersion) {
+                if (!parse_number(version) || (version != 1 && version != 2)) {
                     return false;
                 }
+                format_version = static_cast<int>(version);
+                version_seen = true;
             } else if (key == "current_track_index") {
                 std::uint64_t index = 0;
-                if (!parse_number(index)) {
+                if (!parse_number(index) || !fits_size(index)) {
                     return false;
                 }
                 snapshot.current_track_index = static_cast<std::size_t>(index);
@@ -362,8 +509,11 @@ public:
                         return false;
                     }
                     track_first = false;
+                    if (snapshot.tracks.size() >= PlaylistSessionSnapshot::kMaxTrackCount) {
+                        return false;
+                    }
                     PlaylistSessionTrack track;
-                    if (!parse_track(track)) {
+                    if (!parse_track(track, format_version > 0 ? format_version : 2)) {
                         return false;
                     }
                     snapshot.tracks.push_back(std::move(track));
@@ -372,6 +522,11 @@ public:
                 return false;
             }
         }
+
+        if (!version_seen) {
+            return false;
+        }
+        return validate_snapshot(snapshot) && fully_consumed();
     }
 
 private:
@@ -436,10 +591,17 @@ bool PlaylistSession::load(PlaylistSessionSnapshot& out) const {
         return false;
     }
 
-    std::ifstream in(path.c_str());
+    std::ifstream in(path.c_str(), std::ios::binary);
     if (!in) {
         return false;
     }
+
+    in.seekg(0, std::ios::end);
+    const std::streamoff size = in.tellg();
+    if (size < 0 || static_cast<std::size_t>(size) > PlaylistSessionSnapshot::kMaxFileBytes) {
+        return false;
+    }
+    in.seekg(0, std::ios::beg);
 
     std::ostringstream buffer;
     buffer << in.rdbuf();
@@ -452,31 +614,60 @@ bool PlaylistSession::load(PlaylistSessionSnapshot& out) const {
 }
 
 bool PlaylistSession::save(const PlaylistSessionSnapshot& snapshot) const {
+    if (!validate_snapshot(snapshot)) {
+        return false;
+    }
+
     const std::string dir = config_directory();
     if (dir.empty()) {
         return false;
     }
-    std::system((std::string("mkdir -p '") + dir + "'").c_str());
-
-    const std::string path = session_path();
-    std::ofstream out(path.c_str(), std::ios::trunc);
-    if (!out) {
+    if (g_mkdir_with_parents(dir.c_str(), 0700) != 0) {
         return false;
     }
 
-    out << "{\n";
-    out << "  \"version\": " << PlaylistSessionSnapshot::kFormatVersion << ",\n";
-    out << "  \"current_track_index\": " << snapshot.current_track_index << ",\n";
-    out << "  \"tracks\": [\n";
+    const std::string path = session_path();
+    const std::string tmp_path = path + ".tmp";
+
+    std::ostringstream body;
+    body << "{\n";
+    body << "  \"version\": " << PlaylistSessionSnapshot::kFormatVersion << ",\n";
+    body << "  \"current_track_index\": " << snapshot.current_track_index << ",\n";
+    body << "  \"tracks\": [\n";
     for (std::size_t i = 0; i < snapshot.tracks.size(); ++i) {
-        out << "    " << serialize_track(snapshot.tracks[i]);
+        body << "    " << serialize_track(snapshot.tracks[i]);
         if (i + 1 < snapshot.tracks.size()) {
-            out << ',';
+            body << ',';
         }
-        out << '\n';
+        body << '\n';
     }
-    out << "  ]\n";
-    out << "}\n";
+    body << "  ]\n";
+    body << "}\n";
+
+    std::ofstream out(tmp_path.c_str(), std::ios::trunc | std::ios::binary);
+    if (!out) {
+        return false;
+    }
+    out << body.str();
+    out.flush();
+    if (!out.good()) {
+        std::remove(tmp_path.c_str());
+        return false;
+    }
+    out.close();
+    if (!out.good()) {
+        std::remove(tmp_path.c_str());
+        return false;
+    }
+
+    if (chmod(tmp_path.c_str(), 0600) != 0) {
+        std::remove(tmp_path.c_str());
+        return false;
+    }
+    if (std::rename(tmp_path.c_str(), path.c_str()) != 0) {
+        std::remove(tmp_path.c_str());
+        return false;
+    }
     return true;
 }
 

@@ -36,15 +36,11 @@ class GtkPlayerWindow;
 
 namespace patches {
 void update_current_track_from_playlist_ui(GtkPlayerWindow& window, int index_column);
-void save_playlist_session(GtkPlayerWindow& window);
-bool restore_playlist_session(GtkPlayerWindow& window);
 gboolean on_playlist_focus_in(GtkWidget* widget, GdkEventFocus* event, gpointer user_data);
 } // namespace patches
 
 class GtkPlayerWindow {
     friend void patches::update_current_track_from_playlist_ui(GtkPlayerWindow& window, int index_column);
-    friend void patches::save_playlist_session(GtkPlayerWindow& window);
-    friend bool patches::restore_playlist_session(GtkPlayerWindow& window);
     friend gboolean patches::on_playlist_focus_in(GtkWidget* widget, GdkEventFocus* event, gpointer user_data);
 
 public:
@@ -291,10 +287,14 @@ private:
     void sync_playlist_cursor_to_selection();
     void initialize_playlist_session();
     void save_playlist_session() const;
-    bool restore_playlist_session();
-    std::size_t highlighted_playlist_index() const;
-    static PlaylistSessionEntryData session_entry_data_from(const PlaylistEntry& entry);
-    static PlaylistEntry playlist_entry_from(const PlaylistSessionEntryData& data);
+    bool try_restore_previous_session();
+    void resume_restored_session_metadata_loading();
+    void start_session_path_validation();
+    void stop_session_path_validation();
+    void apply_session_path_validation_result(std::uint64_t generation, std::size_t index, bool valid);
+    static gboolean on_session_path_validation_idle(gpointer user_data);
+    static PlaylistSessionTrack session_track_from_entry(const PlaylistEntry& entry);
+    static PlaylistEntry playlist_entry_from_session_track(const PlaylistSessionTrack& track);
 
     std::unique_ptr<IAudioDecoder> create_decoder_for_entry(const PlaylistEntry& entry, bool for_normalization) const;
     GaplessTrackSpec gapless_spec_for_entry(const PlaylistEntry& entry) const;
@@ -463,7 +463,7 @@ private:
     PendingMetadataPlayback pending_metadata_playback_;
     std::unordered_map<std::string, MetadataProbePathState> metadata_probe_path_states_;
     std::unordered_map<std::string, MediaProbeResult> media_probe_cache_;
-    bool restore_last_sources_enabled_ = false;
+    bool restore_last_sources_enabled_ = true;
     std::vector<std::string> last_opened_sources_;
     std::vector<std::string> current_loaded_source_paths_;
     guint restore_sources_idle_id_ = 0;
@@ -488,6 +488,10 @@ private:
     struct SessionDelegate;
     std::unique_ptr<SessionDelegate> session_delegate_;
     std::unique_ptr<PlaylistSessionController> session_controller_;
+    mutable bool session_saved_ = false;
+    std::atomic<bool> session_path_validation_stop_{false};
+    std::uint64_t session_path_validation_generation_ = 0;
+    std::thread session_path_validation_thread_;
 };
 
 } // namespace pcmtp

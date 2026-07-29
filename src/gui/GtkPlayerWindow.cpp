@@ -2296,8 +2296,37 @@ struct GtkPlayerWindow::SearchDelegate final : PlaylistSearchController::Delegat
         return COL_SEARCH_FOLDED;
     }
 
+    int col_index() const override {
+        return COL_INDEX;
+    }
+
     bool ui_closing() const override {
         return self == nullptr || self->ui_closing_;
+    }
+
+    void on_search_filter_cleared() override {
+        if (self != nullptr) {
+            self->sync_playlist_view_to_transport(true);
+        }
+    }
+
+    void on_search_filtered() override {
+        if (self != nullptr) {
+            self->sync_playlist_selection_to_filter();
+        }
+    }
+
+    void on_search_cancelled() override {
+        if (self == nullptr || self->playlist_view_ == nullptr) {
+            return;
+        }
+        gtk_widget_grab_focus(self->playlist_view_);
+    }
+
+    void activate_filtered_playlist_selection() override {
+        if (self != nullptr) {
+            self->activate_filtered_playlist_selection();
+        }
     }
 };
 
@@ -2704,8 +2733,9 @@ void GtkPlayerWindow::build_ui(GtkApplication* app) {
     gtk_box_pack_start(GTK_BOX(softvol_box), softvol_hint, FALSE, FALSE, 0);
 
     playlist_view_ = gtk_tree_view_new_with_model(GTK_TREE_MODEL(search_controller_->filter_model()));
+    search_controller_->release_filter_reference();
     gtk_widget_set_name(playlist_view_, "playlist-view");
-    gtk_tree_selection_set_mode(gtk_tree_view_get_selection(GTK_TREE_VIEW(playlist_view_)), GTK_SELECTION_BROWSE);
+    gtk_tree_selection_set_mode(gtk_tree_view_get_selection(GTK_TREE_VIEW(playlist_view_)), GTK_SELECTION_SINGLE);
     gtk_container_add(GTK_CONTAINER(scrolled), playlist_view_);
     gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(playlist_view_), TRUE);
     gtk_tree_view_set_enable_search(GTK_TREE_VIEW(playlist_view_), FALSE);
@@ -2750,6 +2780,10 @@ void GtkPlayerWindow::build_ui(GtkApplication* app) {
     g_signal_connect(playlist_view_, "row-activated", G_CALLBACK(GtkPlayerWindow::on_playlist_row_activated), this);
     g_signal_connect(playlist_view_, "focus-in-event", G_CALLBACK(patches::on_playlist_focus_in), this);
     g_signal_connect(playlist_view_, "key-press-event", G_CALLBACK(patches::on_playlist_view_key_press), this);
+    g_signal_connect(gtk_tree_view_get_selection(GTK_TREE_VIEW(playlist_view_)),
+                     "changed",
+                     G_CALLBACK(patches::on_playlist_selection_changed),
+                     this);
     g_signal_connect(window_, "delete-event", G_CALLBACK(GtkPlayerWindow::on_window_delete_event), this);
     g_signal_connect(window_, "destroy", G_CALLBACK(GtkPlayerWindow::on_window_destroy), this);
     refresh_device_list();
@@ -4940,6 +4974,7 @@ std::vector<std::string> GtkPlayerWindow::load_resolved_source_paths(
         cue_cache_.clear();
         media_probe_cache_.clear();
         current_track_index_ = 0;
+        selected_playlist_index_ = 0;
     }
 
     std::vector<std::string> probe_paths;
@@ -5090,16 +5125,19 @@ void GtkPlayerWindow::start_current_track(bool restart_if_paused) {
     if (!playback_available()) {
         return;
     }
-    if (playlist_.empty() || current_track_index_ >= playlist_.size()) {
+    if (playlist_.empty()) {
         return;
     }
 
-    if (engine_.is_paused() && restart_if_paused) {
+    selected_playlist_index_ = std::min(selected_playlist_index_, playlist_.size() - 1);
+
+    if (engine_.is_paused() && restart_if_paused &&
+        selected_playlist_index_ == current_track_index_) {
         engine_.resume();
         return;
     }
 
-    play_track_index(current_track_index_);
+    play_track_index(selected_playlist_index_);
 }
 
 void GtkPlayerWindow::halt_active_transport(bool clear_pending_state) {
@@ -5128,6 +5166,12 @@ void GtkPlayerWindow::remap_playlist_indices_after_failed_removal(
         current_track_index_ = *remapped;
     } else if (!playlist_.empty()) {
         current_track_index_ = 0;
+    }
+
+    if (const std::optional<std::size_t> remapped = remap_index(selected_playlist_index_)) {
+        selected_playlist_index_ = *remapped;
+    } else if (!playlist_.empty()) {
+        selected_playlist_index_ = current_track_index_;
     }
 
     if (pending_metadata_playback_.active) {
@@ -5212,6 +5256,7 @@ void GtkPlayerWindow::play_track_index_at_offset(std::size_t index,
     clear_gapless_chain();
 
     current_track_index_ = index;
+    selected_playlist_index_ = index;
     const PlaylistEntry track = playlist_[current_track_index_];
     const std::uint64_t track_length = track_length_samples(track);
     const std::uint64_t initial_offset = std::min<std::uint64_t>(offset_samples, track_length);
@@ -7272,7 +7317,7 @@ void GtkPlayerWindow::update_playlist_row(std::size_t index) {
                        -1);
 }
 
-void GtkPlayerWindow::select_playlist_row(std::size_t index) {
+void GtkPlayerWindow::select_playlist_row(std::size_t index, bool center_vertically) {
     GtkTreePath* path = nullptr;
     if (!patches::find_playlist_view_path_for_index(GTK_TREE_VIEW(playlist_view_), index, COL_INDEX, &path) || path == nullptr) {
         return;
@@ -7281,12 +7326,153 @@ void GtkPlayerWindow::select_playlist_row(std::size_t index) {
     gtk_tree_selection_unselect_all(selection);
     gtk_tree_selection_select_path(selection, path);
     gtk_tree_view_set_cursor(GTK_TREE_VIEW(playlist_view_), path, nullptr, FALSE);
-    gtk_tree_view_scroll_to_cell(GTK_TREE_VIEW(playlist_view_), path, nullptr, FALSE, 0.0f, 0.0f);
+    gtk_tree_view_scroll_to_cell(GTK_TREE_VIEW(playlist_view_),
+                               path,
+                               nullptr,
+                               TRUE,
+                               center_vertically ? 0.5f : 0.0f,
+                               0.0f);
     gtk_tree_path_free(path);
+    selected_playlist_index_ = index;
 }
 
-void GtkPlayerWindow::update_playlist_selection_from_ui() {
-    patches::update_current_track_from_playlist_ui(*this, COL_INDEX);
+void GtkPlayerWindow::update_selected_playlist_index_from_ui() {
+    if (playlist_.empty() || playlist_view_ == nullptr) {
+        return;
+    }
+
+    GtkTreeView* view = GTK_TREE_VIEW(playlist_view_);
+    GtkTreeSelection* selection = gtk_tree_view_get_selection(view);
+    GtkTreeModel* model = nullptr;
+    GtkTreeIter iter;
+    if (gtk_tree_selection_get_selected(selection, &model, &iter)) {
+        std::size_t row_index = 0;
+        if (patches::playlist_index_from_model_iter(model, &iter, COL_INDEX, &row_index) &&
+            row_index < playlist_.size()) {
+            selected_playlist_index_ = row_index;
+            if (pending_metadata_playback_valid()) {
+                set_pending_metadata_playback(selected_playlist_index_,
+                                            pending_metadata_playback_.offset_samples,
+                                            pending_metadata_playback_.start_playback,
+                                            pending_metadata_playback_.preserve_paused,
+                                            pending_metadata_playback_.update_mpris_track);
+            }
+            return;
+        }
+    }
+
+    GtkTreePath* cursor_path = nullptr;
+    GtkTreeViewColumn* cursor_column = nullptr;
+    gtk_tree_view_get_cursor(view, &cursor_path, &cursor_column);
+    if (cursor_path != nullptr) {
+        GtkTreeModel* cursor_model = gtk_tree_view_get_model(view);
+        std::size_t row_index = 0;
+        if (cursor_model != nullptr &&
+            patches::playlist_index_from_view_path(view, cursor_path, COL_INDEX, &row_index) &&
+            row_index < playlist_.size()) {
+            selected_playlist_index_ = row_index;
+            if (pending_metadata_playback_valid()) {
+                set_pending_metadata_playback(selected_playlist_index_,
+                                            pending_metadata_playback_.offset_samples,
+                                            pending_metadata_playback_.start_playback,
+                                            pending_metadata_playback_.preserve_paused,
+                                            pending_metadata_playback_.update_mpris_track);
+            }
+        }
+        gtk_tree_path_free(cursor_path);
+    }
+}
+
+void GtkPlayerWindow::sync_playlist_view_to_transport(bool center_vertically) {
+    if (playlist_.empty() || current_track_index_ >= playlist_.size()) {
+        return;
+    }
+    selected_playlist_index_ = current_track_index_;
+    select_playlist_row(current_track_index_, center_vertically);
+}
+
+void GtkPlayerWindow::sync_playlist_selection_to_filter() {
+    if (playlist_.empty() || playlist_view_ == nullptr) {
+        return;
+    }
+
+    GtkTreeView* view = GTK_TREE_VIEW(playlist_view_);
+    GtkTreeModel* model = gtk_tree_view_get_model(view);
+    if (model == nullptr) {
+        return;
+    }
+
+    GtkTreeSelection* selection = gtk_tree_view_get_selection(view);
+    GtkTreeIter iter;
+    GtkTreeModel* selected_model = nullptr;
+    if (gtk_tree_selection_get_selected(selection, &selected_model, &iter)) {
+        std::size_t index = 0;
+        if (patches::playlist_index_from_model_iter(selected_model, &iter, COL_INDEX, &index) &&
+            index < playlist_.size()) {
+            selected_playlist_index_ = index;
+            return;
+        }
+    }
+
+    if (!gtk_tree_model_get_iter_first(model, &iter)) {
+        return;
+    }
+
+    GtkTreePath* path = gtk_tree_model_get_path(model, &iter);
+    if (path == nullptr) {
+        return;
+    }
+    gtk_tree_selection_unselect_all(selection);
+    gtk_tree_selection_select_iter(selection, &iter);
+    gtk_tree_view_set_cursor(view, path, nullptr, FALSE);
+    gtk_tree_path_free(path);
+
+    std::size_t index = 0;
+    if (patches::playlist_index_from_model_iter(model, &iter, COL_INDEX, &index) &&
+        index < playlist_.size()) {
+        selected_playlist_index_ = index;
+    }
+}
+
+void GtkPlayerWindow::activate_filtered_playlist_selection() {
+    if (playlist_.empty() || playlist_view_ == nullptr) {
+        return;
+    }
+
+    const bool filter_active =
+        search_controller_ != nullptr && search_controller_->is_filter_active();
+
+    GtkTreeView* view = GTK_TREE_VIEW(playlist_view_);
+    GtkTreeModel* model = gtk_tree_view_get_model(view);
+    if (model == nullptr) {
+        return;
+    }
+
+    GtkTreeSelection* selection = gtk_tree_view_get_selection(view);
+    GtkTreeIter iter;
+    GtkTreeModel* selected_model = nullptr;
+    if (gtk_tree_selection_get_selected(selection, &selected_model, &iter)) {
+        std::size_t index = 0;
+        if (patches::playlist_index_from_model_iter(selected_model, &iter, COL_INDEX, &index) &&
+            index < playlist_.size()) {
+            play_track_index(index);
+        }
+        return;
+    }
+
+    if (!filter_active) {
+        return;
+    }
+
+    if (!gtk_tree_model_get_iter_first(model, &iter)) {
+        return;
+    }
+
+    std::size_t index = 0;
+    if (patches::playlist_index_from_model_iter(model, &iter, COL_INDEX, &index) &&
+        index < playlist_.size()) {
+        play_track_index(index);
+    }
 }
 
 std::string GtkPlayerWindow::format_time(std::uint64_t samples_per_channel, std::uint32_t sample_rate) {

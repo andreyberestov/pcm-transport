@@ -36,13 +36,13 @@ class GtkPlayerWindow;
 namespace patches {
 gboolean on_playlist_focus_in(GtkWidget* widget, GdkEventFocus* event, gpointer user_data);
 gboolean on_playlist_view_key_press(GtkWidget* widget, GdkEventKey* event, gpointer user_data);
-void update_current_track_from_playlist_ui(GtkPlayerWindow& window, int index_column);
+void on_playlist_selection_changed(GtkTreeSelection* selection, gpointer user_data);
 } // namespace patches
 
 class GtkPlayerWindow {
     friend gboolean patches::on_playlist_focus_in(GtkWidget* widget, GdkEventFocus* event, gpointer user_data);
     friend gboolean patches::on_playlist_view_key_press(GtkWidget* widget, GdkEventKey* event, gpointer user_data);
-    friend void patches::update_current_track_from_playlist_ui(GtkPlayerWindow& window, int index_column);
+    friend void patches::on_playlist_selection_changed(GtkTreeSelection* selection, gpointer user_data);
 
 public:
     struct ResampleRule {
@@ -283,9 +283,12 @@ private:
     void cancel_pending_seek();
     void rebuild_playlist_view();
     void update_playlist_row(std::size_t index);
-    void select_playlist_row(std::size_t index);
-    void update_playlist_selection_from_ui();
+    void select_playlist_row(std::size_t index, bool center_vertically = false);
+    void update_selected_playlist_index_from_ui();
     void sync_playlist_cursor_to_selection();
+    void sync_playlist_view_to_transport(bool center_vertically = false);
+    void sync_playlist_selection_to_filter();
+    void activate_filtered_playlist_selection();
 
     std::unique_ptr<IAudioDecoder> create_decoder_for_entry(const PlaylistEntry& entry, bool for_normalization) const;
     GaplessTrackSpec gapless_spec_for_entry(const PlaylistEntry& entry) const;
@@ -392,6 +395,7 @@ private:
     PlaybackEngine engine_;
     std::vector<PlaylistEntry> playlist_;
     std::size_t current_track_index_ = 0;
+    std::size_t selected_playlist_index_ = 0;
     std::string current_device_ = "default";
     std::vector<CardProfileInfo> cards_;
     DspConnectionInfo current_dsp_info_{};

@@ -1,4 +1,4 @@
-#include "pcmtp/patches/PlaylistSessionController.hpp"
+#include "pcmtp/session/PlaylistSessionController.hpp"
 
 #include <gtk/gtk.h>
 
@@ -12,8 +12,6 @@ struct FocusRestoreData {
     std::size_t index = 0;
 };
 
-} // namespace
-
 gboolean playlist_session_focus_idle_cb(gpointer data) {
     auto* focus_data = static_cast<FocusRestoreData*>(data);
     if (focus_data != nullptr && focus_data->delegate != nullptr && !focus_data->delegate->ui_closing()) {
@@ -23,17 +21,19 @@ gboolean playlist_session_focus_idle_cb(gpointer data) {
     return G_SOURCE_REMOVE;
 }
 
+} // namespace
+
 PlaylistSessionController::PlaylistSessionController(Delegate& delegate) : delegate_(delegate) {}
 
-void PlaylistSessionController::save(const std::vector<PlaylistSessionTrack>& tracks,
+bool PlaylistSessionController::save(const std::vector<PlaylistSessionTrack>& tracks,
                                      std::size_t current_index) const {
     if (tracks.empty()) {
-        return;
+        return false;
     }
     PlaylistSessionSnapshot snapshot;
     snapshot.tracks = tracks;
     snapshot.current_track_index = std::min(current_index, tracks.size() - 1);
-    PlaylistSession().save(snapshot);
+    return PlaylistSession().save(snapshot);
 }
 
 bool PlaylistSessionController::load_restore_result(std::vector<PlaylistSessionTrack>& tracks,

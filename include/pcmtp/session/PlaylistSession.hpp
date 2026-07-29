@@ -41,6 +41,14 @@ struct PlaylistSessionTrack {
     std::uint64_t cue_album_end_sample = 0;
     std::uint64_t source_cue_album_end_sample = 0;
     bool is_stream = false;
+    std::uint64_t file_dev = 0;
+    std::uint64_t file_ino = 0;
+    std::uint64_t file_size = 0;
+    std::int64_t file_mtime = 0;
+    std::uint64_t top_level_dev = 0;
+    std::uint64_t top_level_ino = 0;
+    std::uint64_t top_level_size = 0;
+    std::int64_t top_level_mtime = 0;
     // Matches GtkPlayerWindow::MetadataState: 0=Pending, 1=Ready, 2=Failed.
     int metadata_state = 1;
 };

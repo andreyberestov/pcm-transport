@@ -1,4 +1,7 @@
 #include "pcmtp/gui/GtkPlayerWindow.hpp"
+
+#include "pcmtp/session/PlaylistSession.hpp"
+#include "pcmtp/session/SessionPathValidation.hpp"
 #include <climits>
 #include <cmath>
 
@@ -2282,6 +2285,7 @@ struct GtkPlayerWindow::SessionDelegate final : PlaylistSessionController::Deleg
             self->playlist_.push_back(GtkPlayerWindow::playlist_entry_from_session_track(track));
         }
         self->current_track_index_ = std::min(current_index, self->playlist_.size() - 1);
+        ++self->session_playlist_generation_;
         self->halt_active_transport(true);
         self->rebuild_playlist_view();
         self->select_playlist_row(self->current_track_index_);
@@ -2290,7 +2294,6 @@ struct GtkPlayerWindow::SessionDelegate final : PlaylistSessionController::Deleg
         self->update_loading_controls();
         self->refresh_display();
         self->mark_mpris_track_changed();
-        self->resume_restored_session_metadata_loading();
         self->start_session_path_validation();
     }
 
@@ -2327,7 +2330,10 @@ GtkPlayerWindow::GtkPlayerWindow(std::size_t transport_buffer_ms)
 GtkPlayerWindow::~GtkPlayerWindow() {
     ui_closing_ = true;
     stop_session_path_validation();
-    save_playlist_session();
+    if (!session_shutdown_save_done_) {
+        save_playlist_session();
+        session_shutdown_save_done_ = true;
+    }
     stop_ui_updates();
     cancel_pending_seek();
     stop_source_scan_worker();
@@ -2709,7 +2715,6 @@ void GtkPlayerWindow::build_ui(GtkApplication* app) {
     g_signal_connect(btn_alsamixer_, "clicked", G_CALLBACK(GtkPlayerWindow::on_open_alsamixer_clicked), this);
     g_signal_connect(btn_about_, "clicked", G_CALLBACK(GtkPlayerWindow::on_about_clicked), this);
     g_signal_connect(playlist_view_, "row-activated", G_CALLBACK(GtkPlayerWindow::on_playlist_row_activated), this);
-    g_signal_connect(playlist_view_, "focus-in-event", G_CALLBACK(patches::on_playlist_focus_in), this);
     g_signal_connect(window_, "delete-event", G_CALLBACK(GtkPlayerWindow::on_window_delete_event), this);
     g_signal_connect(window_, "destroy", G_CALLBACK(GtkPlayerWindow::on_window_destroy), this);
     refresh_device_list();
@@ -2793,7 +2798,10 @@ gboolean GtkPlayerWindow::on_timer_tick(gpointer user_data) {
 gboolean GtkPlayerWindow::on_window_delete_event(GtkWidget*, GdkEvent*, gpointer user_data) {
     auto* self = static_cast<GtkPlayerWindow*>(user_data);
     if (self != nullptr) {
-        self->save_playlist_session();
+        if (!self->session_shutdown_save_done_) {
+            self->save_playlist_session();
+            self->session_shutdown_save_done_ = true;
+        }
         self->ui_closing_ = true;
         self->stop_ui_updates();
         self->cancel_pending_seek();
@@ -4220,7 +4228,7 @@ void GtkPlayerWindow::metadata_worker_loop(std::size_t worker_index) {
 }
 
 void GtkPlayerWindow::enqueue_metadata_probe(const std::string& path, bool move_to_front) {
-    if (path.empty()) {
+    if (path.empty() || !is_session_regular_file(path)) {
         return;
     }
 
@@ -4805,6 +4813,7 @@ void GtkPlayerWindow::finish_metadata_load_session() {
     refresh_playlist_processing_metadata();
     update_loading_controls();
     finalize_loaded_playlist(metadata_failed_files_ > 0);
+    mark_session_dirty();
 
     if (pending_metadata_playback_valid()) {
         const std::string pending_path = pending_metadata_playback_.waiting_path;
@@ -4881,6 +4890,8 @@ std::vector<std::string> GtkPlayerWindow::load_resolved_source_paths(
 
     stop_playback();
     clear_pending_metadata_play();
+    stop_session_path_validation();
+    ++session_playlist_generation_;
     {
         std::lock_guard<std::mutex> lock(metadata_worker_mutex_);
         ++metadata_generation_;
@@ -4901,6 +4912,7 @@ std::vector<std::string> GtkPlayerWindow::load_resolved_source_paths(
         cue_cache_.clear();
         media_probe_cache_.clear();
         current_track_index_ = 0;
+        mark_session_dirty();
     }
 
     std::vector<std::string> probe_paths;
@@ -4976,6 +4988,7 @@ std::vector<std::string> GtkPlayerWindow::load_resolved_source_paths(
         current_track_index_ = std::min(current_track_index_, playlist_.size() - 1);
         select_playlist_row(current_track_index_);
     }
+    mark_session_dirty();
     update_loading_controls();
     refresh_display();
     notify_mpris_state_changed();
@@ -5174,6 +5187,7 @@ void GtkPlayerWindow::play_track_index_at_offset(std::size_t index,
     clear_gapless_chain();
 
     current_track_index_ = index;
+    mark_session_dirty();
     const PlaylistEntry track = playlist_[current_track_index_];
     const std::uint64_t track_length = track_length_samples(track);
     const std::uint64_t initial_offset = std::min<std::uint64_t>(offset_samples, track_length);
@@ -7243,7 +7257,42 @@ void GtkPlayerWindow::select_playlist_row(std::size_t index) {
 }
 
 void GtkPlayerWindow::update_playlist_selection_from_ui() {
-    patches::update_current_track_from_playlist_ui(*this, COL_INDEX);
+    if (playlist_.empty() || playlist_view_ == nullptr) {
+        return;
+    }
+
+    GtkTreeView* view = GTK_TREE_VIEW(playlist_view_);
+    GtkTreeSelection* selection = gtk_tree_view_get_selection(view);
+    GtkTreeModel* model = nullptr;
+    GtkTreeIter iter;
+    if (gtk_tree_selection_get_selected(selection, &model, &iter)) {
+        int row_index = -1;
+        gtk_tree_model_get(model, &iter, COL_INDEX, &row_index, -1);
+        if (row_index >= 0 && static_cast<std::size_t>(row_index) < playlist_.size()) {
+            current_track_index_ = static_cast<std::size_t>(row_index);
+            return;
+        }
+    }
+
+    GtkTreePath* cursor_path = nullptr;
+    GtkTreeViewColumn* cursor_column = nullptr;
+    gtk_tree_view_get_cursor(view, &cursor_path, &cursor_column);
+    if (cursor_path != nullptr) {
+        GtkTreeModel* cursor_model = gtk_tree_view_get_model(view);
+        GtkTreeIter cursor_iter;
+        if (cursor_model != nullptr && gtk_tree_model_get_iter(cursor_model, &cursor_iter, cursor_path)) {
+            int row_index = -1;
+            gtk_tree_model_get(cursor_model, &cursor_iter, COL_INDEX, &row_index, -1);
+            if (row_index >= 0 && static_cast<std::size_t>(row_index) < playlist_.size()) {
+                current_track_index_ = static_cast<std::size_t>(row_index);
+            }
+        }
+        gtk_tree_path_free(cursor_path);
+    }
+}
+
+void GtkPlayerWindow::mark_session_dirty() {
+    session_dirty_ = true;
 }
 
 std::string GtkPlayerWindow::format_time(std::uint64_t samples_per_channel, std::uint32_t sample_rate) {
@@ -7370,13 +7419,6 @@ void GtkPlayerWindow::load_preferences() {
             alsa_24bit_container_preference_ = normalize_alsa_24bit_preference_id(value);
         } else if (key == "realtime_audio_priority_enabled") {
             realtime_audio_priority_enabled_ = (value == "1" || value == "true" || value == "yes");
-        }
-    }
-    if (!restore_last_sources_enabled_) {
-        PlaylistSessionSnapshot session_probe;
-        if (PlaylistSession().load(session_probe) && !session_probe.tracks.empty()) {
-            restore_last_sources_enabled_ = true;
-            save_preferences();
         }
     }
     if (!restore_last_sources_enabled_) {
@@ -7738,7 +7780,6 @@ bool GtkPlayerWindow::mpris_open_uri(const std::string& uri) {
     }
     const std::vector<std::string> loaded = load_source_paths({path}, false, false, true, path);
     if (!loaded.empty()) {
-        save_playlist_session();
         return true;
     }
     return false;
@@ -7988,77 +8029,62 @@ void GtkPlayerWindow::on_media_previous(GSimpleAction*, GVariant*, gpointer user
     static_cast<GtkPlayerWindow*>(user_data)->handle_media_previous();
 }
 
-void GtkPlayerWindow::sync_playlist_cursor_to_selection() {
-    if (playlist_.empty() || playlist_view_ == nullptr) {
-        return;
-    }
-
-    GtkTreeView* view = GTK_TREE_VIEW(playlist_view_);
-    GtkTreeSelection* selection = gtk_tree_view_get_selection(view);
-    GtkTreeModel* model = nullptr;
-    GtkTreeIter iter;
-    if (!gtk_tree_selection_get_selected(selection, &model, &iter)) {
-        return;
-    }
-
-    GtkTreePath* path = gtk_tree_model_get_path(model, &iter);
-    if (path == nullptr) {
-        return;
-    }
-    gtk_tree_view_set_cursor(view, path, nullptr, FALSE);
-    gtk_tree_path_free(path);
-}
-
 namespace {
 
-struct SessionPathValidationResult {
-    GtkPlayerWindow* window = nullptr;
-    std::uint64_t generation = 0;
-    std::size_t index = 0;
-    bool valid = false;
-};
-
-bool session_path_is_regular_file(const std::string& path) {
-    if (path.empty()) {
-        return false;
-    }
-    struct stat st {};
-    if (stat(path.c_str(), &st) != 0) {
-        return false;
-    }
-    return S_ISREG(st.st_mode);
-}
+constexpr std::size_t kSessionValidationBatchSize = 250;
 
 } // namespace
 
 gboolean GtkPlayerWindow::on_session_path_validation_idle(gpointer user_data) {
-    auto* result = static_cast<SessionPathValidationResult*>(user_data);
-    if (result == nullptr) {
+    auto* self = static_cast<GtkPlayerWindow*>(user_data);
+    if (self == nullptr) {
         return G_SOURCE_REMOVE;
     }
 
-    if (result->window != nullptr) {
-        result->window->apply_session_path_validation_result(result->generation, result->index, result->valid);
+    std::deque<std::vector<SessionValidationResultItem>> batches;
+    std::uint64_t generation = 0;
+    std::uint64_t playlist_generation = 0;
+    bool final_batch = false;
+    {
+        std::lock_guard<std::mutex> lock(self->session_validation_mutex_);
+        self->session_validation_idle_id_ = 0;
+        if (self->session_validation_pending_batches_.empty()) {
+            return G_SOURCE_REMOVE;
+        }
+        generation = self->session_validation_pending_generation_;
+        playlist_generation = self->session_validation_pending_playlist_generation_;
+        final_batch = self->session_validation_final_batch_pending_;
+        batches.swap(self->session_validation_pending_batches_);
+        self->session_validation_final_batch_pending_ = false;
     }
 
-    delete result;
+    for (std::vector<SessionValidationResultItem>& batch : batches) {
+        self->apply_session_path_validation_batch(generation,
+                                                  playlist_generation,
+                                                  std::move(batch),
+                                                  false);
+    }
+    if (final_batch) {
+        self->apply_session_path_validation_batch(generation, playlist_generation, {}, true);
+    }
     return G_SOURCE_REMOVE;
 }
 
-void GtkPlayerWindow::save_playlist_session() const {
-    if (session_saved_ || session_controller_ == nullptr || playlist_.empty() ||
-        !restore_last_sources_enabled_) {
+void GtkPlayerWindow::save_playlist_session() {
+    if (!restore_last_sources_enabled_ || !session_dirty_ || session_controller_ == nullptr ||
+        playlist_.empty()) {
         return;
     }
-    session_saved_ = true;
 
     std::vector<PlaylistSessionTrack> tracks;
     tracks.reserve(playlist_.size());
     for (const PlaylistEntry& entry : playlist_) {
         tracks.push_back(session_track_from_entry(entry));
     }
-    const std::size_t active_index = playlist_.empty() ? 0 : std::min(current_track_index_, playlist_.size() - 1);
-    session_controller_->save(tracks, active_index);
+    const std::size_t active_index = std::min(current_track_index_, playlist_.size() - 1);
+    if (session_controller_->save(tracks, active_index)) {
+        session_dirty_ = false;
+    }
 }
 
 bool GtkPlayerWindow::try_restore_previous_session() {
@@ -8068,21 +8094,44 @@ bool GtkPlayerWindow::try_restore_previous_session() {
     return session_controller_->restore();
 }
 
-void GtkPlayerWindow::apply_session_path_validation_result(std::uint64_t generation,
-                                                           std::size_t index,
-                                                           bool valid) {
-    if (ui_closing_ || generation != session_path_validation_generation_ || index >= playlist_.size()) {
-        return;
-    }
-    if (valid) {
+void GtkPlayerWindow::apply_session_path_validation_batch(std::uint64_t generation,
+                                                          std::uint64_t playlist_generation,
+                                                          std::vector<SessionValidationResultItem> results,
+                                                          bool final_batch) {
+    if (ui_closing_ || generation != session_path_validation_generation_ ||
+        playlist_generation != session_playlist_generation_) {
         return;
     }
 
-    PlaylistEntry& entry = playlist_[index];
-    entry.metadata_state = MetadataState::Failed;
-    update_playlist_row(index);
-    if (index == current_track_index_) {
-        refresh_display();
+    for (const SessionValidationResultItem& result : results) {
+        if (result.index >= playlist_.size()) {
+            continue;
+        }
+        const std::string expected_id = session_stable_id(session_track_from_entry(playlist_[result.index]));
+        if (result.stable_id != expected_id) {
+            continue;
+        }
+
+        PlaylistEntry& entry = playlist_[result.index];
+        switch (result.status) {
+            case SessionPathValidationStatus::Ok:
+                break;
+            case SessionPathValidationStatus::Missing:
+                entry.metadata_state = MetadataState::Failed;
+                update_playlist_row(result.index);
+                if (result.index == current_track_index_) {
+                    refresh_display();
+                }
+                break;
+            case SessionPathValidationStatus::Changed:
+                reset_entry_metadata_for_reprobe(entry);
+                update_playlist_row(result.index);
+                break;
+        }
+    }
+
+    if (final_batch) {
+        resume_restored_session_metadata_loading();
     }
 }
 
@@ -8092,6 +8141,16 @@ void GtkPlayerWindow::stop_session_path_validation() {
         session_path_validation_thread_.join();
     }
     session_path_validation_stop_.store(false, std::memory_order_relaxed);
+
+    if (session_validation_idle_id_ != 0) {
+        g_source_remove(session_validation_idle_id_);
+        session_validation_idle_id_ = 0;
+    }
+    {
+        std::lock_guard<std::mutex> lock(session_validation_mutex_);
+        session_validation_pending_batches_.clear();
+        session_validation_final_batch_pending_ = false;
+    }
 }
 
 void GtkPlayerWindow::start_session_path_validation() {
@@ -8101,32 +8160,99 @@ void GtkPlayerWindow::start_session_path_validation() {
     }
 
     const std::uint64_t generation = ++session_path_validation_generation_;
+    const std::uint64_t playlist_generation = session_playlist_generation_;
+
+    std::vector<PlaylistSessionTrack> snapshot_tracks;
+    snapshot_tracks.reserve(playlist_.size());
+    for (const PlaylistEntry& entry : playlist_) {
+        snapshot_tracks.push_back(session_track_from_entry(entry));
+    }
+    const std::vector<SessionValidationItem> items = build_session_validation_snapshot(snapshot_tracks);
+
     std::vector<std::size_t> order;
-    order.reserve(playlist_.size());
-    order.push_back(current_track_index_);
-    for (std::size_t index = 0; index < playlist_.size(); ++index) {
-        if (index != current_track_index_) {
+    order.reserve(items.size());
+    for (std::size_t index = 0; index < items.size(); ++index) {
+        if (items[index].index == current_track_index_) {
+            order.push_back(index);
+        }
+    }
+    for (std::size_t index = 0; index < items.size(); ++index) {
+        if (items[index].index != current_track_index_) {
             order.push_back(index);
         }
     }
 
     GtkPlayerWindow* self = this;
-    session_path_validation_thread_ = std::thread([self, generation, order]() {
-        for (std::size_t index : order) {
-            if (self->session_path_validation_stop_.load(std::memory_order_relaxed) ||
-                generation != self->session_path_validation_generation_) {
+    session_path_validation_thread_ = std::thread([self, generation, playlist_generation, items, order]() {
+        std::vector<SessionValidationResultItem> batch;
+        batch.reserve(kSessionValidationBatchSize);
+
+        auto flush_batch = [&](bool final_batch) {
+            if (batch.empty() && !final_batch) {
                 return;
             }
-            if (index >= self->playlist_.size()) {
+            {
+                std::lock_guard<std::mutex> lock(self->session_validation_mutex_);
+                if (generation != self->session_path_validation_generation_ ||
+                    playlist_generation != self->session_playlist_generation_) {
+                    return;
+                }
+                if (!batch.empty()) {
+                    self->session_validation_pending_batches_.push_back(std::move(batch));
+                    batch.clear();
+                    batch.reserve(kSessionValidationBatchSize);
+                }
+                self->session_validation_pending_generation_ = generation;
+                self->session_validation_pending_playlist_generation_ = playlist_generation;
+                if (final_batch) {
+                    self->session_validation_final_batch_pending_ = true;
+                }
+                if (self->session_validation_idle_id_ == 0) {
+                    self->session_validation_idle_id_ =
+                        g_idle_add(GtkPlayerWindow::on_session_path_validation_idle, self);
+                }
+            }
+        };
+
+        for (std::size_t order_index : order) {
+            if (self->session_path_validation_stop_.load(std::memory_order_relaxed) ||
+                generation != self->session_path_validation_generation_ ||
+                playlist_generation != self->session_playlist_generation_) {
+                return;
+            }
+            if (order_index >= items.size()) {
                 continue;
             }
-            const std::string path = self->playlist_[index].audio_file_path;
-            const bool valid = session_path_is_regular_file(path);
-
-            auto* result = new SessionPathValidationResult{self, generation, index, valid};
-            g_idle_add(GtkPlayerWindow::on_session_path_validation_idle, result);
+            const SessionValidationItem& item = items[order_index];
+            SessionValidationResultItem result;
+            result.index = item.index;
+            result.stable_id = item.stable_id;
+            result.status = validate_session_item(item);
+            batch.push_back(std::move(result));
+            if (batch.size() >= kSessionValidationBatchSize) {
+                flush_batch(false);
+            }
         }
+        flush_batch(true);
     });
+}
+
+void GtkPlayerWindow::reset_entry_metadata_for_reprobe(PlaylistEntry& entry) {
+    entry.metadata_state = MetadataState::Pending;
+    entry.source_sample_rate = 0;
+    entry.source_bits_per_sample = 0;
+    entry.native_source_available = false;
+    entry.native_decode = false;
+    entry.lossless_source = false;
+    entry.lossy_source = false;
+    entry.resampled = false;
+    entry.resampled_from_rate = 0;
+    entry.bitdepth_converted = false;
+    entry.processed_by_ffmpeg = false;
+    entry.codec_name.clear();
+    entry.dsd_source = false;
+    entry.dsd_sample_rate = 0;
+    entry.decoded_format = AudioFormat{};
 }
 
 PlaylistSessionTrack GtkPlayerWindow::session_track_from_entry(const GtkPlayerWindow::PlaylistEntry& entry) {
@@ -8165,6 +8291,22 @@ PlaylistSessionTrack GtkPlayerWindow::session_track_from_entry(const GtkPlayerWi
     track.source_cue_album_end_sample = entry.source_cue_album_end_sample;
     track.is_stream = false;
     track.metadata_state = static_cast<int>(entry.metadata_state);
+    SessionFileIdentity audio_identity;
+    if (capture_session_file_identity(entry.audio_file_path, audio_identity)) {
+        track.file_dev = audio_identity.dev;
+        track.file_ino = audio_identity.ino;
+        track.file_size = audio_identity.size;
+        track.file_mtime = audio_identity.mtime;
+    }
+    if (entry.cue_track && !entry.top_level_source_path.empty()) {
+        SessionFileIdentity cue_identity;
+        if (capture_session_file_identity(entry.top_level_source_path, cue_identity)) {
+            track.top_level_dev = cue_identity.dev;
+            track.top_level_ino = cue_identity.ino;
+            track.top_level_size = cue_identity.size;
+            track.top_level_mtime = cue_identity.mtime;
+        }
+    }
     return track;
 }
 

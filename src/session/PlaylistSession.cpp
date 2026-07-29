@@ -1,5 +1,7 @@
 #include "pcmtp/session/PlaylistSession.hpp"
 
+#include "pcmtp/session/SessionLimits.hpp"
+
 #include <glib.h>
 
 #include <cctype>
@@ -17,9 +19,12 @@ namespace pcmtp {
 
 namespace {
 
-constexpr std::uint32_t kMaxSampleRate = 768000;
 constexpr std::uint16_t kMaxChannels = 32;
 constexpr std::uint16_t kMaxBitsPerSample = 32;
+
+bool fits_int(std::uint64_t value) {
+    return value <= static_cast<std::uint64_t>(std::numeric_limits<int>::max());
+}
 
 std::string config_directory() {
     const char* home = std::getenv("HOME");
@@ -89,6 +94,10 @@ void append_json_uint16(std::ostringstream& out, const std::string& key, std::ui
 }
 
 void append_json_int(std::ostringstream& out, const std::string& key, int value) {
+    out << '"' << key << "\":" << value;
+}
+
+void append_json_int64(std::ostringstream& out, const std::string& key, std::int64_t value) {
     out << '"' << key << "\":" << value;
 }
 
@@ -163,6 +172,22 @@ std::string serialize_track(const PlaylistSessionTrack& track) {
     out << ',';
     append_json_uint64(out, "source_cue_album_end_sample", track.source_cue_album_end_sample);
     out << ',';
+    append_json_uint64(out, "file_dev", track.file_dev);
+    out << ',';
+    append_json_uint64(out, "file_ino", track.file_ino);
+    out << ',';
+    append_json_uint64(out, "file_size", track.file_size);
+    out << ',';
+    append_json_int64(out, "file_mtime", track.file_mtime);
+    out << ',';
+    append_json_uint64(out, "top_level_dev", track.top_level_dev);
+    out << ',';
+    append_json_uint64(out, "top_level_ino", track.top_level_ino);
+    out << ',';
+    append_json_uint64(out, "top_level_size", track.top_level_size);
+    out << ',';
+    append_json_int64(out, "top_level_mtime", track.top_level_mtime);
+    out << ',';
     append_json_int(out, "metadata_state", track.metadata_state);
     out << ',';
     append_json_bool(out, "is_stream", track.is_stream);
@@ -188,11 +213,29 @@ bool validate_track(const PlaylistSessionTrack& track) {
     if (track.decoded_bits_per_sample == 0 || track.decoded_bits_per_sample > kMaxBitsPerSample) {
         return false;
     }
-    if (track.decoded_sample_rate == 0 || track.decoded_sample_rate > kMaxSampleRate) {
+    if (track.decoded_sample_rate == 0 || track.decoded_sample_rate > kMaxPcmSampleRate ||
+        !is_supported_pcm_sample_rate(track.decoded_sample_rate)) {
         return false;
     }
-    if (track.source_sample_rate > kMaxSampleRate || track.resampled_from_rate > kMaxSampleRate ||
-        track.dsd_sample_rate > kMaxSampleRate) {
+    if (track.source_sample_rate > kMaxPcmSampleRate ||
+        track.resampled_from_rate > kMaxPcmSampleRate) {
+        return false;
+    }
+    if (track.resampled_from_rate > 0 &&
+        !is_supported_pcm_sample_rate(track.resampled_from_rate)) {
+        return false;
+    }
+    if (track.dsd_sample_rate > kMaxDsdSampleRate) {
+        return false;
+    }
+    if (track.dsd_source) {
+        if (track.dsd_sample_rate == 0 || !is_supported_dsd_sample_rate(track.dsd_sample_rate)) {
+            return false;
+        }
+    } else if (track.dsd_sample_rate != 0) {
+        return false;
+    }
+    if (track.native_decode && !track.native_source_available) {
         return false;
     }
     if (track.source_bits_per_sample > kMaxBitsPerSample) {
@@ -203,6 +246,14 @@ bool validate_track(const PlaylistSessionTrack& track) {
     }
     if (track.source_end_sample > 0 && track.source_end_sample < track.source_start_sample) {
         return false;
+    }
+    if (track.cue_track) {
+        if (track.source_end_sample <= track.source_start_sample) {
+            return false;
+        }
+        if (track.cue_has_end_frame_75 && track.cue_end_frame_75 < track.cue_start_frame_75) {
+            return false;
+        }
     }
     return true;
 }
@@ -371,7 +422,9 @@ public:
                 if (!parse_string(track.top_level_source_path)) return false;
             } else if (key == "track_number") {
                 std::uint64_t value = 0;
-                if (!parse_number(value)) return false;
+                if (!parse_number(value) || !fits_int(value)) {
+                    return false;
+                }
                 track.track_number = static_cast<int>(value);
             } else if (key == "title") {
                 if (!parse_string(track.title)) return false;
@@ -445,6 +498,26 @@ public:
                 if (!parse_number(track.cue_album_end_sample)) return false;
             } else if (key == "source_cue_album_end_sample") {
                 if (!parse_number(track.source_cue_album_end_sample)) return false;
+            } else if (key == "file_dev") {
+                if (!parse_number(track.file_dev)) return false;
+            } else if (key == "file_ino") {
+                if (!parse_number(track.file_ino)) return false;
+            } else if (key == "file_size") {
+                if (!parse_number(track.file_size)) return false;
+            } else if (key == "file_mtime") {
+                std::uint64_t value = 0;
+                if (!parse_number(value)) return false;
+                track.file_mtime = static_cast<std::int64_t>(value);
+            } else if (key == "top_level_dev") {
+                if (!parse_number(track.top_level_dev)) return false;
+            } else if (key == "top_level_ino") {
+                if (!parse_number(track.top_level_ino)) return false;
+            } else if (key == "top_level_size") {
+                if (!parse_number(track.top_level_size)) return false;
+            } else if (key == "top_level_mtime") {
+                std::uint64_t value = 0;
+                if (!parse_number(value)) return false;
+                track.top_level_mtime = static_cast<std::int64_t>(value);
             } else if (key == "metadata_state") {
                 std::uint64_t value = 0;
                 if (!parse_number(value) || value > 2) return false;
@@ -484,7 +557,7 @@ public:
 
             if (key == "version") {
                 std::uint64_t version = 0;
-                if (!parse_number(version) || (version != 1 && version != 2)) {
+                if (!parse_number(version) || version != PlaylistSessionSnapshot::kFormatVersion) {
                     return false;
                 }
                 format_version = static_cast<int>(version);
@@ -629,28 +702,51 @@ bool PlaylistSession::save(const PlaylistSessionSnapshot& snapshot) const {
     const std::string path = session_path();
     const std::string tmp_path = path + ".tmp";
 
-    std::ostringstream body;
-    body << "{\n";
-    body << "  \"version\": " << PlaylistSessionSnapshot::kFormatVersion << ",\n";
-    body << "  \"current_track_index\": " << snapshot.current_track_index << ",\n";
-    body << "  \"tracks\": [\n";
-    for (std::size_t i = 0; i < snapshot.tracks.size(); ++i) {
-        body << "    " << serialize_track(snapshot.tracks[i]);
-        if (i + 1 < snapshot.tracks.size()) {
-            body << ',';
-        }
-        body << '\n';
-    }
-    body << "  ]\n";
-    body << "}\n";
-
     std::ofstream out(tmp_path.c_str(), std::ios::trunc | std::ios::binary);
     if (!out) {
         return false;
     }
-    out << body.str();
+
+    auto write = [&](const std::string& chunk) -> bool {
+        out << chunk;
+        if (!out.good()) {
+            return false;
+        }
+        const std::streamoff size = out.tellp();
+        return size >= 0 && static_cast<std::size_t>(size) <= PlaylistSessionSnapshot::kMaxFileBytes;
+    };
+
+    if (!write("{\n") ||
+        !write("  \"version\": " + std::to_string(PlaylistSessionSnapshot::kFormatVersion) + ",\n") ||
+        !write("  \"current_track_index\": " + std::to_string(snapshot.current_track_index) + ",\n") ||
+        !write("  \"tracks\": [\n")) {
+        out.close();
+        std::remove(tmp_path.c_str());
+        return false;
+    }
+
+    for (std::size_t i = 0; i < snapshot.tracks.size(); ++i) {
+        std::string line = "    " + serialize_track(snapshot.tracks[i]);
+        if (i + 1 < snapshot.tracks.size()) {
+            line += ',';
+        }
+        line += '\n';
+        if (!write(line)) {
+            out.close();
+            std::remove(tmp_path.c_str());
+            return false;
+        }
+    }
+
+    if (!write("  ]\n") || !write("}\n")) {
+        out.close();
+        std::remove(tmp_path.c_str());
+        return false;
+    }
+
     out.flush();
     if (!out.good()) {
+        out.close();
         std::remove(tmp_path.c_str());
         return false;
     }

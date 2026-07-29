@@ -26,23 +26,13 @@
 #include "pcmtp/mpris/MprisService.hpp"
 #include "pcmtp/playlist/MediaProbe.hpp"
 #include "pcmtp/playlist/SourceScanner.hpp"
-#include "pcmtp/patches/PlaylistSessionController.hpp"
-#include "pcmtp/patches/PlaylistSelectionPatches.hpp"
+#include "pcmtp/session/PlaylistSessionController.hpp"
+#include "pcmtp/session/SessionPathValidation.hpp"
 #include "pcmtp/util/ManagedSubprocess.hpp"
 
 namespace pcmtp {
 
-class GtkPlayerWindow;
-
-namespace patches {
-void update_current_track_from_playlist_ui(GtkPlayerWindow& window, int index_column);
-gboolean on_playlist_focus_in(GtkWidget* widget, GdkEventFocus* event, gpointer user_data);
-} // namespace patches
-
 class GtkPlayerWindow {
-    friend void patches::update_current_track_from_playlist_ui(GtkPlayerWindow& window, int index_column);
-    friend gboolean patches::on_playlist_focus_in(GtkWidget* widget, GdkEventFocus* event, gpointer user_data);
-
 public:
     struct ResampleRule {
         std::uint32_t from_rate = 0;
@@ -66,6 +56,7 @@ public:
     void show(const std::string& program_name,
               const std::vector<std::string>& source_paths);
 
+private:
     enum class MetadataState {
         Pending,
         Ready,
@@ -110,7 +101,6 @@ public:
         bool normalization_matches_current = false;
     };
 
-private:
     struct MetadataProbeJob {
         std::uint64_t generation = 0;
         std::string path;
@@ -284,17 +274,21 @@ private:
     void update_playlist_row(std::size_t index);
     void select_playlist_row(std::size_t index);
     void update_playlist_selection_from_ui();
-    void sync_playlist_cursor_to_selection();
     void initialize_playlist_session();
-    void save_playlist_session() const;
+    void mark_session_dirty();
+    void save_playlist_session();
     bool try_restore_previous_session();
     void resume_restored_session_metadata_loading();
     void start_session_path_validation();
     void stop_session_path_validation();
-    void apply_session_path_validation_result(std::uint64_t generation, std::size_t index, bool valid);
+    void apply_session_path_validation_batch(std::uint64_t generation,
+                                             std::uint64_t playlist_generation,
+                                             std::vector<SessionValidationResultItem> results,
+                                             bool final_batch);
     static gboolean on_session_path_validation_idle(gpointer user_data);
     static PlaylistSessionTrack session_track_from_entry(const PlaylistEntry& entry);
     static PlaylistEntry playlist_entry_from_session_track(const PlaylistSessionTrack& track);
+    static void reset_entry_metadata_for_reprobe(PlaylistEntry& entry);
 
     std::unique_ptr<IAudioDecoder> create_decoder_for_entry(const PlaylistEntry& entry, bool for_normalization) const;
     GaplessTrackSpec gapless_spec_for_entry(const PlaylistEntry& entry) const;
@@ -463,7 +457,7 @@ private:
     PendingMetadataPlayback pending_metadata_playback_;
     std::unordered_map<std::string, MetadataProbePathState> metadata_probe_path_states_;
     std::unordered_map<std::string, MediaProbeResult> media_probe_cache_;
-    bool restore_last_sources_enabled_ = true;
+    bool restore_last_sources_enabled_ = false;
     std::vector<std::string> last_opened_sources_;
     std::vector<std::string> current_loaded_source_paths_;
     guint restore_sources_idle_id_ = 0;
@@ -488,10 +482,18 @@ private:
     struct SessionDelegate;
     std::unique_ptr<SessionDelegate> session_delegate_;
     std::unique_ptr<PlaylistSessionController> session_controller_;
-    mutable bool session_saved_ = false;
+    bool session_dirty_ = false;
+    bool session_shutdown_save_done_ = false;
     std::atomic<bool> session_path_validation_stop_{false};
     std::uint64_t session_path_validation_generation_ = 0;
+    std::uint64_t session_playlist_generation_ = 0;
     std::thread session_path_validation_thread_;
+    std::mutex session_validation_mutex_;
+    std::deque<std::vector<SessionValidationResultItem>> session_validation_pending_batches_;
+    std::uint64_t session_validation_pending_generation_ = 0;
+    std::uint64_t session_validation_pending_playlist_generation_ = 0;
+    bool session_validation_final_batch_pending_ = false;
+    guint session_validation_idle_id_ = 0;
 };
 
 } // namespace pcmtp

@@ -11,8 +11,6 @@ typedef void* gpointer;
 namespace pcmtp {
 
 class PlaylistSessionController {
-    friend gboolean playlist_session_focus_idle_cb(gpointer data);
-
 public:
     class Delegate {
     public:
@@ -25,7 +23,7 @@ public:
 
     explicit PlaylistSessionController(Delegate& delegate);
 
-    void save(const std::vector<PlaylistSessionTrack>& tracks, std::size_t current_index) const;
+    bool save(const std::vector<PlaylistSessionTrack>& tracks, std::size_t current_index) const;
     bool restore();
 
     static bool load_restore_result(std::vector<PlaylistSessionTrack>& tracks, std::size_t& current_index);

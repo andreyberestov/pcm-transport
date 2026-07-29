@@ -2335,6 +2335,80 @@ void GtkPlayerWindow::initialize_playlist_search() {
     search_controller_ = std::make_unique<PlaylistSearchController>(*search_delegate_);
 }
 
+void GtkPlayerWindow::apply_playlist_search_handler_connections() {
+    if (playlist_view_ == nullptr) {
+        return;
+    }
+
+    if (playlist_key_press_handler_id_ != 0) {
+        g_signal_handler_disconnect(playlist_view_, playlist_key_press_handler_id_);
+        playlist_key_press_handler_id_ = 0;
+    }
+    if (playlist_focus_in_handler_id_ != 0) {
+        g_signal_handler_disconnect(playlist_view_, playlist_focus_in_handler_id_);
+        playlist_focus_in_handler_id_ = 0;
+    }
+    if (playlist_selection_changed_handler_id_ != 0) {
+        GtkTreeSelection* selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(playlist_view_));
+        g_signal_handler_disconnect(selection, playlist_selection_changed_handler_id_);
+        playlist_selection_changed_handler_id_ = 0;
+    }
+
+    if (!playlist_search_enabled_) {
+        return;
+    }
+
+    playlist_key_press_handler_id_ =
+        g_signal_connect(playlist_view_, "key-press-event", G_CALLBACK(patches::on_playlist_view_key_press), this);
+    playlist_focus_in_handler_id_ =
+        g_signal_connect(playlist_view_, "focus-in-event", G_CALLBACK(patches::on_playlist_focus_in), this);
+    GtkTreeSelection* selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(playlist_view_));
+    playlist_selection_changed_handler_id_ =
+        g_signal_connect(selection, "changed", G_CALLBACK(patches::on_playlist_selection_changed), this);
+}
+
+void GtkPlayerWindow::apply_playlist_search_ui_state() {
+    if (playlist_search_enabled_) {
+        if (search_controller_ == nullptr && playlist_panel_ != nullptr) {
+            initialize_playlist_search();
+            search_controller_->install_in_panel(GTK_BOX(playlist_panel_));
+        } else if (search_controller_ != nullptr) {
+            search_controller_->set_search_entry_visible(true);
+        }
+    } else if (search_controller_ != nullptr) {
+        search_controller_->cancel_search();
+        if (playlist_panel_ != nullptr) {
+            search_controller_->teardown_from_panel(GTK_BOX(playlist_panel_));
+        } else {
+            search_controller_->shutdown();
+        }
+        search_controller_.reset();
+        search_delegate_.reset();
+    }
+
+    if (playlist_view_ == nullptr) {
+        apply_playlist_search_handler_connections();
+        return;
+    }
+
+    GtkTreeModel* model = GTK_TREE_MODEL(playlist_store_);
+    if (playlist_search_enabled_ && search_controller_ != nullptr && search_controller_->filter_model() != nullptr) {
+        model = GTK_TREE_MODEL(search_controller_->filter_model());
+    }
+    gtk_tree_view_set_model(GTK_TREE_VIEW(playlist_view_), model);
+    if (playlist_search_enabled_ && search_controller_ != nullptr) {
+        if (search_controller_->filter_model() != nullptr &&
+            model == GTK_TREE_MODEL(search_controller_->filter_model())) {
+            search_controller_->release_filter_reference();
+        }
+        search_controller_->refilter();
+    }
+    apply_playlist_search_handler_connections();
+    if (!playlist_.empty() && current_track_index_ < playlist_.size()) {
+        sync_playlist_view_to_transport(false);
+    }
+}
+
 void GtkPlayerWindow::sync_playlist_cursor_to_selection() {
     if (playlist_.empty() || playlist_view_ == nullptr) {
         return;
@@ -2482,7 +2556,6 @@ void GtkPlayerWindow::on_open(GApplication* application,
 
 void GtkPlayerWindow::build_ui(GtkApplication* app) {
     start_metadata_worker();
-    initialize_playlist_search();
     window_ = gtk_application_window_new(app);
     gtk_window_set_icon_name(GTK_WINDOW(window_), kApplicationId);
     gtk_window_set_title(GTK_WINDOW(window_), "PCM Transport v0.9.111");
@@ -2691,6 +2764,7 @@ void GtkPlayerWindow::build_ui(GtkApplication* app) {
     gtk_box_pack_start(GTK_BOX(outer), content_row, TRUE, TRUE, 0);
 
     GtkWidget* playlist_panel = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    playlist_panel_ = playlist_panel;
     gtk_box_pack_start(GTK_BOX(content_row), playlist_panel, TRUE, TRUE, 0);
 
     playlist_store_ = gtk_list_store_new(COL_COUNT,
@@ -2700,7 +2774,10 @@ void GtkPlayerWindow::build_ui(GtkApplication* app) {
                                           G_TYPE_STRING,
                                           G_TYPE_STRING,
                                           G_TYPE_STRING);
-    search_controller_->install_in_panel(GTK_BOX(playlist_panel));
+    if (playlist_search_enabled_) {
+        initialize_playlist_search();
+        search_controller_->install_in_panel(GTK_BOX(playlist_panel));
+    }
 
     GtkWidget* scrolled = gtk_scrolled_window_new(nullptr, nullptr);
     playlist_scrolled_ = scrolled;
@@ -2732,8 +2809,12 @@ void GtkPlayerWindow::build_ui(GtkApplication* app) {
     gtk_widget_set_halign(softvol_hint, GTK_ALIGN_CENTER);
     gtk_box_pack_start(GTK_BOX(softvol_box), softvol_hint, FALSE, FALSE, 0);
 
-    playlist_view_ = gtk_tree_view_new_with_model(GTK_TREE_MODEL(search_controller_->filter_model()));
-    search_controller_->release_filter_reference();
+    if (playlist_search_enabled_ && search_controller_->filter_model() != nullptr) {
+        playlist_view_ = gtk_tree_view_new_with_model(GTK_TREE_MODEL(search_controller_->filter_model()));
+        search_controller_->release_filter_reference();
+    } else {
+        playlist_view_ = gtk_tree_view_new_with_model(GTK_TREE_MODEL(playlist_store_));
+    }
     gtk_widget_set_name(playlist_view_, "playlist-view");
     gtk_tree_selection_set_mode(gtk_tree_view_get_selection(GTK_TREE_VIEW(playlist_view_)), GTK_SELECTION_SINGLE);
     gtk_container_add(GTK_CONTAINER(scrolled), playlist_view_);
@@ -2778,12 +2859,7 @@ void GtkPlayerWindow::build_ui(GtkApplication* app) {
     g_signal_connect(btn_alsamixer_, "clicked", G_CALLBACK(GtkPlayerWindow::on_open_alsamixer_clicked), this);
     g_signal_connect(btn_about_, "clicked", G_CALLBACK(GtkPlayerWindow::on_about_clicked), this);
     g_signal_connect(playlist_view_, "row-activated", G_CALLBACK(GtkPlayerWindow::on_playlist_row_activated), this);
-    g_signal_connect(playlist_view_, "focus-in-event", G_CALLBACK(patches::on_playlist_focus_in), this);
-    g_signal_connect(playlist_view_, "key-press-event", G_CALLBACK(patches::on_playlist_view_key_press), this);
-    g_signal_connect(gtk_tree_view_get_selection(GTK_TREE_VIEW(playlist_view_)),
-                     "changed",
-                     G_CALLBACK(patches::on_playlist_selection_changed),
-                     this);
+    apply_playlist_search_handler_connections();
     g_signal_connect(window_, "delete-event", G_CALLBACK(GtkPlayerWindow::on_window_delete_event), this);
     g_signal_connect(window_, "destroy", G_CALLBACK(GtkPlayerWindow::on_window_destroy), this);
     refresh_device_list();
@@ -2910,6 +2986,7 @@ void GtkPlayerWindow::on_window_destroy(GtkWidget*, gpointer user_data) {
         }
         self->playlist_view_ = nullptr;
         self->playlist_store_ = nullptr;
+        self->playlist_panel_ = nullptr;
         self->playlist_scrolled_ = nullptr;
         self->diagnostics_active_output_value_ = nullptr;
     }
@@ -4608,6 +4685,17 @@ void GtkPlayerWindow::set_pending_metadata_playback(std::size_t index,
         return;
     }
 
+    if (pending_metadata_playback_valid() &&
+        pending_metadata_playback_.index == index &&
+        pending_metadata_playback_.offset_samples == offset_samples &&
+        pending_metadata_playback_.start_playback == start_playback &&
+        pending_metadata_playback_.preserve_paused == preserve_paused &&
+        pending_metadata_playback_.update_mpris_track == update_mpris_track &&
+        pending_metadata_playback_.waiting_path == playlist_[index].audio_file_path) {
+        select_playlist_row(index);
+        return;
+    }
+
     halt_active_transport(false);
 
     pending_metadata_playback_.active = true;
@@ -5129,15 +5217,26 @@ void GtkPlayerWindow::start_current_track(bool restart_if_paused) {
         return;
     }
 
-    selected_playlist_index_ = std::min(selected_playlist_index_, playlist_.size() - 1);
+    if (playlist_search_enabled_) {
+        selected_playlist_index_ = std::min(selected_playlist_index_, playlist_.size() - 1);
 
-    if (engine_.is_paused() && restart_if_paused &&
-        selected_playlist_index_ == current_track_index_) {
+        if (engine_.is_paused() && restart_if_paused &&
+            selected_playlist_index_ == current_track_index_) {
+            engine_.resume();
+            return;
+        }
+
+        play_track_index(selected_playlist_index_);
+        return;
+    }
+
+    update_playlist_selection_from_ui();
+    if (engine_.is_paused() && restart_if_paused) {
         engine_.resume();
         return;
     }
 
-    play_track_index(selected_playlist_index_);
+    play_track_index(current_track_index_);
 }
 
 void GtkPlayerWindow::halt_active_transport(bool clear_pending_state) {
@@ -5609,6 +5708,9 @@ void GtkPlayerWindow::open_settings_dialog() {
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(clip_detect_check), clip_detection_enabled_ ? TRUE : FALSE);
     GtkWidget* progress_blink_check = gtk_check_button_new_with_label("Animate progress bar cell");
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(progress_blink_check), progress_blink_enabled_ ? TRUE : FALSE);
+    GtkWidget* playlist_search_check =
+        gtk_check_button_new_with_label("Enable playlist search filter");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(playlist_search_check), playlist_search_enabled_ ? TRUE : FALSE);
     GtkWidget* restore_sources_check = gtk_check_button_new_with_label("Restore last opened sources on startup");
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(restore_sources_check), restore_last_sources_enabled_ ? TRUE : FALSE);
     GtkWidget* log_title = gtk_label_new("Logging:");
@@ -5662,11 +5764,12 @@ void GtkPlayerWindow::open_settings_dialog() {
     gtk_grid_attach(GTK_GRID(grid), level_meter_check, 0, 12, 2, 1);
     gtk_grid_attach(GTK_GRID(grid), clip_detect_check, 0, 13, 2, 1);
     gtk_grid_attach(GTK_GRID(grid), progress_blink_check, 0, 14, 2, 1);
-    gtk_grid_attach(GTK_GRID(grid), restore_sources_check, 0, 15, 2, 1);
-    gtk_grid_attach(GTK_GRID(grid), log_sep, 0, 16, 2, 1);
-    gtk_grid_attach(GTK_GRID(grid), log_title, 0, 17, 2, 1);
-    gtk_grid_attach(GTK_GRID(grid), log_check, 0, 18, 2, 1);
-    gtk_grid_attach(GTK_GRID(grid), log_row_grid, 0, 19, 2, 1);
+    gtk_grid_attach(GTK_GRID(grid), playlist_search_check, 0, 15, 2, 1);
+    gtk_grid_attach(GTK_GRID(grid), restore_sources_check, 0, 16, 2, 1);
+    gtk_grid_attach(GTK_GRID(grid), log_sep, 0, 17, 2, 1);
+    gtk_grid_attach(GTK_GRID(grid), log_title, 0, 18, 2, 1);
+    gtk_grid_attach(GTK_GRID(grid), log_check, 0, 19, 2, 1);
+    gtk_grid_attach(GTK_GRID(grid), log_row_grid, 0, 20, 2, 1);
 
     g_signal_connect(log_path_entry, "changed", G_CALLBACK(+[](GtkEditable* editable, gpointer) {
         update_log_path_tooltip(GTK_WIDGET(editable));
@@ -5746,6 +5849,12 @@ void GtkPlayerWindow::open_settings_dialog() {
         level_meter_enabled_ = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(level_meter_check)) != 0;
         clip_detection_enabled_ = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(clip_detect_check)) != 0;
         progress_blink_enabled_ = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(progress_blink_check)) != 0;
+        const bool playlist_search_requested =
+            gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(playlist_search_check)) != 0;
+        if (playlist_search_requested != playlist_search_enabled_) {
+            playlist_search_enabled_ = playlist_search_requested;
+            apply_playlist_search_ui_state();
+        }
         const bool restore_sources_requested =
             gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(restore_sources_check)) != 0;
         if (!restore_sources_requested) {
@@ -7281,7 +7390,7 @@ void GtkPlayerWindow::rebuild_playlist_view() {
                            COL_SEARCH_FOLDED, search_folded.c_str(),
                            -1);
     }
-    if (search_controller_ != nullptr) {
+    if (search_controller_ != nullptr && playlist_search_enabled_) {
         search_controller_->refilter();
     }
 }
@@ -7318,26 +7427,61 @@ void GtkPlayerWindow::update_playlist_row(std::size_t index) {
 }
 
 void GtkPlayerWindow::select_playlist_row(std::size_t index, bool center_vertically) {
-    GtkTreePath* path = nullptr;
-    if (!patches::find_playlist_view_path_for_index(GTK_TREE_VIEW(playlist_view_), index, COL_INDEX, &path) || path == nullptr) {
+    if (playlist_view_ == nullptr) {
         return;
     }
-    GtkTreeSelection* selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(playlist_view_));
-    gtk_tree_selection_unselect_all(selection);
-    gtk_tree_selection_select_path(selection, path);
-    gtk_tree_view_set_cursor(GTK_TREE_VIEW(playlist_view_), path, nullptr, FALSE);
-    gtk_tree_view_scroll_to_cell(GTK_TREE_VIEW(playlist_view_),
-                               path,
-                               nullptr,
-                               TRUE,
-                               center_vertically ? 0.5f : 0.0f,
-                               0.0f);
+
+    GtkTreePath* path = nullptr;
+    if (!patches::find_playlist_view_path_for_index(GTK_TREE_VIEW(playlist_view_), index, COL_INDEX, &path) ||
+        path == nullptr) {
+        return;
+    }
+
+    GtkTreeView* view = GTK_TREE_VIEW(playlist_view_);
+    GtkTreeSelection* selection = gtk_tree_view_get_selection(view);
+    const auto apply_selection = [&]() {
+        gtk_tree_selection_unselect_all(selection);
+        gtk_tree_selection_select_path(selection, path);
+        gtk_tree_view_set_cursor(view, path, nullptr, FALSE);
+        if (center_vertically) {
+            gtk_tree_view_scroll_to_cell(view, path, nullptr, TRUE, 0.5f, 0.0f);
+        } else {
+            gtk_tree_view_scroll_to_cell(view, path, nullptr, FALSE, 0.0f, 0.0f);
+        }
+    };
+
+    if (playlist_search_enabled_ && playlist_selection_changed_handler_id_ != 0) {
+        playlist_selection_syncing_ = true;
+        g_signal_handler_block(selection, playlist_selection_changed_handler_id_);
+        apply_selection();
+        g_signal_handler_unblock(selection, playlist_selection_changed_handler_id_);
+        playlist_selection_syncing_ = false;
+    } else {
+        apply_selection();
+    }
+
     gtk_tree_path_free(path);
-    selected_playlist_index_ = index;
+}
+
+void GtkPlayerWindow::update_playlist_selection_from_ui() {
+    if (playlist_.empty() || playlist_view_ == nullptr) {
+        return;
+    }
+
+    GtkTreeSelection* selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(playlist_view_));
+    GtkTreeModel* model = nullptr;
+    GtkTreeIter iter;
+    if (gtk_tree_selection_get_selected(selection, &model, &iter)) {
+        int index = 0;
+        gtk_tree_model_get(model, &iter, COL_INDEX, &index, -1);
+        if (index >= 0 && static_cast<std::size_t>(index) < playlist_.size()) {
+            current_track_index_ = static_cast<std::size_t>(index);
+        }
+    }
 }
 
 void GtkPlayerWindow::update_selected_playlist_index_from_ui() {
-    if (playlist_.empty() || playlist_view_ == nullptr) {
+    if (!playlist_search_enabled_ || playlist_selection_syncing_ || playlist_.empty() || playlist_view_ == nullptr) {
         return;
     }
 
@@ -7351,6 +7495,9 @@ void GtkPlayerWindow::update_selected_playlist_index_from_ui() {
             row_index < playlist_.size()) {
             selected_playlist_index_ = row_index;
             if (pending_metadata_playback_valid()) {
+                if (pending_metadata_playback_.index == row_index) {
+                    return;
+                }
                 set_pending_metadata_playback(selected_playlist_index_,
                                             pending_metadata_playback_.offset_samples,
                                             pending_metadata_playback_.start_playback,
@@ -7372,6 +7519,10 @@ void GtkPlayerWindow::update_selected_playlist_index_from_ui() {
             row_index < playlist_.size()) {
             selected_playlist_index_ = row_index;
             if (pending_metadata_playback_valid()) {
+                if (pending_metadata_playback_.index == row_index) {
+                    gtk_tree_path_free(cursor_path);
+                    return;
+                }
                 set_pending_metadata_playback(selected_playlist_index_,
                                             pending_metadata_playback_.offset_samples,
                                             pending_metadata_playback_.start_playback,
@@ -7387,12 +7538,11 @@ void GtkPlayerWindow::sync_playlist_view_to_transport(bool center_vertically) {
     if (playlist_.empty() || current_track_index_ >= playlist_.size()) {
         return;
     }
-    selected_playlist_index_ = current_track_index_;
     select_playlist_row(current_track_index_, center_vertically);
 }
 
 void GtkPlayerWindow::sync_playlist_selection_to_filter() {
-    if (playlist_.empty() || playlist_view_ == nullptr) {
+    if (!playlist_search_enabled_ || playlist_.empty() || playlist_view_ == nullptr) {
         return;
     }
 
@@ -7406,12 +7556,7 @@ void GtkPlayerWindow::sync_playlist_selection_to_filter() {
     GtkTreeIter iter;
     GtkTreeModel* selected_model = nullptr;
     if (gtk_tree_selection_get_selected(selection, &selected_model, &iter)) {
-        std::size_t index = 0;
-        if (patches::playlist_index_from_model_iter(selected_model, &iter, COL_INDEX, &index) &&
-            index < playlist_.size()) {
-            selected_playlist_index_ = index;
-            return;
-        }
+        return;
     }
 
     if (!gtk_tree_model_get_iter_first(model, &iter)) {
@@ -7422,25 +7567,29 @@ void GtkPlayerWindow::sync_playlist_selection_to_filter() {
     if (path == nullptr) {
         return;
     }
+
+    if (playlist_selection_changed_handler_id_ != 0) {
+        playlist_selection_syncing_ = true;
+        g_signal_handler_block(selection, playlist_selection_changed_handler_id_);
+    }
     gtk_tree_selection_unselect_all(selection);
     gtk_tree_selection_select_iter(selection, &iter);
     gtk_tree_view_set_cursor(view, path, nullptr, FALSE);
-    gtk_tree_path_free(path);
-
-    std::size_t index = 0;
-    if (patches::playlist_index_from_model_iter(model, &iter, COL_INDEX, &index) &&
-        index < playlist_.size()) {
-        selected_playlist_index_ = index;
+    if (playlist_selection_changed_handler_id_ != 0) {
+        g_signal_handler_unblock(selection, playlist_selection_changed_handler_id_);
+        playlist_selection_syncing_ = false;
     }
+    gtk_tree_path_free(path);
 }
 
 void GtkPlayerWindow::activate_filtered_playlist_selection() {
-    if (playlist_.empty() || playlist_view_ == nullptr) {
+    if (!playlist_search_enabled_ || playlist_.empty() || playlist_view_ == nullptr) {
         return;
     }
 
-    const bool filter_active =
-        search_controller_ != nullptr && search_controller_->is_filter_active();
+    if (search_controller_ != nullptr) {
+        search_controller_->flush_pending_refilter();
+    }
 
     GtkTreeView* view = GTK_TREE_VIEW(playlist_view_);
     GtkTreeModel* model = gtk_tree_view_get_model(view);
@@ -7460,7 +7609,7 @@ void GtkPlayerWindow::activate_filtered_playlist_selection() {
         return;
     }
 
-    if (!filter_active) {
+    if (search_controller_ == nullptr || !search_controller_->is_filter_active()) {
         return;
     }
 
@@ -7553,6 +7702,8 @@ void GtkPlayerWindow::load_preferences() {
             deep_bass_amount_ = clamp_deep_bass_amount_ui(deep_bass_amount_);
         } else if (key == "progress_blink_enabled") {
             progress_blink_enabled_ = (value == "1" || value == "true" || value == "yes");
+        } else if (key == "playlist_search_enabled") {
+            playlist_search_enabled_ = (value == "1" || value == "true" || value == "yes");
         } else if (key == "level_meter_enabled") {
             level_meter_enabled_ = (value == "1" || value == "true" || value == "yes");
         } else if (key == "clip_detection_enabled") {
@@ -7674,6 +7825,7 @@ void GtkPlayerWindow::save_preferences() const {
     out << "deep_bass_preset=" << clamp_deep_bass_preset_ui(deep_bass_preset_) << '\n';
     out << "deep_bass_amount=" << deep_bass_amount_ << '\n';
     out << "progress_blink_enabled=" << (progress_blink_enabled_ ? 1 : 0) << '\n';
+    out << "playlist_search_enabled=" << (playlist_search_enabled_ ? 1 : 0) << '\n';
     out << "level_meter_enabled=" << (level_meter_enabled_ ? 1 : 0) << '\n';
     out << "clip_detection_enabled=" << (clip_detection_enabled_ ? 1 : 0) << '\n';
     out << "resample_rules=" << serialize_resample_rules(resample_rules_) << '\n';

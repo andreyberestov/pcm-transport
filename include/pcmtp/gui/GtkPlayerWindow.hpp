@@ -284,11 +284,14 @@ private:
     void rebuild_playlist_view();
     void update_playlist_row(std::size_t index);
     void select_playlist_row(std::size_t index, bool center_vertically = false);
+    void update_playlist_selection_from_ui();
     void update_selected_playlist_index_from_ui();
     void sync_playlist_cursor_to_selection();
     void sync_playlist_view_to_transport(bool center_vertically = false);
     void sync_playlist_selection_to_filter();
     void activate_filtered_playlist_selection();
+    void apply_playlist_search_handler_connections();
+    void apply_playlist_search_ui_state();
 
     std::unique_ptr<IAudioDecoder> create_decoder_for_entry(const PlaylistEntry& entry, bool for_normalization) const;
     GaplessTrackSpec gapless_spec_for_entry(const PlaylistEntry& entry) const;
@@ -388,6 +391,7 @@ private:
     GtkWidget* soft_volume_scale_ = nullptr;
     bool softvol_dragging_ = false;
     GtkListStore* playlist_store_ = nullptr;
+    GtkWidget* playlist_panel_ = nullptr;
     GtkWidget* playlist_scrolled_ = nullptr;
     GtkWidget* playlist_view_ = nullptr;
     GtkWidget* diagnostics_active_output_value_ = nullptr;
@@ -470,6 +474,11 @@ private:
     guint ui_timer_id_ = 0;
     unsigned int ui_refresh_tick_ = 0;
     bool progress_blink_enabled_ = true;
+    bool playlist_search_enabled_ = false;
+    bool playlist_selection_syncing_ = false;
+    gulong playlist_selection_changed_handler_id_ = 0;
+    gulong playlist_key_press_handler_id_ = 0;
+    gulong playlist_focus_in_handler_id_ = 0;
     std::string alsa_24bit_container_preference_ = "auto";
     bool realtime_audio_priority_enabled_ = false;
     guint pending_seek_timer_id_ = 0;

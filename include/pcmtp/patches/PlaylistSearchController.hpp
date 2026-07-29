@@ -33,7 +33,10 @@ public:
 
     void cancel_search();
     void refilter();
+    void flush_pending_refilter();
     bool is_filter_active() const { return !filter_text_.empty(); }
+    void set_search_entry_visible(bool visible);
+    void teardown_from_panel(GtkBox* playlist_panel);
     gboolean on_playlist_key_press(GtkWidget* widget, GdkEventKey* event);
     void shutdown();
 

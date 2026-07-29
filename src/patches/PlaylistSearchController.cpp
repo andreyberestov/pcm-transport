@@ -104,6 +104,39 @@ void PlaylistSearchController::refilter() {
     }
 }
 
+void PlaylistSearchController::flush_pending_refilter() {
+    if (invalidated_) {
+        return;
+    }
+    cancel_pending_refilter();
+    refilter();
+    if (filter_text_.empty()) {
+        delegate_.on_search_filter_cleared();
+    } else {
+        delegate_.on_search_filtered();
+    }
+}
+
+void PlaylistSearchController::set_search_entry_visible(bool visible) {
+    if (search_entry_ == nullptr) {
+        return;
+    }
+    if (visible) {
+        gtk_widget_show(search_entry_);
+    } else {
+        gtk_widget_hide(search_entry_);
+    }
+}
+
+void PlaylistSearchController::teardown_from_panel(GtkBox* playlist_panel) {
+    if (search_entry_ != nullptr && playlist_panel != nullptr) {
+        gtk_container_remove(GTK_CONTAINER(playlist_panel), search_entry_);
+        gtk_widget_destroy(search_entry_);
+        search_entry_ = nullptr;
+    }
+    shutdown();
+}
+
 void PlaylistSearchController::schedule_refilter() {
     if (invalidated_) {
         return;

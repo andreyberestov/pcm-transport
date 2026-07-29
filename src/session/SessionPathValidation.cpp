@@ -2,8 +2,6 @@
 
 #include <sys/stat.h>
 
-#include <sstream>
-
 namespace pcmtp {
 
 namespace {
@@ -27,20 +25,6 @@ bool stat_regular_file(const std::string& path, SessionFileIdentity* identity) {
 
 } // namespace
 
-std::string session_stable_id(const PlaylistSessionTrack& track) {
-    std::ostringstream out;
-    out << track.audio_file_path << '\x1e'
-        << track.top_level_source_path << '\x1e'
-        << track.track_number << '\x1e'
-        << track.start_sample << '\x1e'
-        << track.source_start_sample << '\x1e'
-        << track.source_end_sample << '\x1e'
-        << track.cue_start_frame_75 << '\x1e'
-        << track.cue_end_frame_75 << '\x1e'
-        << (track.cue_track ? 1 : 0);
-    return out.str();
-}
-
 bool capture_session_file_identity(const std::string& path, SessionFileIdentity& identity) {
     return stat_regular_file(path, &identity);
 }
@@ -50,62 +34,60 @@ bool is_session_regular_file(const std::string& path, SessionFileIdentity* ident
 }
 
 bool session_file_identity_matches(const SessionFileIdentity& saved, const SessionFileIdentity& current) {
-    if (saved.dev == 0 && saved.ino == 0) {
-        return true;
-    }
     return saved.dev == current.dev && saved.ino == current.ino && saved.size == current.size &&
            saved.mtime == current.mtime;
 }
 
-SessionPathValidationStatus validate_session_item(const SessionValidationItem& item) {
-    SessionFileIdentity audio_identity;
-    if (!is_session_regular_file(item.audio_file_path, &audio_identity)) {
-        return SessionPathValidationStatus::Missing;
+bool session_file_identity_known(const SessionFileIdentity& identity) {
+    return identity.dev != 0 || identity.ino != 0;
+}
+
+SessionValidationResultItem validate_session_item(const SessionValidationItem& item) {
+    SessionValidationResultItem result;
+    result.index = item.index;
+    result.stable_id = item.stable_id;
+
+    if (!is_session_regular_file(item.audio_file_path, &result.current_audio_identity)) {
+        result.status = SessionPathValidationStatus::Missing;
+        return result;
     }
-    if (!session_file_identity_matches(item.saved_audio_identity, audio_identity)) {
-        if (item.saved_audio_identity.dev != 0 || item.saved_audio_identity.ino != 0) {
-            return SessionPathValidationStatus::Changed;
-        }
+    result.current_audio_identity_known = true;
+
+    bool audio_changed = false;
+    if (item.saved_audio_identity_known) {
+        audio_changed = !session_file_identity_matches(item.saved_audio_identity, result.current_audio_identity);
+    } else {
+        audio_changed = true;
     }
 
     if (item.cue_track && !item.top_level_source_path.empty()) {
-        SessionFileIdentity cue_identity;
-        if (!is_session_regular_file(item.top_level_source_path, &cue_identity)) {
-            return SessionPathValidationStatus::Missing;
+        if (!is_session_regular_file(item.top_level_source_path, &result.current_top_level_identity)) {
+            result.status = SessionPathValidationStatus::Missing;
+            return result;
         }
-        if (!session_file_identity_matches(item.saved_top_level_identity, cue_identity)) {
-            if (item.saved_top_level_identity.dev != 0 || item.saved_top_level_identity.ino != 0) {
-                return SessionPathValidationStatus::Changed;
-            }
+        result.current_top_level_identity_known = true;
+
+        bool cue_changed = false;
+        if (item.saved_top_level_identity_known) {
+            cue_changed = !session_file_identity_matches(item.saved_top_level_identity,
+                                                         result.current_top_level_identity);
+        } else {
+            cue_changed = true;
+        }
+
+        if (cue_changed) {
+            result.status = SessionPathValidationStatus::ChangedCue;
+            return result;
         }
     }
 
-    return SessionPathValidationStatus::Ok;
-}
-
-std::vector<SessionValidationItem> build_session_validation_snapshot(
-    const std::vector<PlaylistSessionTrack>& tracks) {
-    std::vector<SessionValidationItem> items;
-    items.reserve(tracks.size());
-    for (std::size_t index = 0; index < tracks.size(); ++index) {
-        const PlaylistSessionTrack& track = tracks[index];
-        SessionValidationItem item;
-        item.index = index;
-        item.audio_file_path = track.audio_file_path;
-        item.top_level_source_path = track.top_level_source_path;
-        item.stable_id = session_stable_id(track);
-        item.cue_track = track.cue_track;
-        item.saved_audio_identity.dev = track.file_dev;
-        item.saved_audio_identity.ino = track.file_ino;
-        item.saved_audio_identity.size = track.file_size;
-        item.saved_audio_identity.mtime = track.file_mtime;
-        item.saved_top_level_identity.dev = track.top_level_dev;
-        item.saved_top_level_identity.ino = track.top_level_ino;
-        item.saved_top_level_identity.size = track.top_level_size;
-        item.saved_top_level_identity.mtime = track.top_level_mtime;
-        items.push_back(std::move(item));
+    if (audio_changed) {
+        result.status = SessionPathValidationStatus::ChangedAudio;
+        return result;
     }
-    return items;
+
+    result.status = SessionPathValidationStatus::Ok;
+    return result;
 }
 
 } // namespace pcmtp

@@ -54,11 +54,12 @@ struct PlaylistSessionTrack {
 };
 
 struct PlaylistSessionSnapshot {
-    static constexpr int kFormatVersion = 2;
+    static constexpr int kFormatVersion = 3;
     static constexpr std::size_t kMaxFileBytes = 32 * 1024 * 1024;
     static constexpr std::size_t kMaxTrackCount = 100000;
 
     std::size_t current_track_index = 0;
+    std::vector<std::string> loaded_source_paths;
     std::vector<PlaylistSessionTrack> tracks;
 };
 
@@ -68,6 +69,7 @@ public:
 
     bool load(PlaylistSessionSnapshot& out) const;
     bool save(const PlaylistSessionSnapshot& snapshot) const;
+    bool remove() const;
 };
 
 } // namespace pcmtp

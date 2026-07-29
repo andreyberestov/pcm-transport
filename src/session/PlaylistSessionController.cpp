@@ -12,6 +12,8 @@ struct FocusRestoreData {
     std::size_t index = 0;
 };
 
+} // namespace
+
 gboolean playlist_session_focus_idle_cb(gpointer data) {
     auto* focus_data = static_cast<FocusRestoreData*>(data);
     if (focus_data != nullptr && focus_data->delegate != nullptr && !focus_data->delegate->ui_closing()) {
@@ -21,48 +23,45 @@ gboolean playlist_session_focus_idle_cb(gpointer data) {
     return G_SOURCE_REMOVE;
 }
 
-} // namespace
-
 PlaylistSessionController::PlaylistSessionController(Delegate& delegate) : delegate_(delegate) {}
 
 bool PlaylistSessionController::save(const std::vector<PlaylistSessionTrack>& tracks,
-                                     std::size_t current_index) const {
+                                     std::size_t current_index,
+                                     const std::vector<std::string>& loaded_source_paths) const {
     if (tracks.empty()) {
         return false;
     }
     PlaylistSessionSnapshot snapshot;
     snapshot.tracks = tracks;
     snapshot.current_track_index = std::min(current_index, tracks.size() - 1);
+    snapshot.loaded_source_paths = loaded_source_paths;
     return PlaylistSession().save(snapshot);
 }
 
-bool PlaylistSessionController::load_restore_result(std::vector<PlaylistSessionTrack>& tracks,
-                                                    std::size_t& current_index) {
+bool PlaylistSessionController::load_restore_result(RestoreResult& out) {
+    out = RestoreResult{};
     PlaylistSessionSnapshot snapshot;
     if (!PlaylistSession().load(snapshot)) {
         return false;
     }
 
-    tracks.clear();
-    tracks.reserve(snapshot.tracks.size());
+    out.loaded_source_paths = snapshot.loaded_source_paths;
+    out.tracks.reserve(snapshot.tracks.size());
     for (const PlaylistSessionTrack& track : snapshot.tracks) {
-        if (track.is_stream) {
+        if (track.is_stream || track.audio_file_path.empty()) {
             continue;
         }
-        if (track.audio_file_path.empty()) {
-            continue;
-        }
-        tracks.push_back(track);
+        out.tracks.push_back(track);
     }
-    if (tracks.empty()) {
+    if (out.tracks.empty()) {
         return false;
     }
 
-    current_index = std::min(snapshot.current_track_index, tracks.size() - 1);
+    out.current_index = std::min(snapshot.current_track_index, out.tracks.size() - 1);
     const PlaylistSessionTrack& saved_target =
         snapshot.tracks[std::min(snapshot.current_track_index, snapshot.tracks.size() - 1)];
-    for (std::size_t i = 0; i < tracks.size(); ++i) {
-        const PlaylistSessionTrack& track = tracks[i];
+    for (std::size_t i = 0; i < out.tracks.size(); ++i) {
+        const PlaylistSessionTrack& track = out.tracks[i];
         if (track.audio_file_path == saved_target.audio_file_path &&
             track.top_level_source_path == saved_target.top_level_source_path &&
             track.start_sample == saved_target.start_sample &&
@@ -70,7 +69,7 @@ bool PlaylistSessionController::load_restore_result(std::vector<PlaylistSessionT
             track.source_end_sample == saved_target.source_end_sample &&
             track.cue_track == saved_target.cue_track &&
             track.track_number == saved_target.track_number) {
-            current_index = i;
+            out.current_index = i;
             return true;
         }
     }
@@ -78,15 +77,14 @@ bool PlaylistSessionController::load_restore_result(std::vector<PlaylistSessionT
 }
 
 bool PlaylistSessionController::restore() {
-    std::vector<PlaylistSessionTrack> tracks;
-    std::size_t current_index = 0;
-    if (!load_restore_result(tracks, current_index)) {
+    RestoreResult result;
+    if (!load_restore_result(result)) {
         return false;
     }
 
-    delegate_.apply_restored_session(tracks, current_index);
+    delegate_.apply_restored_session(result.tracks, result.current_index, result.loaded_source_paths);
 
-    auto* focus_data = new FocusRestoreData{&delegate_, current_index};
+    auto* focus_data = new FocusRestoreData{&delegate_, result.current_index};
     g_idle_add(playlist_session_focus_idle_cb, focus_data);
     return true;
 }

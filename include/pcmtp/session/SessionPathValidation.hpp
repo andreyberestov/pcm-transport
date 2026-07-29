@@ -5,8 +5,6 @@
 #include <string>
 #include <vector>
 
-#include "pcmtp/session/PlaylistSession.hpp"
-
 namespace pcmtp {
 
 struct SessionFileIdentity {
@@ -19,7 +17,8 @@ struct SessionFileIdentity {
 enum class SessionPathValidationStatus {
     Ok,
     Missing,
-    Changed,
+    ChangedAudio,
+    ChangedCue,
 };
 
 struct SessionValidationItem {
@@ -29,6 +28,8 @@ struct SessionValidationItem {
     std::string stable_id;
     SessionFileIdentity saved_audio_identity;
     SessionFileIdentity saved_top_level_identity;
+    bool saved_audio_identity_known = false;
+    bool saved_top_level_identity_known = false;
     bool cue_track = false;
 };
 
@@ -36,14 +37,16 @@ struct SessionValidationResultItem {
     std::size_t index = 0;
     std::string stable_id;
     SessionPathValidationStatus status = SessionPathValidationStatus::Missing;
+    SessionFileIdentity current_audio_identity;
+    SessionFileIdentity current_top_level_identity;
+    bool current_audio_identity_known = false;
+    bool current_top_level_identity_known = false;
 };
 
-std::string session_stable_id(const PlaylistSessionTrack& track);
 bool capture_session_file_identity(const std::string& path, SessionFileIdentity& identity);
 bool is_session_regular_file(const std::string& path, SessionFileIdentity* identity = nullptr);
 bool session_file_identity_matches(const SessionFileIdentity& saved, const SessionFileIdentity& current);
-SessionPathValidationStatus validate_session_item(const SessionValidationItem& item);
-std::vector<SessionValidationItem> build_session_validation_snapshot(
-    const std::vector<PlaylistSessionTrack>& tracks);
+bool session_file_identity_known(const SessionFileIdentity& identity);
+SessionValidationResultItem validate_session_item(const SessionValidationItem& item);
 
 } // namespace pcmtp

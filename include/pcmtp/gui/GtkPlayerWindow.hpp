@@ -14,6 +14,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "pcmtp/core/PcmTypes.hpp"
@@ -63,6 +64,14 @@ private:
         Failed
     };
 
+    enum class PathValidationState {
+        NotRequired,
+        Pending,
+        Ok,
+        Changed,
+        Missing,
+    };
+
     struct PlaylistEntry {
         std::string audio_file_path;
         std::string top_level_source_path;
@@ -99,6 +108,15 @@ private:
         std::shared_ptr<PcmBuffer> normalized_pcm;
         AudioFormat normalized_format{};
         bool normalization_matches_current = false;
+        PathValidationState path_validation_state = PathValidationState::NotRequired;
+        SessionFileIdentity saved_audio_identity;
+        SessionFileIdentity saved_top_level_identity;
+        bool saved_audio_identity_known = false;
+        bool saved_top_level_identity_known = false;
+        SessionFileIdentity current_audio_identity;
+        SessionFileIdentity current_top_level_identity;
+        bool current_audio_identity_known = false;
+        bool current_top_level_identity_known = false;
     };
 
     struct MetadataProbeJob {
@@ -217,6 +235,7 @@ private:
                                     const std::string& path,
                                     const MediaProbeResult& result);
     bool prepare_track_for_playback(std::size_t index);
+    bool track_path_validated_for_playback(const PlaylistEntry& entry) const;
     void prioritize_metadata_probe(const std::string& path);
     void set_pending_metadata_playback(std::size_t index,
                                        std::uint64_t offset_samples,
@@ -280,12 +299,14 @@ private:
     bool try_restore_previous_session();
     void resume_restored_session_metadata_loading();
     void start_session_path_validation();
-    void stop_session_path_validation();
+    void stop_session_path_validation(bool join_thread = false);
     void apply_session_path_validation_batch(std::uint64_t generation,
                                              std::uint64_t playlist_generation,
-                                             std::vector<SessionValidationResultItem> results,
-                                             bool final_batch);
+                                             std::vector<SessionValidationResultItem> results);
+    void on_session_path_validation_complete(std::uint64_t generation, std::uint64_t playlist_generation);
+    void reopen_session_cue_sources(const std::vector<std::string>& cue_paths);
     static gboolean on_session_path_validation_idle(gpointer user_data);
+    static std::string session_stable_id_for_entry(const PlaylistEntry& entry);
     static PlaylistSessionTrack session_track_from_entry(const PlaylistEntry& entry);
     static PlaylistEntry playlist_entry_from_session_track(const PlaylistSessionTrack& track);
     static void reset_entry_metadata_for_reprobe(PlaylistEntry& entry);
@@ -485,8 +506,8 @@ private:
     bool session_dirty_ = false;
     bool session_shutdown_save_done_ = false;
     std::atomic<bool> session_path_validation_stop_{false};
-    std::uint64_t session_path_validation_generation_ = 0;
-    std::uint64_t session_playlist_generation_ = 0;
+    std::atomic<std::uint64_t> session_path_validation_generation_{0};
+    std::atomic<std::uint64_t> session_playlist_generation_{0};
     std::thread session_path_validation_thread_;
     std::mutex session_validation_mutex_;
     std::deque<std::vector<SessionValidationResultItem>> session_validation_pending_batches_;
@@ -494,6 +515,7 @@ private:
     std::uint64_t session_validation_pending_playlist_generation_ = 0;
     bool session_validation_final_batch_pending_ = false;
     guint session_validation_idle_id_ = 0;
+    std::unordered_set<std::string> session_cue_reopen_paths_;
 };
 
 } // namespace pcmtp

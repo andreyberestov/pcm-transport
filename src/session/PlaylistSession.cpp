@@ -1,5 +1,8 @@
 #include "pcmtp/session/PlaylistSession.hpp"
 
+#include <cerrno>
+
+#include "pcmtp/core/DsdRates.hpp"
 #include "pcmtp/session/SessionLimits.hpp"
 
 #include <glib.h>
@@ -206,6 +209,13 @@ bool validate_track(const PlaylistSessionTrack& track) {
     }
     if (track.metadata_state != 1) {
         return true;
+    }
+    if (track.file_dev == 0 && track.file_ino == 0) {
+        return false;
+    }
+    if (track.cue_track && !track.top_level_source_path.empty() &&
+        track.top_level_dev == 0 && track.top_level_ino == 0) {
+        return false;
     }
     if (track.decoded_channels == 0 || track.decoded_channels > kMaxChannels) {
         return false;
@@ -568,6 +578,26 @@ public:
                     return false;
                 }
                 snapshot.current_track_index = static_cast<std::size_t>(index);
+            } else if (key == "loaded_source_paths") {
+                if (!consume('[')) {
+                    return false;
+                }
+                bool path_first = true;
+                while (true) {
+                    skip_whitespace();
+                    if (consume(']')) {
+                        break;
+                    }
+                    if (!path_first && !consume(',')) {
+                        return false;
+                    }
+                    path_first = false;
+                    std::string path;
+                    if (!parse_string(path) || path.empty()) {
+                        return false;
+                    }
+                    snapshot.loaded_source_paths.push_back(std::move(path));
+                }
             } else if (key == "tracks") {
                 if (!consume('[')) {
                     return false;
@@ -719,7 +749,26 @@ bool PlaylistSession::save(const PlaylistSessionSnapshot& snapshot) const {
     if (!write("{\n") ||
         !write("  \"version\": " + std::to_string(PlaylistSessionSnapshot::kFormatVersion) + ",\n") ||
         !write("  \"current_track_index\": " + std::to_string(snapshot.current_track_index) + ",\n") ||
-        !write("  \"tracks\": [\n")) {
+        !write("  \"loaded_source_paths\": [\n")) {
+        out.close();
+        std::remove(tmp_path.c_str());
+        return false;
+    }
+
+    for (std::size_t i = 0; i < snapshot.loaded_source_paths.size(); ++i) {
+        std::string line = "    \"" + json_escape(snapshot.loaded_source_paths[i]) + "\"";
+        if (i + 1 < snapshot.loaded_source_paths.size()) {
+            line += ',';
+        }
+        line += '\n';
+        if (!write(line)) {
+            out.close();
+            std::remove(tmp_path.c_str());
+            return false;
+        }
+    }
+
+    if (!write("  ],\n") || !write("  \"tracks\": [\n")) {
         out.close();
         std::remove(tmp_path.c_str());
         return false;
@@ -765,6 +814,19 @@ bool PlaylistSession::save(const PlaylistSessionSnapshot& snapshot) const {
         return false;
     }
     return true;
+}
+
+bool PlaylistSession::remove() const {
+    const std::string path = session_path();
+    const std::string tmp_path = path + ".tmp";
+    bool ok = true;
+    if (!path.empty() && std::remove(path.c_str()) != 0 && errno != ENOENT) {
+        ok = false;
+    }
+    if (!tmp_path.empty() && std::remove(tmp_path.c_str()) != 0 && errno != ENOENT) {
+        ok = false;
+    }
+    return ok;
 }
 
 } // namespace pcmtp

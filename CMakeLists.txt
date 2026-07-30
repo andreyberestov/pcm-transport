@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(pcm_transport VERSION 0.9.111 LANGUAGES C CXX)
+project(pcm_transport VERSION 0.9.112 LANGUAGES C CXX)
 
 include(GNUInstallDirs)
 
@@ -53,6 +53,21 @@ set(PCM_TRANSPORT_SESSION_SOURCES
     src/session/SessionPathValidation.cpp
 )
 
+set(PCM_TRANSPORT_PATCH_SOURCES
+    src/patches/PlaylistSearchController.cpp
+    src/patches/PlaylistSelectionPatches.cpp
+)
+
+add_library(pcm_transport_patches STATIC ${PCM_TRANSPORT_PATCH_SOURCES})
+target_include_directories(pcm_transport_patches PUBLIC include)
+target_include_directories(pcm_transport_patches PRIVATE
+    ${GTK3_INCLUDE_DIRS}
+)
+target_compile_options(pcm_transport_patches PRIVATE
+    ${GTK3_CFLAGS_OTHER}
+    -Wall -Wextra -Wpedantic
+)
+
 add_executable(pcm_transport
     src/main.cpp
     src/app/Application.cpp
@@ -101,6 +116,7 @@ target_link_directories(pcm_transport PRIVATE
 )
 
 target_link_libraries(pcm_transport PRIVATE
+    pcm_transport_patches
     ${ALSA_LIBRARIES}
     ${FLAC_LIBRARIES}
     ${GTK3_LIBRARIES}

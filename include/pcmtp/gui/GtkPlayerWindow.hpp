@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrey Berestov and PCM Transport contributors
+// SPDX-License-Identifier: GPL-3.0-only
+
 #pragma once
 
 #include <gtk/gtk.h>
@@ -29,11 +32,24 @@
 #include "pcmtp/playlist/SourceScanner.hpp"
 #include "pcmtp/session/PlaylistSessionController.hpp"
 #include "pcmtp/session/SessionPathValidation.hpp"
+#include "pcmtp/patches/PlaylistSearchController.hpp"
 #include "pcmtp/util/ManagedSubprocess.hpp"
 
 namespace pcmtp {
 
+class GtkPlayerWindow;
+
+namespace patches {
+gboolean on_playlist_focus_in(GtkWidget* widget, GdkEventFocus* event, gpointer user_data);
+gboolean on_playlist_view_key_press(GtkWidget* widget, GdkEventKey* event, gpointer user_data);
+void on_playlist_selection_changed(GtkTreeSelection* selection, gpointer user_data);
+} // namespace patches
+
 class GtkPlayerWindow {
+    friend gboolean patches::on_playlist_focus_in(GtkWidget* widget, GdkEventFocus* event, gpointer user_data);
+    friend gboolean patches::on_playlist_view_key_press(GtkWidget* widget, GdkEventKey* event, gpointer user_data);
+    friend void patches::on_playlist_selection_changed(GtkTreeSelection* selection, gpointer user_data);
+
 public:
     struct ResampleRule {
         std::uint32_t from_rate = 0;
@@ -80,6 +96,7 @@ private:
         int track_number = 0;
         std::string title;
         std::string performer;
+        std::string album;
         std::uint64_t start_sample = 0;
         std::uint64_t end_sample = 0;
         std::uint64_t source_start_sample = 0;
@@ -136,6 +153,7 @@ private:
         bool replace_playlist = true;
         bool quiet = false;
         bool record_last_sources = false;
+        bool restore_saved_sources = false;
         std::string play_after_load_path;
         std::shared_ptr<std::atomic<bool>> cancel_requested;
     };
@@ -143,6 +161,12 @@ private:
     struct SourceScanCompletion {
         SourceScanJob job;
         SourceScanResult result;
+    };
+
+    enum class PlaylistSelectionMode {
+        ExplicitUser,
+        FollowTransport,
+        FilterCandidate
     };
 
     struct PendingMetadataPlayback {
@@ -153,6 +177,7 @@ private:
         bool start_playback = true;
         bool preserve_paused = false;
         bool update_mpris_track = true;
+        bool preserve_explicit_selection = false;
         std::string waiting_path;
     };
 
@@ -169,6 +194,15 @@ private:
                         const gchar* hint,
                         gpointer user_data);
     static void on_open_clicked(GtkButton* button, gpointer user_data);
+    static gboolean on_open_button_press(GtkWidget* widget, GdkEventButton* event, gpointer user_data);
+    static void on_playlist_drag_data_received(GtkWidget* widget,
+                                               GdkDragContext* context,
+                                               gint x,
+                                               gint y,
+                                               GtkSelectionData* selection_data,
+                                               guint info,
+                                               guint time,
+                                               gpointer user_data);
     static void on_play_clicked(GtkButton* button, gpointer user_data);
     static void on_pause_clicked(GtkButton* button, gpointer user_data);
     static void on_stop_clicked(GtkButton* button, gpointer user_data);
@@ -202,6 +236,7 @@ private:
     static void on_media_next(GSimpleAction* action, GVariant* parameter, gpointer user_data);
     static void on_media_previous(GSimpleAction* action, GVariant* parameter, gpointer user_data);
     static gboolean on_restore_last_sources_idle(gpointer user_data);
+    static gboolean on_preferences_save_timeout(gpointer user_data);
 
     void build_ui(GtkApplication* app);
     void start_source_scan_worker();
@@ -211,12 +246,14 @@ private:
                            bool replace_playlist,
                            bool quiet,
                            bool record_last_sources,
-                           const std::string& play_after_load_path = std::string());
+                           const std::string& play_after_load_path = std::string(),
+                           bool restore_saved_sources = false);
     void enqueue_source_scan(const std::vector<std::string>& paths,
                              bool replace_playlist,
                              bool quiet,
                              bool record_last_sources,
-                             const std::string& play_after_load_path);
+                             const std::string& play_after_load_path,
+                             bool restore_saved_sources);
     void cancel_source_scan();
     void drain_source_scan_results();
     std::size_t append_source_placeholders(const std::string& path,
@@ -241,7 +278,8 @@ private:
                                        std::uint64_t offset_samples,
                                        bool start_playback,
                                        bool preserve_paused,
-                                       bool update_mpris_track);
+                                       bool update_mpris_track,
+                                       bool preserve_explicit_selection);
     void clear_pending_metadata_play();
     void advance_pending_metadata_playback(int direction);
     void try_start_pending_metadata_play(const std::string& path);
@@ -256,13 +294,15 @@ private:
                                                bool replace_playlist,
                                                bool quiet,
                                                bool record_last_sources,
-                                               const std::string& play_after_load_path = std::string());
+                                               const std::string& play_after_load_path = std::string(),
+                                               bool restore_saved_sources = false);
     std::vector<std::string> load_resolved_source_paths(
         const std::vector<ScannedSourcePath>& paths,
         bool replace_playlist,
         bool quiet,
         bool record_last_sources,
-        const std::string& play_after_load_path);
+        const std::string& play_after_load_path,
+        bool restore_saved_sources);
     void finalize_loaded_playlist(bool rebuild_view = true);
     void schedule_last_sources_restore();
     void start_current_track(bool restart_if_paused = true);
@@ -270,13 +310,15 @@ private:
     void remap_playlist_indices_after_failed_removal(
         const std::vector<std::optional<std::size_t>>& index_remap);
     void stop_playback();
-    void play_track_index(std::size_t index);
+    void play_track_index(std::size_t index, bool preserve_explicit_selection = false);
     void play_track_index_at_offset(std::size_t index,
                                     std::uint64_t offset_samples,
                                     bool start_playback = true,
                                     bool preserve_paused = false,
-                                    bool update_mpris_track = true);
+                                    bool update_mpris_track = true,
+                                    bool preserve_explicit_selection = false);
     void open_file_dialog();
+    void open_directory_dialog();
     void open_settings_dialog();
     void open_about_dialog();
     void open_eq_dialog();
@@ -284,14 +326,31 @@ private:
     void open_bitperfect_test_dialog(GtkWidget* parent_dialog, int duration_seconds);
     void refresh_device_list();
     void load_preferences();
+    std::string serialize_preferences() const;
     void save_preferences() const;
+    void save_preferences_now() const;
+    void flush_preferences_save() const;
     void refresh_dsp_info_for_current_device();
     void refresh_display(bool update_text = true, bool update_progress = true, bool update_meter = true);
     void stop_ui_updates();
     void cancel_pending_seek();
     void rebuild_playlist_view();
+    void reset_playlist_column_widths();
+    void begin_playlist_selection_sync();
+    void end_playlist_selection_sync();
+    void rebuild_playlist_search_cache();
+    void clear_playlist_search_cache();
     void update_playlist_row(std::size_t index);
-    void select_playlist_row(std::size_t index);
+    bool select_playlist_row(std::size_t index, bool center_vertically = false);
+    void reset_playlist_selection_state(std::size_t index = 0);
+    void set_explicit_playlist_selection(std::size_t index);
+    void sync_playlist_selection_after_transport_change(std::size_t index,
+                                                        bool preserve_explicit_selection,
+                                                        bool center_vertically = false);
+    std::size_t playlist_play_target_index() const;
+    PlaylistSelectionMode playlist_selection_mode_without_filter_candidate() const;
+    void restore_playlist_selection_after_filter(bool center_vertically = false);
+    void select_first_filter_candidate();
     void update_playlist_selection_from_ui();
     void initialize_playlist_session();
     void mark_session_dirty();
@@ -310,6 +369,13 @@ private:
     static PlaylistSessionTrack session_track_from_entry(const PlaylistEntry& entry);
     static PlaylistEntry playlist_entry_from_session_track(const PlaylistSessionTrack& track);
     static void reset_entry_metadata_for_reprobe(PlaylistEntry& entry);
+    void update_selected_playlist_index_from_ui();
+    void sync_playlist_cursor_to_selection();
+    void sync_playlist_selection_to_filter();
+    void activate_filtered_playlist_selection();
+    void apply_playlist_search_handler_connections();
+    void apply_playlist_search_ui_state();
+    void adjust_playlist_search_window_height(bool enabled);
 
     std::unique_ptr<IAudioDecoder> create_decoder_for_entry(const PlaylistEntry& entry, bool for_normalization) const;
     GaplessTrackSpec gapless_spec_for_entry(const PlaylistEntry& entry) const;
@@ -342,6 +408,7 @@ private:
     void refresh_active_alsa_output_diagnostics();
     void setup_mpris();
     void setup_media_keys(GtkApplication* app);
+    void initialize_playlist_search();
     void handle_media_play();
     void handle_media_pause();
     void handle_media_stop();
@@ -408,12 +475,21 @@ private:
     GtkWidget* soft_volume_scale_ = nullptr;
     bool softvol_dragging_ = false;
     GtkListStore* playlist_store_ = nullptr;
+    GtkWidget* playlist_panel_ = nullptr;
+    GtkWidget* playlist_scrolled_ = nullptr;
     GtkWidget* playlist_view_ = nullptr;
+    GtkTreeViewColumn* playlist_expand_column_ = nullptr;
     GtkWidget* diagnostics_active_output_value_ = nullptr;
 
     PlaybackEngine engine_;
     std::vector<PlaylistEntry> playlist_;
     std::size_t current_track_index_ = 0;
+    std::size_t selected_playlist_index_ = 0;
+    PlaylistSelectionMode playlist_selection_mode_ = PlaylistSelectionMode::FollowTransport;
+    PlaylistSelectionMode playlist_selection_mode_before_filter_candidate_ =
+        PlaylistSelectionMode::FollowTransport;
+    std::size_t playlist_selection_index_before_filter_candidate_ = 0;
+    bool playlist_filter_candidate_valid_ = false;
     std::string current_device_ = "default";
     std::vector<CardProfileInfo> cards_;
     DspConnectionInfo current_dsp_info_{};
@@ -471,6 +547,7 @@ private:
     std::size_t metadata_failed_files_ = 0;
     bool metadata_load_quiet_ = false;
     bool metadata_load_record_sources_ = false;
+    bool metadata_load_restore_sources_ = false;
     bool metadata_load_replace_playlist_ = false;
     std::vector<std::string> metadata_load_requested_sources_;
     std::string play_after_metadata_path_;
@@ -482,12 +559,23 @@ private:
     std::vector<std::string> last_opened_sources_;
     std::vector<std::string> current_loaded_source_paths_;
     guint restore_sources_idle_id_ = 0;
+    mutable guint preferences_save_timeout_id_ = 0;
+    mutable std::string persisted_preferences_snapshot_;
     std::unordered_map<std::string, CueSheet> cue_cache_;
     std::chrono::steady_clock::time_point clip_hold_until_{};
     std::uint32_t clip_hold_samples_ = 0;
     guint ui_timer_id_ = 0;
     unsigned int ui_refresh_tick_ = 0;
     bool progress_blink_enabled_ = true;
+    bool playlist_search_enabled_ = false;
+    bool playlist_search_window_height_adjusted_ = false;
+    int playlist_search_window_height_delta_ = 0;
+    bool playlist_selection_syncing_ = false;
+    bool playlist_selection_handler_blocked_ = false;
+    unsigned int playlist_selection_sync_depth_ = 0;
+    gulong playlist_selection_changed_handler_id_ = 0;
+    gulong playlist_key_press_handler_id_ = 0;
+    gulong playlist_focus_in_handler_id_ = 0;
     std::string alsa_24bit_container_preference_ = "auto";
     bool realtime_audio_priority_enabled_ = false;
     guint pending_seek_timer_id_ = 0;
@@ -516,6 +604,10 @@ private:
     bool session_validation_final_batch_pending_ = false;
     guint session_validation_idle_id_ = 0;
     std::unordered_set<std::string> session_cue_reopen_paths_;
+    class PlaylistSelectionSignalBlocker;
+    struct SearchDelegate;
+    std::unique_ptr<SearchDelegate> search_delegate_;
+    std::unique_ptr<PlaylistSearchController> search_controller_;
 };
 
 } // namespace pcmtp

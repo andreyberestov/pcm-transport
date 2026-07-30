@@ -1,8 +1,10 @@
+// SPDX-FileCopyrightText: 2026 Andrey Berestov and PCM Transport contributors
+// SPDX-License-Identifier: GPL-3.0-only
+
 #pragma once
 
 #include <gtk/gtk.h>
 
-#include <cstddef>
 #include <string>
 
 namespace pcmtp {
@@ -14,14 +16,14 @@ public:
         virtual ~Delegate() = default;
 
         virtual GtkListStore* playlist_store() = 0;
-        virtual GtkWidget* playlist_view() = 0;
         virtual int col_search_folded() const = 0;
-        virtual int col_index() const = 0;
         virtual bool ui_closing() const = 0;
         virtual void on_search_filter_cleared() = 0;
         virtual void on_search_filtered() = 0;
         virtual void on_search_cancelled() = 0;
         virtual void activate_filtered_playlist_selection() = 0;
+        virtual void begin_refilter() = 0;
+        virtual void end_refilter() = 0;
     };
 
     explicit PlaylistSearchController(Delegate& delegate);
@@ -29,15 +31,14 @@ public:
 
     void install_in_panel(GtkBox* playlist_panel);
     GtkTreeModelFilter* filter_model() const { return filter_; }
-    void release_filter_reference();
+    int search_entry_natural_height() const;
 
     void cancel_search();
     void refilter();
     void flush_pending_refilter();
     bool is_filter_active() const { return !filter_text_.empty(); }
-    void set_search_entry_visible(bool visible);
-    void teardown_from_panel(GtkBox* playlist_panel);
     gboolean on_playlist_key_press(GtkWidget* widget, GdkEventKey* event);
+    void invalidate();
     void shutdown();
 
 private:
@@ -57,7 +58,6 @@ private:
     GtkWidget* search_entry_ = nullptr;
     std::string filter_text_;
     bool invalidated_ = false;
-    bool filter_reference_released_ = false;
     gulong search_changed_handler_id_ = 0;
     gulong search_key_press_handler_id_ = 0;
     guint refilter_timeout_id_ = 0;

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrey Berestov and PCM Transport contributors
+// SPDX-License-Identifier: GPL-3.0-only
+
 #include "pcmtp/patches/PlaylistSearchController.hpp"
 
 #include <cstring>
@@ -36,10 +39,14 @@ void PlaylistSearchController::install_in_panel(GtkBox* playlist_panel) {
     gtk_box_set_spacing(playlist_panel, 10);
 
     search_entry_ = gtk_search_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(search_entry_), "Search title or artist");
+    g_object_add_weak_pointer(G_OBJECT(search_entry_),
+                              reinterpret_cast<gpointer*>(&search_entry_));
+    gtk_entry_set_placeholder_text(GTK_ENTRY(search_entry_), "Search artist, album or title");
     GtkStyleContext* search_style = gtk_widget_get_style_context(search_entry_);
     gtk_style_context_add_class(search_style, "playlist-search-entry");
     gtk_box_pack_start(playlist_panel, search_entry_, FALSE, FALSE, 0);
+    gtk_box_reorder_child(playlist_panel, search_entry_, 0);
+    gtk_widget_show(search_entry_);
 
     GtkListStore* store = delegate_.playlist_store();
     if (store != nullptr) {
@@ -58,11 +65,14 @@ void PlaylistSearchController::install_in_panel(GtkBox* playlist_panel) {
                                                     this);
 }
 
-void PlaylistSearchController::release_filter_reference() {
-    if (filter_ != nullptr && !filter_reference_released_) {
-        g_object_unref(filter_);
-        filter_reference_released_ = true;
+int PlaylistSearchController::search_entry_natural_height() const {
+    if (search_entry_ == nullptr) {
+        return 0;
     }
+    gint minimum_height = 0;
+    gint natural_height = 0;
+    gtk_widget_get_preferred_height(search_entry_, &minimum_height, &natural_height);
+    return natural_height > 0 ? natural_height : minimum_height;
 }
 
 void PlaylistSearchController::cancel_pending_refilter() {
@@ -90,22 +100,29 @@ void PlaylistSearchController::cancel_search() {
         return;
     }
 
+    const bool needs_refilter = refilter_timeout_id_ != 0 || !filter_text_.empty();
     cancel_pending_refilter();
     filter_text_.clear();
     set_search_text("");
-    refilter();
-    delegate_.on_search_filter_cleared();
+    if (needs_refilter) {
+        refilter();
+        delegate_.on_search_filter_cleared();
+    }
     delegate_.on_search_cancelled();
 }
 
 void PlaylistSearchController::refilter() {
-    if (filter_ != nullptr && !invalidated_ && GTK_IS_TREE_MODEL_FILTER(filter_)) {
-        gtk_tree_model_filter_refilter(filter_);
+    if (filter_ == nullptr || invalidated_ || !GTK_IS_TREE_MODEL_FILTER(filter_)) {
+        return;
     }
+
+    delegate_.begin_refilter();
+    gtk_tree_model_filter_refilter(filter_);
+    delegate_.end_refilter();
 }
 
 void PlaylistSearchController::flush_pending_refilter() {
-    if (invalidated_) {
+    if (invalidated_ || refilter_timeout_id_ == 0) {
         return;
     }
     cancel_pending_refilter();
@@ -115,26 +132,6 @@ void PlaylistSearchController::flush_pending_refilter() {
     } else {
         delegate_.on_search_filtered();
     }
-}
-
-void PlaylistSearchController::set_search_entry_visible(bool visible) {
-    if (search_entry_ == nullptr) {
-        return;
-    }
-    if (visible) {
-        gtk_widget_show(search_entry_);
-    } else {
-        gtk_widget_hide(search_entry_);
-    }
-}
-
-void PlaylistSearchController::teardown_from_panel(GtkBox* playlist_panel) {
-    if (search_entry_ != nullptr && playlist_panel != nullptr) {
-        gtk_container_remove(GTK_CONTAINER(playlist_panel), search_entry_);
-        gtk_widget_destroy(search_entry_);
-        search_entry_ = nullptr;
-    }
-    shutdown();
 }
 
 void PlaylistSearchController::schedule_refilter() {
@@ -240,7 +237,11 @@ gboolean PlaylistSearchController::on_search_entry_key_press(GtkWidget* widget, 
     return FALSE;
 }
 
-void PlaylistSearchController::shutdown() {
+void PlaylistSearchController::invalidate() {
+    if (invalidated_) {
+        return;
+    }
+
     invalidated_ = true;
     cancel_pending_refilter();
     if (search_entry_ != nullptr) {
@@ -253,8 +254,22 @@ void PlaylistSearchController::shutdown() {
             search_key_press_handler_id_ = 0;
         }
     }
-    filter_ = nullptr;
-    search_entry_ = nullptr;
+}
+
+void PlaylistSearchController::shutdown() {
+    invalidate();
+
+    if (search_entry_ != nullptr) {
+        GtkWidget* entry = search_entry_;
+        g_object_remove_weak_pointer(G_OBJECT(entry),
+                                     reinterpret_cast<gpointer*>(&search_entry_));
+        search_entry_ = nullptr;
+        gtk_widget_destroy(entry);
+    }
+    if (filter_ != nullptr) {
+        g_object_unref(filter_);
+        filter_ = nullptr;
+    }
 }
 
 void PlaylistSearchController::on_search_changed(GtkEditable* editable, gpointer user_data) {

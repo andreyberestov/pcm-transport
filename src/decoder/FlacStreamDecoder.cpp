@@ -94,6 +94,12 @@ std::size_t FlacStreamDecoder::read_samples(PcmSample* destination, std::size_t 
         throw std::runtime_error("Decoder not opened");
     }
 
+    const std::size_t channels = std::max<std::size_t>(1, format_.channels);
+    max_samples -= max_samples % channels;
+    if (max_samples == 0) {
+        return 0;
+    }
+
     fill_queue_if_needed();
 
     std::lock_guard<std::mutex> lock(mutex_);
@@ -106,8 +112,15 @@ std::size_t FlacStreamDecoder::read_samples(PcmSample* destination, std::size_t 
             continue;
         }
         const std::size_t available = front.size() - block_offset_;
+        if (block_offset_ % channels != 0 || available % channels != 0) {
+            throw std::runtime_error("FLAC decoder queued an incomplete PCM frame");
+        }
         const std::size_t needed = max_samples - copied;
-        const std::size_t take = std::min(available, needed);
+        std::size_t take = std::min(available, needed);
+        take -= take % channels;
+        if (take == 0) {
+            break;
+        }
         std::copy(front.data() + block_offset_, front.data() + block_offset_ + take, destination + copied);
         copied += take;
         block_offset_ += take;
@@ -131,6 +144,12 @@ std::uint64_t FlacStreamDecoder::total_samples_per_channel() const {
 
 std::string FlacStreamDecoder::source_path() const {
     return path_;
+}
+
+PresentationEndKind FlacStreamDecoder::presentation_end_kind() const noexcept {
+    return total_samples_per_channel_ > 0
+        ? PresentationEndKind::ExactSampleSpan
+        : PresentationEndKind::Unknown;
 }
 
 bool FlacStreamDecoder::seek_to_sample(std::uint64_t sample_index) {

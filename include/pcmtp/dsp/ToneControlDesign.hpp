@@ -81,13 +81,6 @@ double process_deep_bass_normalized(double input,
                                     DeepBassPreset preset,
                                     DeepBassState& state,
                                     double amount_gain = 1.0);
-void process_deep_bass_normalized_stereo(double& left,
-                                         double& right,
-                                         std::uint32_t sample_rate,
-                                         DeepBassPreset preset,
-                                         DeepBassState& left_state,
-                                         DeepBassState& right_state,
-                                         double amount_gain = 1.0);
 double estimate_total_processing_max_gain_db(std::uint32_t sample_rate,
                                              int bass_db,
                                              int bass_hz,

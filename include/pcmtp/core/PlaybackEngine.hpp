@@ -4,9 +4,9 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <condition_variable>
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -23,37 +23,54 @@ struct PlaybackStatusSnapshot {
     bool playing = false;
     bool paused = false;
     bool finished = false;
+    AudioFormat format{};
     std::uint64_t current_samples_per_channel = 0;
     std::uint64_t total_samples_per_channel = 0;
+    bool segment_position_valid = false;
+    std::size_t segment_index = 0;
+    std::uint64_t segment_samples_per_channel = 0;
+    TransportTruncationKind transport_truncation_kind =
+        TransportTruncationKind::None;
     std::string message;
     std::string active_output_report;
-    float peak_level = 0.0f;
-    bool clip_detected = false;
-    std::uint32_t clipped_samples = 0;
 };
 
 struct PlaybackTransportSnapshot {
     bool playing = false;
     bool paused = false;
+    bool finished = false;
+    AudioFormat format{};
     std::uint64_t current_samples_per_channel = 0;
+    std::uint64_t total_samples_per_channel = 0;
+    bool segment_position_valid = false;
+    std::size_t segment_index = 0;
+    std::uint64_t segment_samples_per_channel = 0;
+    TransportTruncationKind transport_truncation_kind =
+        TransportTruncationKind::None;
 };
 
-using PlaybackStatusCallback = std::function<void(const PlaybackStatusSnapshot&)>;
+struct PlaybackMeterSnapshot {
+    bool peak_measured = false;
+    float peak_level = 0.0f;
+    std::uint32_t clipped_samples = 0;
+    bool transport_active = false;
+};
 
 class PlaybackEngine {
 public:
-    explicit PlaybackEngine(std::size_t transport_buffer_milliseconds);
+    PlaybackEngine();
     ~PlaybackEngine();
 
     void start(std::unique_ptr<IAudioDecoder> decoder,
                std::unique_ptr<IAudioBackend> backend,
                const std::string& device_name,
-               PlaybackStatusCallback callback = PlaybackStatusCallback(),
                std::uint64_t initial_samples_per_channel = 0);
 
     void stop();
     void pause();
     void resume();
+    void request_stop_after_current_segment(std::uint64_t segment_end_sample);
+    void request_stop_after_segment(std::size_t segment_index);
 
     bool is_playing() const;
     bool is_paused() const;
@@ -66,29 +83,20 @@ public:
     void set_deep_bass_enabled(bool enabled);
     bool deep_bass_enabled() const;
     void set_deep_bass_preset(int preset);
-    int deep_bass_preset() const;
     void set_deep_bass_amount(int amount_steps);
-    int deep_bass_amount() const;
     void set_level_meter_enabled(bool enabled);
-    bool level_meter_enabled() const;
     void set_clip_detection_enabled(bool enabled);
-    bool clip_detection_enabled() const;
     int bass_db() const;
     int treble_db() const;
     PlaybackStatusSnapshot snapshot() const;
     PlaybackTransportSnapshot transport_snapshot() const;
+    PlaybackMeterSnapshot consume_meter_snapshot();
     std::string last_error() const;
-    std::size_t transport_buffer_milliseconds() const;
 
     void set_realtime_priority_enabled(bool enabled);
     void set_realtime_priority(int priority);
-    bool realtime_priority_enabled() const;
-    int realtime_priority() const;
-    long playback_thread_id() const;
-    std::string realtime_priority_status() const;
     std::string refresh_realtime_priority_status();
     std::string request_realtime_priority_for_playback_thread();
-    bool realtime_priority_service_available() const;
 
     std::string active_output_report() const;
 
@@ -97,11 +105,8 @@ private:
     std::string try_set_realtime_priority_for_current_thread();
     std::string verified_realtime_priority_status(long tid) const;
     void wait_if_paused();
-    void update_status(bool force = false);
     void set_error(const std::string& message);
     void join_threads();
-
-    const std::size_t transport_buffer_milliseconds_;
 
     mutable std::mutex state_mutex_;
     PlaybackStatusSnapshot snapshot_{};
@@ -111,11 +116,9 @@ private:
     std::unique_ptr<IAudioBackend> backend_;
     AudioFormat format_{};
     std::string device_name_;
-    PlaybackStatusCallback callback_;
 
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> pause_requested_{false};
-    std::atomic<bool> playback_completed_{false};
     std::thread playback_thread_;
     std::mutex pause_mutex_;
     std::condition_variable pause_cv_;
@@ -131,6 +134,11 @@ private:
     std::atomic<int> deep_bass_amount_{0};
     std::atomic<bool> level_meter_enabled_{true};
     std::atomic<bool> clip_detection_enabled_{true};
+    // Valid values are Q24 peak magnitudes; all-bits-one means that no PCM
+    // measurement has been published since the previous GUI consume.
+    std::atomic<std::uint32_t> level_meter_peak_units_{~std::uint32_t{0}};
+    std::atomic<std::uint32_t> clipped_samples_pending_{0};
+    std::atomic<bool> meter_transport_active_{false};
     std::atomic<bool> realtime_priority_enabled_{false};
     std::atomic<int> realtime_priority_{60};
     std::atomic<long> playback_thread_tid_{0};

@@ -75,6 +75,13 @@ int PlaylistSearchController::search_entry_natural_height() const {
     return natural_height > 0 ? natural_height : minimum_height;
 }
 
+void PlaylistSearchController::set_search_entry_visible(bool visible) {
+    if (search_entry_ == nullptr) {
+        return;
+    }
+    gtk_widget_set_visible(search_entry_, visible ? TRUE : FALSE);
+}
+
 void PlaylistSearchController::cancel_pending_refilter() {
     if (refilter_timeout_id_ != 0) {
         g_source_remove(refilter_timeout_id_);
@@ -93,6 +100,16 @@ void PlaylistSearchController::set_search_text(const std::string& text) {
     if (search_changed_handler_id_ != 0) {
         g_signal_handler_unblock(search_entry_, search_changed_handler_id_);
     }
+}
+
+void PlaylistSearchController::update_filter_text(const std::string& text) {
+    const bool was_active = !filter_text_.empty();
+    std::string folded = utf8_casefold_copy(text);
+    const bool is_active = !folded.empty();
+    if (!was_active && is_active) {
+        delegate_.on_search_filter_started();
+    }
+    filter_text_ = folded;
 }
 
 void PlaylistSearchController::cancel_search() {
@@ -194,7 +211,7 @@ gboolean PlaylistSearchController::on_playlist_key_press(GtkWidget* widget, GdkE
             next.assign(text, static_cast<std::size_t>(prev - text));
         }
         set_search_text(next);
-        filter_text_ = utf8_casefold_copy(next);
+        update_filter_text(next);
         schedule_refilter();
         return TRUE;
     }
@@ -278,7 +295,7 @@ void PlaylistSearchController::on_search_changed(GtkEditable* editable, gpointer
         return;
     }
     const gchar* text = gtk_entry_get_text(GTK_ENTRY(editable));
-    self->filter_text_ = text != nullptr ? utf8_casefold_copy(text) : std::string();
+    self->update_filter_text(text != nullptr ? text : std::string());
     self->schedule_refilter();
 }
 
@@ -315,7 +332,7 @@ void PlaylistSearchController::append_to_search_entry(const char* text) {
     std::string next = current != nullptr ? current : std::string();
     next.append(text);
     set_search_text(next);
-    filter_text_ = utf8_casefold_copy(next);
+    update_filter_text(next);
     schedule_refilter();
     gtk_editable_set_position(GTK_EDITABLE(search_entry_), -1);
 }

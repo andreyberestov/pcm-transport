@@ -35,7 +35,6 @@ struct CueSheet {
 class CueParser {
 public:
     static bool looks_like_cue_path(const std::string& path);
-    static std::string resolve_audio_file_path(const std::string& path);
     static CueSheet parse_file(const std::string& path, std::uint64_t total_samples_per_channel);
     static std::uint64_t frame75_to_samples(std::uint64_t frame_75,
                                             std::uint32_t sample_rate);

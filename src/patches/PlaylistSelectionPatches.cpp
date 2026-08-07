@@ -46,7 +46,7 @@ bool playlist_index_from_model_iter(GtkTreeModel* model,
 
 void on_playlist_selection_changed(GtkTreeSelection* selection, gpointer user_data) {
     auto* self = static_cast<GtkPlayerWindow*>(user_data);
-    if (self == nullptr || self->ui_closing_ || !self->playlist_search_enabled_) {
+    if (self == nullptr || self->ui_closing_) {
         return;
     }
     self->update_selected_playlist_index_from_ui();

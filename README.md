@@ -1,4 +1,4 @@
-# PCM Transport v0.9.112
+# PCM Transport v0.9.113
 
 **PCM Transport** is a Linux desktop audio player focused on direct PCM playback, predictable DSP, and clear signal-path reporting.
 
@@ -14,7 +14,8 @@ Contributors:
 
 Website: https://andreyberestov.github.io/pcm-transport/
 
-© 2026 Andrey Berestov
+PCM Transport — Copyright © 2026 Andrey Berestov.
+Portions copyright © 2026 PCM Transport contributors.
 
 ---
 
@@ -33,7 +34,7 @@ Website: https://andreyberestov.github.io/pcm-transport/
 - GTK 3 desktop interface
 - Direct ALSA output
 - Native FLAC decoding through libFLAC
-- Runtime FFmpeg/FFprobe support for MP3, M4A, AAC, OGG, WAV, AIFF, APE, WV and other formats
+- Direct FFmpeg library decoding and metadata probing for MP3, M4A, AAC, OGG, WAV, AIFF, APE, WV and other formats
 - CUE support, including continuous CUE image playback
 - Local M3U / M3U8 playlist import
 - UTF-8 and Windows-1251 normalization for legacy metadata
@@ -57,7 +58,7 @@ Native / primary:
 *.m3u8
 ```
 
-FFmpeg-backed lossless / PCM / container formats:
+FFmpeg library-backed lossless / PCM / container formats:
 
 ```text
 *.aif
@@ -76,7 +77,7 @@ FFmpeg-backed lossless / PCM / container formats:
 *.dff
 ```
 
-FFmpeg-backed lossy formats:
+FFmpeg library-backed lossy formats:
 
 ```text
 *.mp3
@@ -103,7 +104,10 @@ FFmpeg-backed lossy formats:
 *.mpp
 ```
 
-FFmpeg-backed formats require `ffmpeg` and `ffprobe` at runtime. Rare-format support depends on the local FFmpeg build.
+FFmpeg-backed formats use the libavformat, libavcodec, libavutil and
+libswresample shared libraries. The ffmpeg and ffprobe command-line
+tools are not required. Rare-format support depends on the local
+FFmpeg library build.
 
 ## Playback notes
 
@@ -171,14 +175,18 @@ sudo pacman -S --needed base-devel cmake pkgconf alsa-lib flac gtk3 ffmpeg
 ### Debian / Ubuntu
 
 ```bash
-sudo apt install build-essential cmake pkg-config libasound2-dev libflac-dev libgtk-3-dev ffmpeg
+sudo apt install build-essential cmake pkg-config \
+    libasound2-dev libflac-dev libgtk-3-dev \
+    libavformat-dev libavcodec-dev libavutil-dev libswresample-dev
 ```
 
 ### ALT Linux
 
 ```bash
 su -
-apt-get install build-essential cmake pkg-config libalsa-devel libflac-devel libgtk+3-devel ffmpeg
+apt-get install build-essential cmake pkg-config \
+    libalsa-devel libflac-devel libgtk+3-devel \
+    libavformat-devel libavcodec-devel libavutil-devel libswresample-devel
 exit
 ```
 
@@ -187,12 +195,14 @@ exit
 - ALSA
 - GTK 3
 - libFLAC
-- ffmpeg
-- ffprobe
+- FFmpeg shared libraries: libavformat, libavcodec, libavutil and libswresample
 - rtkit-daemon (optional, for RTKit realtime audio-thread priority)
 - pkexec and setcap (optional, for granting persistent cap_sys_nice realtime permission)
 
-Native FLAC playback works without FFmpeg. FFmpeg and FFprobe are required for external formats, metadata probing and conversion paths. RTKit support uses GLib/GIO D-Bus from GTK 3; no separate RTKit build dependency is required. Persistent realtime permission can be granted with pkexec/setcap cap_sys_nice and requires a player restart.
+FLAC decoding remains native through libFLAC when no Processing Rules
+are active. PCM Transport is also linked against the FFmpeg shared
+libraries for other formats, metadata fallback and conversion paths.
+The ffmpeg and ffprobe command-line tools are not used. RTKit support uses GLib/GIO D-Bus from GTK 3; no separate RTKit build dependency is required. Persistent realtime permission can be granted with pkexec/setcap cap_sys_nice and requires a player restart.
 
 ---
 

@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.9.113
+
+- Replace FFmpeg and FFprobe command-line processes with direct FFmpeg API integration for playback, seeking and metadata probing; building now requires the FFmpeg development libraries listed in README.
+- Rework gapless playback around verified sample boundaries and trusted decoder completion; retain `RangeLimitedDecoder` for known ranges, improve CUE and resampled transitions, and remove silence keepalive.
+- Add playlist sorting by track number, artist, title, album and source, with ascending, descending and original-order states while preserving playback and selection.
+- Rework in-process metadata probing with native fast paths for FLAC, MP3 and PCM WAV/BWF, verified sample-count paths for WavPack, APE, TAK, PCM Wave64 and ALAC, a bounded presentation-origin probe for Ogg Vorbis, and bounded validation for raw ADTS AAC. Cache results and use libavformat for remaining formats and ambiguous inputs.
+- Add a unified MODE control for Repeat, Random and Random + Repeat; align navigation, history and availability across the player, media keys and MPRIS.
+- Rework level-meter updates with lock-free peak delivery and time-based ballistics; reduce unnecessary GUI polling while preserving transport responsiveness.
+- Add optional restoration of the last active track and configurable startup playlist height adapted to GTK metrics and the available work area.
+- Preserve native multichannel playback and bypass stereo tonal processing above two channels while retaining soft volume, level metering and clip detection.
+- Improve ALSA setup, fallback negotiation, recovery and diagnostics; keep playback state unpublished until output initialization succeeds.
+- Improve MPRIS track identity, stopped-state selection, seeking, track advancement and state-notification consistency.
+- Improve playlist filtering, metadata updates and interface refresh efficiency.
+- Derive the Lossless indicator from probed codec properties, including correct handling of WavPack hybrid streams.
+- Improve cancellation, error recovery and resource ownership; remove obsolete code and unused state.
+
 ## 0.9.112
 
 - Initial playlist filter implementation contributed by [@loki1368](https://github.com/loki1368).

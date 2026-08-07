@@ -33,12 +33,6 @@ inline std::int64_t pcm_full_scale(std::uint16_t bits_per_sample) {
     return (1LL << (bits_per_sample - 1)) - 1LL;
 }
 
-inline std::int64_t pcm_min_value(std::uint16_t bits_per_sample) {
-    if (bits_per_sample >= 32) return static_cast<std::int64_t>(INT32_MIN);
-    if (bits_per_sample <= 1) return -1LL;
-    return -(1LL << (bits_per_sample - 1));
-}
-
 using PcmBuffer = std::vector<PcmSample>;
 
 } // namespace pcmtp

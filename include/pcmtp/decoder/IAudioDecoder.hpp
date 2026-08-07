@@ -4,11 +4,25 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 
 #include "pcmtp/core/PcmTypes.hpp"
+#include "pcmtp/decoder/SampleBoundary.hpp"
 
 namespace pcmtp {
+
+enum class TransportTruncationKind {
+    None,
+    ExactSampleBoundary,
+    DecoderSegmentBoundary
+};
+
+struct DecoderSegmentPosition {
+    bool valid = false;
+    std::size_t index = 0;
+    std::uint64_t samples_per_channel = 0;
+};
 
 class IAudioDecoder {
 public:
@@ -26,7 +40,23 @@ public:
     virtual bool eof() const = 0;
     virtual std::uint64_t total_samples_per_channel() const = 0;
     virtual std::string source_path() const = 0;
+    virtual PresentationEndKind presentation_end_kind() const noexcept {
+        return PresentationEndKind::Unknown;
+    }
+    virtual DecoderSegmentPosition segment_position() const noexcept {
+        return DecoderSegmentPosition{};
+    }
+    virtual TransportTruncationKind transport_truncation_kind() const noexcept {
+        return TransportTruncationKind::None;
+    }
     virtual bool seek_to_sample(std::uint64_t sample_index) { (void)sample_index; return false; }
+    virtual void request_abort() {}
+    virtual void request_stop_after_current_segment(std::uint64_t segment_end_sample) {
+        (void)segment_end_sample;
+    }
+    virtual void request_stop_after_segment(std::size_t segment_index) {
+        (void)segment_index;
+    }
 };
 
 } // namespace pcmtp

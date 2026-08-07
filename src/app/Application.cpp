@@ -12,7 +12,6 @@
 #include "pcmtp/backend/AlsaPcmBackend.hpp"
 #include "pcmtp/core/PlaybackEngine.hpp"
 #include "pcmtp/decoder/FlacStreamDecoder.hpp"
-#include "pcmtp/decoder/RangeLimitedDecoder.hpp"
 #include "pcmtp/gui/GtkPlayerWindow.hpp"
 #include "pcmtp/hardware/CardProfileRegistry.hpp"
 
@@ -21,7 +20,6 @@ namespace pcmtp {
 int Application::run(int argc, char** argv) {
     std::string file_path;
     std::string device_name = "default";
-    std::size_t transport_buffer_ms = 53;
     std::vector<std::string> gui_source_paths;
     bool probe_only = false;
     bool no_gui = false;
@@ -35,8 +33,6 @@ int Application::run(int argc, char** argv) {
             file_path = argv[++i];
         } else if (!positional_arguments && arg == "--device" && i + 1 < argc) {
             device_name = argv[++i];
-        } else if (!positional_arguments && arg == "--transport-buffer-ms" && i + 1 < argc) {
-            transport_buffer_ms = static_cast<std::size_t>(std::stoul(argv[++i]));
         } else if (!positional_arguments && arg == "--probe") {
             probe_only = true;
         } else if (!positional_arguments && arg == "--nogui") {
@@ -70,7 +66,7 @@ int Application::run(int argc, char** argv) {
     }
 
     if (!file_path.empty()) {
-        return run_player(file_path, device_name, transport_buffer_ms);
+        return run_player(file_path, device_name);
     }
 
     if (no_gui) {
@@ -79,8 +75,7 @@ int Application::run(int argc, char** argv) {
     }
 
     return run_gui(argv[0] != nullptr ? argv[0] : "pcm_transport",
-                   gui_source_paths,
-                   transport_buffer_ms);
+                   gui_source_paths);
 }
 
 int Application::run_probe_only() {
@@ -105,14 +100,15 @@ int Application::run_probe_only() {
     return 0;
 }
 
-int Application::run_player(const std::string& file_path, const std::string& device_name, std::size_t transport_buffer_ms) {
-    std::unique_ptr<IAudioDecoder> decoder(new RangeLimitedDecoder(std::unique_ptr<IAudioDecoder>(new FlacStreamDecoder()), 0, 0));
+int Application::run_player(const std::string& file_path,
+                            const std::string& device_name) {
+    std::unique_ptr<IAudioDecoder> decoder(new FlacStreamDecoder());
     decoder->open(file_path);
 
     std::cout << "Opened FLAC: " << file_path << "\n";
     std::cout << "Format: " << decoder->format().to_string() << "\n";
     std::cout << "Device: " << device_name << "\n";
-    std::cout << "ALSA transport buffer target: " << transport_buffer_ms << " ms\n\n";
+    std::cout << '\n';
 
     const auto cards = CardProfileRegistry::probe_cards();
     for (const auto& card : cards) {
@@ -122,7 +118,7 @@ int Application::run_player(const std::string& file_path, const std::string& dev
         }
     }
 
-    PlaybackEngine engine(transport_buffer_ms);
+    PlaybackEngine engine;
     engine.start(std::move(decoder), std::make_unique<AlsaPcmBackend>(), device_name);
     while (engine.is_playing()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -134,17 +130,16 @@ int Application::run_player(const std::string& file_path, const std::string& dev
 }
 
 int Application::run_gui(const std::string& program_name,
-                         const std::vector<std::string>& source_paths,
-                         std::size_t transport_buffer_ms) {
-    GtkPlayerWindow window(transport_buffer_ms);
+                         const std::vector<std::string>& source_paths) {
+    GtkPlayerWindow window;
     window.show(program_name, source_paths);
     return 0;
 }
 
 void Application::print_usage(const char* program_name) const {
     std::cout << "Usage:\n";
-    std::cout << "  " << program_name << " [FILE...] [--transport-buffer-ms 120]\n";
-    std::cout << "  " << program_name << " --file <path.flac> [--device default|hw:X,Y] [--transport-buffer-ms 120]\n";
+    std::cout << "  " << program_name << " [FILE...]\n";
+    std::cout << "  " << program_name << " --file <path.flac> [--device default|hw:X,Y]\n";
     std::cout << "  " << program_name << " --probe\n";
 }
 

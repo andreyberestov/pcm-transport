@@ -42,6 +42,7 @@ public:
     bool eof() const override;
     std::uint64_t total_samples_per_channel() const override;
     std::string source_path() const override;
+    PresentationEndKind presentation_end_kind() const noexcept override;
     bool seek_to_sample(std::uint64_t sample_index) override;
 
     static FlacFileProbe probe_file(const std::string& path);

@@ -14,10 +14,10 @@ public:
     static Logger& instance();
 
     void configure(bool enabled, const std::string& path = std::string(), bool errors_only = false);
-    bool enabled() const;
     bool debug_enabled() const;
     void info(const std::string& message);
     void error(const std::string& message);
+    void warning(const std::string& message);
     void debug(const std::string& message);
 
 private:

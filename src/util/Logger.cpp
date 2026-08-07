@@ -32,11 +32,6 @@ void Logger::configure(bool enabled, const std::string& path, bool errors_only) 
     }
 }
 
-bool Logger::enabled() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return enabled_;
-}
-
 bool Logger::debug_enabled() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return enabled_ && !errors_only_ && stream_.is_open();
@@ -48,6 +43,10 @@ void Logger::info(const std::string& message) {
 
 void Logger::error(const std::string& message) {
     write("ERROR", message);
+}
+
+void Logger::warning(const std::string& message) {
+    write("WARN", message);
 }
 
 void Logger::debug(const std::string& message) {

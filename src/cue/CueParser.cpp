@@ -20,7 +20,6 @@ namespace pcmtp {
 
 namespace {
 
-
 std::string read_normalized_cue_text(const std::string& path) {
     std::ifstream input(path.c_str(), std::ios::binary);
     if (!input) {
@@ -257,25 +256,6 @@ bool CueParser::looks_like_cue_path(const std::string& path) {
         return static_cast<char>(std::tolower(c));
     });
     return lower.substr(lower.size() - 4) == ".cue";
-}
-
-std::string CueParser::resolve_audio_file_path(const std::string& path) {
-    const std::string text_bytes = read_normalized_cue_text(path);
-    std::istringstream input(text_bytes);
-    const std::string base_dir = directory_of(path);
-    std::string raw_line;
-    while (std::getline(input, raw_line)) {
-        const std::string line = trim(raw_line);
-        if (!starts_with_keyword(line, "FILE ")) {
-            continue;
-        }
-        const std::string referenced = cue_file_entry_value(line);
-        if (referenced.empty()) {
-            break;
-        }
-        return resolve_case_insensitive_path(base_dir, referenced);
-    }
-    throw std::runtime_error("CUE file does not contain FILE entry");
 }
 
 CueSheet CueParser::parse_file(const std::string& path, std::uint64_t total_samples_per_channel) {

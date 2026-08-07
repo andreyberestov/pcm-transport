@@ -337,7 +337,7 @@
       margin-bottom: 0;
     }
 
-    .license-box {
+    .license-box, .support-box {
       margin-top: 48px;
       background: #ffffff;
       border: 1px solid var(--border);
@@ -497,7 +497,7 @@
             <path d="M11 9h2M19 9h2M11 14h2M19 14h2M11 19h2M19 19h2M11 24h2M19 24h2"/>
           </svg>
         </div>
-        <h3>Additional formats via FFmpeg</h3>
+        <h3>Additional formats via FFmpeg libraries</h3>
         <p>MP3, AAC, OGG, WAV, AIFF, APE, WV, DSF/DFF and more via FFmpeg</p>
       </div>
 
@@ -565,7 +565,7 @@
 
     <h2>Supported formats</h2>
     <p class="section-intro">
-      Native FLAC playback is handled through libFLAC. Additional formats use FFmpeg and FFprobe at runtime.
+      Native FLAC playback is handled through libFLAC. Additional formats use the FFmpeg libraries directly. The ffmpeg and ffprobe command-line tools are not required.
       DSF and DFF sources, including DST-compressed DFF, are converted to PCM; native DSD and DoP output are not used. Rare-format support depends on the local FFmpeg build.
     </p>
 
@@ -618,7 +618,9 @@
           <span>Build dependencies</span>
         </div>
         <div class="build-content">
-          <pre><code>sudo apt install build-essential cmake pkg-config libasound2-dev libflac-dev libgtk-3-dev ffmpeg</code></pre>
+          <pre><code>sudo apt install build-essential cmake pkg-config \
+libasound2-dev libflac-dev libgtk-3-dev \
+libavformat-dev libavcodec-dev libavutil-dev libswresample-dev</code></pre>
         </div>
       </div>
 
@@ -629,7 +631,9 @@
         </div>
         <div class="build-content">
           <pre><code>su -
-apt-get install build-essential cmake pkg-config libalsa-devel libflac-devel libgtk+3-devel ffmpeg
+apt-get install build-essential cmake pkg-config \
+libalsa-devel libflac-devel libgtk+3-devel \
+libavformat-devel libavcodec-devel libavutil-devel libswresample-devel
 exit</code></pre>
         </div>
       </div>
@@ -668,8 +672,12 @@ cmake --build build -j</code></pre>
     </div>
 
     <p class="note">
-      Dependencies: ALSA, GTK 3, libFLAC, FFmpeg and FFprobe.
-      Native FLAC works without FFmpeg. FFmpeg adds support for MP3, AAC, OGG, WAV, AIFF, APE, DSF/DFF and more.
+      Dependencies: ALSA, GTK 3, libFLAC, libavformat, libavcodec,
+      libavutil and libswresample.
+
+      FLAC decoding remains native through libFLAC. Other formats,
+      metadata fallback and conversion paths use the FFmpeg libraries
+      directly. The ffmpeg and ffprobe command-line tools are not used.
       Realtime audio priority is optional (via RTKit or cap_sys_nice).
     </p>
 
@@ -690,20 +698,19 @@ cmake --build build -j</code></pre>
         PCM Transport is an independently maintained project developed with the assistance of AI coding tools. The project author defines the requirements and product direction, reviews and integrates changes, and tests each release before publication.
       </p>
     </section>
-    
+
      <section class="development-author">
       <h2>Author</h2>
       <p>
-        <a href="https://github.com/andreyberestov">Andrey Berestov</a>	          
+        <a href="https://github.com/andreyberestov">Andrey Berestov</a>
       </p>
       <p>
-        <b>Contributors</b>	          
+        <b>Contributors</b>
       </p>
       <p>
-        <a href="https://github.com/loki1368">loki1368</a>	          
+        <a href="https://github.com/loki1368">loki1368</a>
       </p>
     </section>
-    
 
     <section class="license-box">
       <h2>License</h2>
@@ -713,12 +720,21 @@ cmake --build build -j</code></pre>
         file in the repository for details.
       </p>
     </section>
+    
+    <section class="support-box">
+      <h2>Support</h2>
+      <p>
+        If you enjoy PCM Transport, you can buy the author a cup of coffee.
+      </p>
+      <span class="wallet">ETH (ERC-20): 0x985f490A569B1Cc08c5b157eA044387801BeD939</span>
+    </section>    
 
     <footer class="footer">
       <p>PCM Transport is an open-source Linux audio player project by Andrey Berestov.</p>
       <p>Licensed under GNU GPL v3.0.</p>
       <p>Feedback and bug reports: <a href="https://github.com/andreyberestov/pcm-transport/issues">GitHub Issues</a></p>
-      <p>© 2026 Andrey Berestov</p>
+      <p>PCM Transport — Copyright © 2026 Andrey Berestov.</p>
+      <p>Portions copyright © 2026 their respective contributors.</p>
     </footer>
   </main>
 </body>

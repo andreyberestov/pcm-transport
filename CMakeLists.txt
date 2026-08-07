@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(pcm_transport VERSION 0.9.112 LANGUAGES C CXX)
+project(pcm_transport VERSION 0.9.113 LANGUAGES C CXX)
 
 include(GNUInstallDirs)
 
@@ -11,6 +11,10 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(ALSA REQUIRED alsa)
 pkg_check_modules(FLAC REQUIRED flac)
 pkg_check_modules(GTK3 REQUIRED gtk+-3.0)
+pkg_check_modules(AVFORMAT REQUIRED IMPORTED_TARGET libavformat)
+pkg_check_modules(AVCODEC REQUIRED IMPORTED_TARGET libavcodec)
+pkg_check_modules(AVUTIL REQUIRED IMPORTED_TARGET libavutil)
+pkg_check_modules(SWRESAMPLE REQUIRED IMPORTED_TARGET libswresample)
 
 find_program(GLIB_COMPILE_RESOURCES_EXECUTABLE
     NAMES glib-compile-resources
@@ -70,20 +74,20 @@ add_executable(pcm_transport
     src/cue/CueParser.cpp
     src/playlist/M3uPlaylistReader.cpp
     src/playlist/MediaProbe.cpp
+    src/playlist/Mp3FastProbe.cpp
     src/playlist/SourceScanner.cpp
     src/decoder/FlacStreamDecoder.cpp
     src/decoder/ExternalAudioDecoder.cpp
+    src/decoder/SampleBoundary.cpp
     src/decoder/RangeLimitedDecoder.cpp
     src/decoder/GaplessChainDecoder.cpp
-    src/decoder/MemoryAudioDecoder.cpp
-    src/core/TransportFifo.cpp
     src/gui/GtkPlayerWindow.cpp
     src/mpris/MprisService.cpp
     src/hardware/CardProfileRegistry.cpp
     src/dsp/AlsaControlBridge.cpp
     src/dsp/ToneControlDesign.cpp
     src/util/Logger.cpp
-    src/util/ManagedSubprocess.cpp
+    src/util/ProbeCancellation.cpp
     src/util/TextEncoding.cpp
     ${PCM_TRANSPORT_RESOURCE_SOURCE}
 )
@@ -113,6 +117,10 @@ target_link_libraries(pcm_transport PRIVATE
     ${ALSA_LIBRARIES}
     ${FLAC_LIBRARIES}
     ${GTK3_LIBRARIES}
+    PkgConfig::AVFORMAT
+    PkgConfig::AVCODEC
+    PkgConfig::AVUTIL
+    PkgConfig::SWRESAMPLE
     pthread
 )
 

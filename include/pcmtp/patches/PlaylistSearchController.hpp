@@ -18,6 +18,7 @@ public:
         virtual GtkListStore* playlist_store() = 0;
         virtual int col_search_folded() const = 0;
         virtual bool ui_closing() const = 0;
+        virtual void on_search_filter_started() = 0;
         virtual void on_search_filter_cleared() = 0;
         virtual void on_search_filtered() = 0;
         virtual void on_search_cancelled() = 0;
@@ -32,6 +33,7 @@ public:
     void install_in_panel(GtkBox* playlist_panel);
     GtkTreeModelFilter* filter_model() const { return filter_; }
     int search_entry_natural_height() const;
+    void set_search_entry_visible(bool visible);
 
     void cancel_search();
     void refilter();
@@ -52,6 +54,7 @@ private:
     void append_to_search_entry(const char* text);
     void focus_search_entry();
     void set_search_text(const std::string& text);
+    void update_filter_text(const std::string& text);
 
     Delegate& delegate_;
     GtkTreeModelFilter* filter_ = nullptr;

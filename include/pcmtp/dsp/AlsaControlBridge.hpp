@@ -32,7 +32,6 @@ struct DspConnectionInfo {
 class AlsaControlBridge {
 public:
     static DspConnectionInfo probe(int card_index);
-    static bool set_control_value(int card_index, int numid, long value, std::string* error_message);
 };
 
 } // namespace pcmtp

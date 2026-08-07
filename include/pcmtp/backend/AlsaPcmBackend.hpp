@@ -5,7 +5,6 @@
 
 #include <alsa/asoundlib.h>
 #include <cstdint>
-
 #include <string>
 #include <vector>
 
@@ -46,12 +45,7 @@ public:
 
     void set_24bit_container_preference(Alsa24BitContainerPreference preference);
 
-    static std::string probe_device_formats(const std::string& device_name);
     static AlsaProbeMatrix probe_device_format_matrix(const std::string& device_name);
-
-    snd_pcm_uframes_t period_frames() const;
-    snd_pcm_uframes_t buffer_frames() const;
-    snd_pcm_format_t pcm_container_format() const;
 
 private:
     snd_pcm_t* handle_ = nullptr;
@@ -60,9 +54,12 @@ private:
     snd_pcm_uframes_t buffer_frames_ = 2352;
     snd_pcm_format_t pcm_container_format_ = SND_PCM_FORMAT_UNKNOWN;
     Alsa24BitContainerPreference format_24bit_preference_ = Alsa24BitContainerPreference::Auto;
+    Alsa24BitContainerPreference active_format_24bit_preference_ = Alsa24BitContainerPreference::Auto;
     std::string device_name_;
     unsigned accepted_sample_rate_ = 0;
-    std::uint16_t accepted_channels_ = 0;
+    std::vector<std::int32_t> scratch_s32_;
+    std::vector<std::int16_t> scratch_s16_;
+    std::vector<unsigned char> scratch_s24_;
 };
 
 } // namespace pcmtp

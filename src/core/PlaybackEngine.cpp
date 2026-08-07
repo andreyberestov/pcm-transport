@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <cerrno>
 #include <cstring>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -56,62 +57,143 @@ bool sample_exceeds_full_scale(double sample, std::uint16_t bits_per_sample) {
 
 
 constexpr int kPreEqHeadroomMaxTenthsDb = 150;
+constexpr std::uint32_t kNoMeterMeasurement = ~std::uint32_t{0};
+constexpr std::uint32_t kMaxMeterPeakUnits = kNoMeterMeasurement - 1;
+constexpr float kMeterPeakScale = 16777216.0f;
+
+std::uint32_t meter_peak_to_units(float peak) {
+    if (!(peak > 0.0f)) {
+        return 0;
+    }
+    const float max_peak =
+        static_cast<float>(kMaxMeterPeakUnits) / kMeterPeakScale;
+    if (peak >= max_peak) {
+        return kMaxMeterPeakUnits;
+    }
+    return static_cast<std::uint32_t>((peak * kMeterPeakScale) + 0.5f);
+}
+
+float meter_peak_from_units(std::uint32_t units) {
+    return static_cast<float>(units) / kMeterPeakScale;
+}
+
+void publish_meter_peak(std::atomic<std::uint32_t>& slot, float peak) {
+    const std::uint32_t peak_units = meter_peak_to_units(peak);
+    std::uint32_t current_units = slot.load(std::memory_order_relaxed);
+    while (true) {
+        if (current_units != kNoMeterMeasurement &&
+            current_units >= peak_units) {
+            return;
+        }
+        if (slot.compare_exchange_weak(
+                current_units,
+                peak_units,
+                std::memory_order_release,
+                std::memory_order_relaxed)) {
+            return;
+        }
+    }
+}
 
 } // namespace
 
-PlaybackEngine::PlaybackEngine(std::size_t transport_buffer_milliseconds)
-    : transport_buffer_milliseconds_(transport_buffer_milliseconds) {
-    if (transport_buffer_milliseconds_ == 0) {
-        throw std::invalid_argument("transport_buffer_milliseconds must be > 0");
-    }
-}
+PlaybackEngine::PlaybackEngine() = default;
 
 PlaybackEngine::~PlaybackEngine() { stop(); }
 
 void PlaybackEngine::start(std::unique_ptr<IAudioDecoder> decoder,
                            std::unique_ptr<IAudioBackend> backend,
                            const std::string& device_name,
-                           PlaybackStatusCallback callback,
                            std::uint64_t initial_samples_per_channel) {
     stop();
     if (!decoder || !backend) {
         throw std::invalid_argument("PlaybackEngine::start received null decoder/backend");
     }
-    decoder_ = std::move(decoder);
-    backend_ = std::move(backend);
-    callback_ = std::move(callback);
-    device_name_ = device_name;
-    stop_requested_ = false;
-    pause_requested_ = false;
-    playback_completed_ = false;
-    initial_samples_per_channel_ = initial_samples_per_channel;
-    format_ = decoder_->format();
-    backend_->open(device_name_, format_);
-    const std::string opened_report = backend_->active_output_report();
-    {
-        std::lock_guard<std::mutex> runtime_lock(runtime_mutex_);
-        last_active_output_report_ = opened_report;
+
+    const AudioFormat opened_format = decoder->format();
+    backend->open(device_name, opened_format);
+    const std::string opened_report = backend->active_output_report();
+    const std::uint64_t total_samples_per_channel =
+        decoder->total_samples_per_channel();
+    const DecoderSegmentPosition segment = decoder->segment_position();
+    const TransportTruncationKind transport_truncation_kind =
+        decoder->transport_truncation_kind();
+
+    PlaybackStatusSnapshot initial_snapshot;
+    initial_snapshot.playing = true;
+    initial_snapshot.paused = false;
+    initial_snapshot.finished = false;
+    initial_snapshot.format = opened_format;
+    initial_snapshot.total_samples_per_channel = total_samples_per_channel;
+    initial_snapshot.segment_position_valid = segment.valid;
+    initial_snapshot.segment_index = segment.index;
+    initial_snapshot.segment_samples_per_channel = segment.samples_per_channel;
+    initial_snapshot.transport_truncation_kind = transport_truncation_kind;
+    initial_snapshot.message = "Playing";
+    initial_snapshot.active_output_report = opened_report;
+    initial_snapshot.current_samples_per_channel = initial_samples_per_channel;
+
+    std::string opened_device_name = device_name;
+    std::string runtime_output_report = opened_report;
+
+    try {
+        decoder_ = std::move(decoder);
+        backend_ = std::move(backend);
+        device_name_ = std::move(opened_device_name);
+        stop_requested_ = false;
+        pause_requested_ = false;
+        level_meter_peak_units_.store(kNoMeterMeasurement, std::memory_order_relaxed);
+        clipped_samples_pending_.store(0, std::memory_order_relaxed);
+        meter_transport_active_.store(true, std::memory_order_release);
+        initial_samples_per_channel_ = initial_samples_per_channel;
+        format_ = opened_format;
+        {
+            std::lock_guard<std::mutex> runtime_lock(runtime_mutex_);
+            last_active_output_report_ = std::move(runtime_output_report);
+        }
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            snapshot_ = std::move(initial_snapshot);
+            last_error_.clear();
+        }
+        playback_thread_ = std::thread(&PlaybackEngine::playback_loop, this);
+    } catch (...) {
+        stop_requested_ = true;
+        pause_requested_ = false;
+        meter_transport_active_.store(false, std::memory_order_release);
+        if (backend_) {
+            try {
+                backend_->close();
+            } catch (...) {}
+        }
+        decoder_.reset();
+        backend_.reset();
+        device_name_.clear();
+        format_ = AudioFormat{};
+        initial_samples_per_channel_ = 0;
+        {
+            std::lock_guard<std::mutex> runtime_lock(runtime_mutex_);
+            last_active_output_report_.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            snapshot_ = PlaybackStatusSnapshot{};
+            snapshot_.message = "Stopped";
+            last_error_.clear();
+        }
+        throw;
     }
-    {
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        snapshot_ = PlaybackStatusSnapshot{};
-        snapshot_.playing = true;
-        snapshot_.paused = false;
-        snapshot_.finished = false;
-        snapshot_.total_samples_per_channel = decoder_->total_samples_per_channel();
-        snapshot_.message = "Playing";
-        snapshot_.active_output_report = opened_report;
-        snapshot_.current_samples_per_channel = initial_samples_per_channel_;
-        last_error_.clear();
-    }
-    update_status(true);
+
     Logger::instance().info("Playback started on device: " + device_name_);
-    playback_thread_ = std::thread(&PlaybackEngine::playback_loop, this);
 }
 
 void PlaybackEngine::stop() {
+    meter_transport_active_.store(false, std::memory_order_release);
     stop_requested_ = true;
     pause_requested_ = false;
+    if (decoder_ != nullptr) {
+        decoder_->request_abort();
+    }
     pause_cv_.notify_all();
     join_threads();
     playback_thread_tid_.store(0, std::memory_order_relaxed);
@@ -126,6 +208,8 @@ void PlaybackEngine::stop() {
     }
     decoder_.reset();
     backend_.reset();
+    level_meter_peak_units_.store(kNoMeterMeasurement, std::memory_order_relaxed);
+    clipped_samples_pending_.store(0, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> runtime_lock(runtime_mutex_);
         last_active_output_report_.clear();
@@ -138,34 +222,42 @@ void PlaybackEngine::stop() {
         if (!snapshot_.finished) {
             snapshot_.current_samples_per_channel = 0;
             snapshot_.message = last_error_.empty() ? "Stopped" : last_error_;
-            snapshot_.peak_level = 0.0f;
-            snapshot_.clip_detected = false;
-            snapshot_.clipped_samples = 0;
         }
     }
-    update_status(true);
 }
 
 void PlaybackEngine::pause() {
     if (!is_playing()) return;
+    meter_transport_active_.store(false, std::memory_order_release);
     pause_requested_ = true;
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         snapshot_.paused = true;
         snapshot_.message = "Paused";
     }
-    update_status(true);
 }
 
 void PlaybackEngine::resume() {
     pause_requested_ = false;
+    meter_transport_active_.store(is_playing(), std::memory_order_release);
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         snapshot_.paused = false;
         snapshot_.message = "Playing";
     }
     pause_cv_.notify_all();
-    update_status(true);
+}
+
+void PlaybackEngine::request_stop_after_current_segment(std::uint64_t segment_end_sample) {
+    if (decoder_ != nullptr) {
+        decoder_->request_stop_after_current_segment(segment_end_sample);
+    }
+}
+
+void PlaybackEngine::request_stop_after_segment(std::size_t segment_index) {
+    if (decoder_ != nullptr) {
+        decoder_->request_stop_after_segment(segment_index);
+    }
 }
 
 bool PlaybackEngine::is_playing() const { std::lock_guard<std::mutex> lock(state_mutex_); return snapshot_.playing; }
@@ -182,13 +274,19 @@ void PlaybackEngine::set_deep_bass_preset(int preset) {
     const int clamped = std::max(0, std::min(5, preset));
     deep_bass_preset_.store(clamped, std::memory_order_relaxed);
 }
-int PlaybackEngine::deep_bass_preset() const { return deep_bass_preset_.load(std::memory_order_relaxed); }
 void PlaybackEngine::set_deep_bass_amount(int amount_steps) { deep_bass_amount_.store(std::max(-1, std::min(1, amount_steps)), std::memory_order_relaxed); }
-int PlaybackEngine::deep_bass_amount() const { return deep_bass_amount_.load(std::memory_order_relaxed); }
-void PlaybackEngine::set_level_meter_enabled(bool enabled) { level_meter_enabled_.store(enabled, std::memory_order_relaxed); }
-bool PlaybackEngine::level_meter_enabled() const { return level_meter_enabled_.load(std::memory_order_relaxed); }
-void PlaybackEngine::set_clip_detection_enabled(bool enabled) { clip_detection_enabled_.store(enabled, std::memory_order_relaxed); }
-bool PlaybackEngine::clip_detection_enabled() const { return clip_detection_enabled_.load(std::memory_order_relaxed); }
+void PlaybackEngine::set_level_meter_enabled(bool enabled) {
+    level_meter_enabled_.store(enabled, std::memory_order_relaxed);
+    if (!enabled) {
+        level_meter_peak_units_.store(kNoMeterMeasurement, std::memory_order_relaxed);
+    }
+}
+void PlaybackEngine::set_clip_detection_enabled(bool enabled) {
+    clip_detection_enabled_.store(enabled, std::memory_order_relaxed);
+    if (!enabled) {
+        clipped_samples_pending_.store(0, std::memory_order_relaxed);
+    }
+}
 int PlaybackEngine::bass_db() const { return bass_db_.load(std::memory_order_relaxed); }
 int PlaybackEngine::treble_db() const { return treble_db_.load(std::memory_order_relaxed); }
 PlaybackStatusSnapshot PlaybackEngine::snapshot() const { std::lock_guard<std::mutex> lock(state_mutex_); return snapshot_; }
@@ -197,11 +295,29 @@ PlaybackTransportSnapshot PlaybackEngine::transport_snapshot() const {
     PlaybackTransportSnapshot transport;
     transport.playing = snapshot_.playing;
     transport.paused = snapshot_.paused;
+    transport.finished = snapshot_.finished;
+    transport.format = snapshot_.format;
     transport.current_samples_per_channel = snapshot_.current_samples_per_channel;
+    transport.total_samples_per_channel = snapshot_.total_samples_per_channel;
+    transport.segment_position_valid = snapshot_.segment_position_valid;
+    transport.segment_index = snapshot_.segment_index;
+    transport.segment_samples_per_channel = snapshot_.segment_samples_per_channel;
+    transport.transport_truncation_kind = snapshot_.transport_truncation_kind;
     return transport;
 }
+PlaybackMeterSnapshot PlaybackEngine::consume_meter_snapshot() {
+    PlaybackMeterSnapshot meter;
+    const std::uint32_t peak_units = level_meter_peak_units_.exchange(
+        kNoMeterMeasurement, std::memory_order_acq_rel);
+    if (peak_units != kNoMeterMeasurement) {
+        meter.peak_measured = true;
+        meter.peak_level = meter_peak_from_units(peak_units);
+    }
+    meter.clipped_samples = clipped_samples_pending_.exchange(0, std::memory_order_relaxed);
+    meter.transport_active = meter_transport_active_.load(std::memory_order_acquire);
+    return meter;
+}
 std::string PlaybackEngine::last_error() const { std::lock_guard<std::mutex> lock(state_mutex_); return last_error_; }
-std::size_t PlaybackEngine::transport_buffer_milliseconds() const { return transport_buffer_milliseconds_; }
 
 void PlaybackEngine::set_realtime_priority_enabled(bool enabled) {
     realtime_priority_enabled_.store(enabled, std::memory_order_relaxed);
@@ -214,23 +330,6 @@ void PlaybackEngine::set_realtime_priority_enabled(bool enabled) {
 
 void PlaybackEngine::set_realtime_priority(int priority) {
     realtime_priority_.store(std::max(1, std::min(80, priority)), std::memory_order_relaxed);
-}
-
-bool PlaybackEngine::realtime_priority_enabled() const {
-    return realtime_priority_enabled_.load(std::memory_order_relaxed);
-}
-
-int PlaybackEngine::realtime_priority() const {
-    return realtime_priority_.load(std::memory_order_relaxed);
-}
-
-long PlaybackEngine::playback_thread_id() const {
-    return playback_thread_tid_.load(std::memory_order_relaxed);
-}
-
-std::string PlaybackEngine::realtime_priority_status() const {
-    std::lock_guard<std::mutex> lock(runtime_mutex_);
-    return realtime_priority_status_;
 }
 
 namespace {
@@ -473,10 +572,6 @@ std::string PlaybackEngine::verified_realtime_priority_status(long tid) const {
            ", priority " + std::to_string(param.sched_priority) + ", TID " + std::to_string(tid);
 }
 
-bool PlaybackEngine::realtime_priority_service_available() const {
-    return rtkit_name_has_owner();
-}
-
 std::string PlaybackEngine::request_realtime_priority_for_playback_thread() {
     if (!realtime_priority_enabled_.load(std::memory_order_relaxed)) {
         std::lock_guard<std::mutex> lock(runtime_mutex_);
@@ -595,35 +690,55 @@ void PlaybackEngine::playback_loop() {
         realtime_priority_status_ = "Realtime priority: disabled";
     }
     try {
-        std::vector<PcmSample> block(4096);
+        const std::uint16_t ch = std::max<std::uint16_t>(1, format_.channels);
+        const bool stereo_tonal_dsp_allowed = ch <= 2;
+        const std::size_t block_samples = std::max<std::size_t>(
+            ch, (static_cast<std::size_t>(4096) / ch) * ch);
+        std::vector<PcmSample> block(block_samples);
         std::uint64_t played_samples_per_channel = initial_samples_per_channel_;
-        float smoothed_peak = 0.0f;
         auto last_update = std::chrono::steady_clock::now();
-        int active_bass_db = bass_db_.load(std::memory_order_relaxed);
-        int active_treble_db = treble_db_.load(std::memory_order_relaxed);
+        int active_bass_db = stereo_tonal_dsp_allowed
+            ? bass_db_.load(std::memory_order_relaxed)
+            : 0;
+        int active_treble_db = stereo_tonal_dsp_allowed
+            ? treble_db_.load(std::memory_order_relaxed)
+            : 0;
         int active_bass_hz = bass_hz_.load(std::memory_order_relaxed);
         int active_treble_hz = treble_hz_.load(std::memory_order_relaxed);
         ShelfCoefficients low = tone::make_low_shelf(format_.sample_rate, static_cast<double>(active_bass_db), static_cast<double>(active_bass_hz));
         ShelfCoefficients high = tone::make_high_shelf(format_.sample_rate, static_cast<double>(active_treble_db), static_cast<double>(active_treble_hz));
         ShelfState low_l{}, low_r{}, high_l{}, high_r{};
         DeepBassState deep_bass_l{}, deep_bass_r{};
-        bool active_deep_bass_enabled = deep_bass_enabled_.load(std::memory_order_relaxed);
+        bool active_deep_bass_enabled = stereo_tonal_dsp_allowed &&
+            deep_bass_enabled_.load(std::memory_order_relaxed);
         int active_deep_bass_preset = deep_bass_preset_.load(std::memory_order_relaxed);
         int active_deep_bass_amount = deep_bass_amount_.load(std::memory_order_relaxed);
-        const std::uint16_t ch = std::max<std::uint16_t>(1, format_.channels);
         while (!stop_requested_ && !decoder_->eof()) {
             wait_if_paused();
             if (stop_requested_) break;
             const std::size_t got = decoder_->read_samples(block.data(), block.size());
+            if (got > block.size()) {
+                throw std::runtime_error("Decoder returned more PCM samples than requested");
+            }
+            if (got % ch != 0) {
+                throw std::runtime_error("Decoder returned an incomplete PCM frame");
+            }
             if (got == 0) break;
 
             const int current_soft_volume_percent = soft_volume_percent_.load(std::memory_order_relaxed);
-            const int current_bass_db = bass_db_.load(std::memory_order_relaxed);
-            const int current_treble_db = treble_db_.load(std::memory_order_relaxed);
+            const int current_bass_db = stereo_tonal_dsp_allowed
+                ? bass_db_.load(std::memory_order_relaxed)
+                : 0;
+            const int current_treble_db = stereo_tonal_dsp_allowed
+                ? treble_db_.load(std::memory_order_relaxed)
+                : 0;
             const int current_bass_hz = bass_hz_.load(std::memory_order_relaxed);
             const int current_treble_hz = treble_hz_.load(std::memory_order_relaxed);
-            const int current_pre_eq_headroom_tenths_db = pre_eq_headroom_tenths_db_.load(std::memory_order_relaxed);
-            const bool current_deep_bass_enabled = deep_bass_enabled_.load(std::memory_order_relaxed);
+            const int current_pre_eq_headroom_tenths_db = stereo_tonal_dsp_allowed
+                ? pre_eq_headroom_tenths_db_.load(std::memory_order_relaxed)
+                : 0;
+            const bool current_deep_bass_enabled = stereo_tonal_dsp_allowed &&
+                deep_bass_enabled_.load(std::memory_order_relaxed);
             const int current_deep_bass_preset = deep_bass_preset_.load(std::memory_order_relaxed);
             const int current_deep_bass_amount = deep_bass_amount_.load(std::memory_order_relaxed);
             const double current_deep_bass_amount_gain = tone::deep_bass_amount_gain_from_steps(current_deep_bass_amount);
@@ -661,7 +776,6 @@ void PlaybackEngine::playback_loop() {
             const double inv_full_scale = full_scale > 0.0 ? (1.0 / full_scale) : 0.0;
             float peak = 0.0f;
             std::uint32_t clipped_samples = 0;
-            bool clip_detected = false;
             if (dsp_active) {
                 for (std::size_t i = 0; i < got; ++i) {
                     const bool left = (ch == 1) || ((i % ch) == 0);
@@ -679,7 +793,6 @@ void PlaybackEngine::playback_loop() {
                         if (meter_mag > static_cast<double>(peak)) peak = static_cast<float>(meter_mag);
                     }
                     if (detect_clip && sample_exceeds_full_scale(sample, format_.bits_per_sample)) {
-                        clip_detected = true;
                         ++clipped_samples;
                     }
                     block[i] = static_cast<PcmSample>(std::llround(clamp_sample_to_bits(sample, format_.bits_per_sample)));
@@ -692,47 +805,66 @@ void PlaybackEngine::playback_loop() {
                     }
                 }
             }
-            const float instant_peak = peak;
-            smoothed_peak = (smoothed_peak * 0.32f) + (instant_peak * 0.68f);
             backend_->write_samples(block.data(), got);
+            // Publish visualization facts only after the PCM block has been
+            // accepted by the output backend.  The GUI owns the display
+            // ballistics; the playback thread only accumulates raw facts.
+            if (measure_level) {
+                publish_meter_peak(level_meter_peak_units_, peak);
+            }
+            if (detect_clip && clipped_samples > 0) {
+                std::uint32_t published_clips =
+                    clipped_samples_pending_.load(std::memory_order_relaxed);
+                while (true) {
+                    const std::uint32_t remaining =
+                        std::numeric_limits<std::uint32_t>::max() - published_clips;
+                    const std::uint32_t next = clipped_samples > remaining
+                        ? std::numeric_limits<std::uint32_t>::max()
+                        : published_clips + clipped_samples;
+                    if (clipped_samples_pending_.compare_exchange_weak(
+                            published_clips,
+                            next,
+                            std::memory_order_relaxed,
+                            std::memory_order_relaxed)) {
+                        break;
+                    }
+                }
+            }
             played_samples_per_channel += got / ch;
             const auto now = std::chrono::steady_clock::now();
             if (now - last_update >= std::chrono::milliseconds(16)) {
+                const DecoderSegmentPosition segment = decoder_->segment_position();
                 {
                     std::lock_guard<std::mutex> lock(state_mutex_);
                     snapshot_.current_samples_per_channel = played_samples_per_channel;
+                    snapshot_.segment_position_valid = segment.valid;
+                    snapshot_.segment_index = segment.index;
+                    snapshot_.segment_samples_per_channel = segment.samples_per_channel;
                     snapshot_.message = pause_requested_ ? "Paused" : "Playing";
-                    snapshot_.peak_level = smoothed_peak;
-                    snapshot_.clip_detected = clip_detected;
-                    snapshot_.clipped_samples = clipped_samples;
                 }
-                update_status(false);
                 last_update = now;
             }
         }
         if (backend_ && !stop_requested_) backend_->drain();
         {
+            const DecoderSegmentPosition segment = decoder_->segment_position();
             std::lock_guard<std::mutex> lock(state_mutex_);
             snapshot_.current_samples_per_channel = played_samples_per_channel;
+            snapshot_.segment_position_valid = segment.valid;
+            snapshot_.segment_index = segment.index;
+            snapshot_.segment_samples_per_channel = segment.samples_per_channel;
             snapshot_.finished = !stop_requested_ && last_error_.empty();
             snapshot_.playing = false;
             snapshot_.paused = false;
             snapshot_.message = last_error_.empty() ? "Stopped" : last_error_;
-            snapshot_.peak_level = 0.0f;
-            snapshot_.clip_detected = false;
-            snapshot_.clipped_samples = 0;
         }
-        playback_completed_ = true;
-        update_status(true);
+        meter_transport_active_.store(false, std::memory_order_release);
+        level_meter_peak_units_.store(kNoMeterMeasurement, std::memory_order_relaxed);
     } catch (const std::exception& ex) {
         set_error(ex.what());
         { std::lock_guard<std::mutex> lock(state_mutex_); snapshot_.playing = false; snapshot_.paused = false; snapshot_.message = last_error_; }
-        playback_completed_ = true;
-        update_status(true);
     } catch (...) {
         set_error("Unknown playback error");
-        playback_completed_ = true;
-        update_status(true);
     }
 }
 
@@ -741,9 +873,11 @@ void PlaybackEngine::wait_if_paused() {
     std::unique_lock<std::mutex> lock(pause_mutex_);
     pause_cv_.wait(lock, [this]() { return !pause_requested_ || stop_requested_; });
 }
-void PlaybackEngine::update_status(bool) { if (callback_) callback_(snapshot()); }
 void PlaybackEngine::set_error(const std::string& message) {
-    { std::lock_guard<std::mutex> lock(state_mutex_); last_error_ = message; snapshot_.playing = false; snapshot_.paused = false; snapshot_.finished = false; snapshot_.message = message; snapshot_.peak_level = 0.0f; snapshot_.clip_detected = false; snapshot_.clipped_samples = 0; }
+    meter_transport_active_.store(false, std::memory_order_release);
+    level_meter_peak_units_.store(kNoMeterMeasurement, std::memory_order_relaxed);
+    clipped_samples_pending_.store(0, std::memory_order_relaxed);
+    { std::lock_guard<std::mutex> lock(state_mutex_); last_error_ = message; snapshot_.playing = false; snapshot_.paused = false; snapshot_.finished = false; snapshot_.message = message; }
     Logger::instance().error(message);
     stop_requested_ = true;
     pause_cv_.notify_all();

@@ -371,18 +371,6 @@ double process_deep_bass_normalized(double input,
     return xn + safe_amount * (processed - xn);
 }
 
-void process_deep_bass_normalized_stereo(double& left,
-                                         double& right,
-                                         std::uint32_t sample_rate,
-                                         DeepBassPreset preset,
-                                         DeepBassState& left_state,
-                                         DeepBassState& right_state,
-                                         double amount_gain) {
-    left = process_deep_bass_normalized(left, sample_rate, preset, left_state, amount_gain);
-    right = process_deep_bass_normalized(right, sample_rate, preset, right_state, amount_gain);
-}
-
-
 double estimate_cascaded_shelf_max_gain_db(std::uint32_t sample_rate,
                                            int bass_db,
                                            int bass_hz,

@@ -129,6 +129,8 @@ void GaplessChainDecoder::open_current_decoder(std::uint64_t offset) {
         }
     }
     open_decoder_at_local_offset(*current_decoder_, tracks_[current_index_], offset);
+    resampler_runtime_kind_.store(
+        current_decoder_->resampler_runtime_kind(), std::memory_order_release);
     current_track_position_ = offset;
     Logger::instance().debug("GaplessChainDecoder opened track index=" + std::to_string(current_index_) +
                              " offset=" + std::to_string(offset) +
@@ -269,6 +271,8 @@ std::size_t GaplessChainDecoder::read_samples(PcmSample* destination, std::size_
         }
 
         const std::size_t got = current_decoder_->read_samples(destination + copied, request_samples);
+        resampler_runtime_kind_.store(
+            current_decoder_->resampler_runtime_kind(), std::memory_order_release);
         if (got > request_samples) {
             throw std::runtime_error("Decoder returned more PCM samples than requested");
         }
@@ -327,6 +331,10 @@ DecoderSegmentPosition GaplessChainDecoder::segment_position() const noexcept {
 
 TransportTruncationKind GaplessChainDecoder::transport_truncation_kind() const noexcept {
     return TransportTruncationKind::DecoderSegmentBoundary;
+}
+
+ResamplerRuntimeKind GaplessChainDecoder::resampler_runtime_kind() const noexcept {
+    return resampler_runtime_kind_.load(std::memory_order_acquire);
 }
 
 bool GaplessChainDecoder::seek_to_sample(std::uint64_t sample_index) {
@@ -531,6 +539,8 @@ void GaplessChainDecoder::prepare_next_worker(std::size_t index,
             const std::size_t got = prepared.decoder->read_samples(
                 prepared.prebuffer.data(), prepared.prebuffer.size());
             prepared.prebuffer.resize(got);
+            prepared.resampler_runtime_kind =
+                prepared.decoder->resampler_runtime_kind();
             if (!cancelled()) {
                 prepared.ready = true;
                 Logger::instance().debug(
@@ -589,6 +599,8 @@ GaplessChainDecoder::SwitchResult GaplessChainDecoder::switch_to_next_track() {
     {
         std::lock_guard<std::mutex> lock(prepare_mutex_);
         if (prepared_.ready && prepared_.index == next_index && prepared_.decoder) {
+            const ResamplerRuntimeKind prepared_resampler_runtime_kind =
+                prepared_.resampler_runtime_kind;
             {
                 std::lock_guard<std::mutex> decoder_lock(decoder_mutex_);
                 current_decoder_ = std::move(prepared_.decoder);
@@ -601,6 +613,8 @@ GaplessChainDecoder::SwitchResult GaplessChainDecoder::switch_to_next_track() {
             prepared_ = PreparedNext{};
             current_index_ = next_index;
             current_track_position_ = 0;
+            resampler_runtime_kind_.store(
+                prepared_resampler_runtime_kind, std::memory_order_release);
             switched_to_prebuffered = true;
         } else if (prepared_.failed && prepared_.index == next_index) {
             Logger::instance().debug(

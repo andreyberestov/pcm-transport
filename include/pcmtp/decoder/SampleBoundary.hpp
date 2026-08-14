@@ -26,6 +26,16 @@ enum class PresentationEndKind {
     TrustedDecoderEof
 };
 
+// Describes whether a source-domain exact presentation span may safely fall
+// back to a fully drained decoder EOF after rate conversion removes the exact
+// numeric output bound. Existing exact sources are decoder-EOF-safe; formats
+// with encoder padding may require the exact source range unless separate EOF
+// evidence proves that the decoder removes the terminal padding.
+enum class ExactPresentationDrainPolicy {
+    DecoderEofMatchesPresentation,
+    ExactRangeRequired
+};
+
 // Records the evidence used to classify the extent. The transport and
 // gapless planners consume SampleExtentKind and remain format-agnostic.
 enum class SampleExtentSource {
@@ -37,6 +47,13 @@ enum class SampleExtentSource {
     NativeHeader,
     PcmDataSize,
     CodecGaplessMetadata,
+    MovAacPresentationBoundary,
+    AiffPcmData,
+    AuPcmData,
+    CafLpcmData,
+    TtaSampleCount,
+    DsfSampleCount,
+    DffDsdData,
     CueIndex
 };
 
@@ -45,13 +62,16 @@ enum class SampleExtentSource {
 // an exact sample range.
 enum class DecoderEofEvidenceSource {
     None,
-    OggTerminalEos
+    OggTerminalEos,
+    MovAacTerminalDiscard
 };
 
 struct SampleExtent {
     std::uint64_t samples = 0;
     SampleExtentKind kind = SampleExtentKind::Unknown;
     SampleExtentSource source = SampleExtentSource::None;
+    ExactPresentationDrainPolicy exact_presentation_drain_policy =
+        ExactPresentationDrainPolicy::DecoderEofMatchesPresentation;
 };
 
 struct LibavStreamBoundaryFacts {
@@ -66,6 +86,9 @@ struct LibavStreamBoundaryFacts {
     unsigned int stream_count = 0;
     unsigned int audio_stream_count = 0;
     bool stream_info_complete = false;
+    bool mov_aac_exact_presentation_evidence = false;
+    ExactPresentationDrainPolicy mov_aac_exact_presentation_drain_policy =
+        ExactPresentationDrainPolicy::ExactRangeRequired;
     DecoderEofEvidenceSource decoder_eof_evidence_source =
         DecoderEofEvidenceSource::None;
 };

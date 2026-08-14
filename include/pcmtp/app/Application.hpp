@@ -14,7 +14,6 @@ public:
 
 private:
     int run_probe_only();
-    int run_player(const std::string& file_path, const std::string& device_name);
     int run_gui(const std::string& program_name,
                 const std::vector<std::string>& source_paths);
     void print_usage(const char* program_name) const;

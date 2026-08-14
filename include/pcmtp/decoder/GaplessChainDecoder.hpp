@@ -57,6 +57,7 @@ public:
     PresentationEndKind presentation_end_kind() const noexcept override;
     DecoderSegmentPosition segment_position() const noexcept override;
     TransportTruncationKind transport_truncation_kind() const noexcept override;
+    ResamplerRuntimeKind resampler_runtime_kind() const noexcept override;
     bool seek_to_sample(std::uint64_t sample_index) override;
     void request_abort() override;
     void request_stop_after_current_segment(std::uint64_t segment_end_sample) override;
@@ -67,6 +68,8 @@ private:
         std::size_t index = 0;
         std::unique_ptr<IAudioDecoder> decoder;
         PcmBuffer prebuffer;
+        ResamplerRuntimeKind resampler_runtime_kind =
+            ResamplerRuntimeKind::NotUsed;
         bool ready = false;
         bool failed = false;
     };
@@ -100,6 +103,8 @@ private:
     AudioFormat format_{};
     std::unique_ptr<IAudioDecoder> current_decoder_;
     mutable std::mutex decoder_mutex_;
+    std::atomic<ResamplerRuntimeKind> resampler_runtime_kind_{
+        ResamplerRuntimeKind::NotUsed};
     bool opened_ = false;
     bool reached_eof_ = false;
     std::atomic<std::uint64_t> requested_end_sample_{

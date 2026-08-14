@@ -3,23 +3,14 @@
 
 #include "pcmtp/app/Application.hpp"
 
-#include <chrono>
 #include <iostream>
-#include <memory>
-#include <stdexcept>
-#include <thread>
 
-#include "pcmtp/backend/AlsaPcmBackend.hpp"
-#include "pcmtp/core/PlaybackEngine.hpp"
-#include "pcmtp/decoder/FlacStreamDecoder.hpp"
 #include "pcmtp/gui/GtkPlayerWindow.hpp"
 #include "pcmtp/hardware/CardProfileRegistry.hpp"
 
 namespace pcmtp {
 
 int Application::run(int argc, char** argv) {
-    std::string file_path;
-    std::string device_name = "default";
     std::vector<std::string> gui_source_paths;
     bool probe_only = false;
     bool no_gui = false;
@@ -29,10 +20,6 @@ int Application::run(int argc, char** argv) {
         const std::string arg = argv[i];
         if (!positional_arguments && arg == "--") {
             positional_arguments = true;
-        } else if (!positional_arguments && arg == "--file" && i + 1 < argc) {
-            file_path = argv[++i];
-        } else if (!positional_arguments && arg == "--device" && i + 1 < argc) {
-            device_name = argv[++i];
         } else if (!positional_arguments && arg == "--probe") {
             probe_only = true;
         } else if (!positional_arguments && arg == "--nogui") {
@@ -55,18 +42,8 @@ int Application::run(int argc, char** argv) {
         return 1;
     }
 
-    if (!file_path.empty() && !gui_source_paths.empty()) {
-        std::cerr << "Positional file arguments cannot be combined with --file\n";
-        print_usage(argv[0]);
-        return 1;
-    }
-
     if (probe_only) {
         return run_probe_only();
-    }
-
-    if (!file_path.empty()) {
-        return run_player(file_path, device_name);
     }
 
     if (no_gui) {
@@ -100,35 +77,6 @@ int Application::run_probe_only() {
     return 0;
 }
 
-int Application::run_player(const std::string& file_path,
-                            const std::string& device_name) {
-    std::unique_ptr<IAudioDecoder> decoder(new FlacStreamDecoder());
-    decoder->open(file_path);
-
-    std::cout << "Opened FLAC: " << file_path << "\n";
-    std::cout << "Format: " << decoder->format().to_string() << "\n";
-    std::cout << "Device: " << device_name << "\n";
-    std::cout << '\n';
-
-    const auto cards = CardProfileRegistry::probe_cards();
-    for (const auto& card : cards) {
-        if (card.legacy_audigy_like) {
-            std::cout << "Detected low-level ALSA mixer path on card " << card.card_index << "\n";
-            std::cout << "Low-level DSP path remains reserved for a future version.\n\n";
-        }
-    }
-
-    PlaybackEngine engine;
-    engine.start(std::move(decoder), std::make_unique<AlsaPcmBackend>(), device_name);
-    while (engine.is_playing()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-    if (!engine.last_error().empty()) {
-        throw std::runtime_error(engine.last_error());
-    }
-    return 0;
-}
-
 int Application::run_gui(const std::string& program_name,
                          const std::vector<std::string>& source_paths) {
     GtkPlayerWindow window;
@@ -139,7 +87,6 @@ int Application::run_gui(const std::string& program_name,
 void Application::print_usage(const char* program_name) const {
     std::cout << "Usage:\n";
     std::cout << "  " << program_name << " [FILE...]\n";
-    std::cout << "  " << program_name << " --file <path.flac> [--device default|hw:X,Y]\n";
     std::cout << "  " << program_name << " --probe\n";
 }
 

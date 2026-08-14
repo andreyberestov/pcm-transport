@@ -17,6 +17,8 @@ struct MediaProbeResult {
     AudioFormat format{};
     std::uint64_t total_samples_per_channel = 0;
     bool source_supports_trusted_decoder_eof = false;
+    ExactPresentationDrainPolicy sample_extent_drain_policy =
+        ExactPresentationDrainPolicy::DecoderEofMatchesPresentation;
     bool source_presentation_start_known = false;
     std::uint64_t source_presentation_start_sample = 0;
     SampleExtentKind sample_extent_kind = SampleExtentKind::Unknown;

@@ -96,10 +96,14 @@ private:
         std::uint64_t source_start_sample = 0;
         std::uint64_t source_end_sample = 0;
         bool source_supports_trusted_decoder_eof = false;
+        ExactPresentationDrainPolicy source_exact_presentation_drain_policy =
+            ExactPresentationDrainPolicy::DecoderEofMatchesPresentation;
         bool source_presentation_start_known = false;
         std::uint64_t source_presentation_start_sample = 0;
         SampleExtentKind sample_extent_kind = SampleExtentKind::Unknown;
         SampleExtentSource sample_extent_source = SampleExtentSource::None;
+        ExactPresentationDrainPolicy sample_extent_drain_policy =
+            ExactPresentationDrainPolicy::DecoderEofMatchesPresentation;
         SampleExtentKind source_sample_extent_kind = SampleExtentKind::Unknown;
         SampleExtentSource source_sample_extent_source = SampleExtentSource::None;
         PresentationEndKind presentation_end_kind = PresentationEndKind::Unknown;
@@ -133,6 +137,8 @@ private:
         bool native_decode = false;
         std::string processing_report;
         std::string processing_path;
+        bool resampler_runtime_reported = false;
+        std::string soxr_runtime_description;
     };
 
     struct MetadataProbeJob {
@@ -263,16 +269,29 @@ private:
     static void on_open_alsamixer_clicked(GtkButton* button, gpointer user_data);
     static void on_repeat_clicked(GtkButton* button, gpointer user_data);
     static void on_run_bitperfect_test_clicked(GtkButton* button, gpointer user_data);
-    static gboolean on_timer_tick(gpointer user_data);
+    static gboolean on_progress_deadline(gpointer user_data);
     static gboolean on_meter_tick(gpointer user_data);
     static gboolean on_playlist_vertical_position_restore_idle(gpointer user_data);
     static void on_playlist_scrolled_size_allocate(GtkWidget* widget,
                                                    GtkAllocation* allocation,
                                                    gpointer user_data);
+    static void on_playlist_field_cell_data(GtkTreeViewColumn* column,
+                                            GtkCellRenderer* renderer,
+                                            GtkTreeModel* model,
+                                            GtkTreeIter* iter,
+                                            gpointer user_data);
     static gboolean on_playlist_search_window_resize_idle(gpointer user_data);
+    static gboolean on_window_configure_event(GtkWidget* widget,
+                                              GdkEventConfigure* event,
+                                              gpointer user_data);
     static gboolean on_window_delete_event(GtkWidget* widget, GdkEvent* event, gpointer user_data);
     static void on_window_destroy(GtkWidget* widget, gpointer user_data);
     static gboolean on_meter_draw(GtkWidget* widget, cairo_t* cr, gpointer user_data);
+    static gboolean on_playback_event_ready(gint fd,
+                                            GIOCondition condition,
+                                            gpointer user_data);
+    static gboolean on_source_scan_completion_dispatch(gpointer user_data);
+    static gboolean on_metadata_completion_dispatch(gpointer user_data);
     static gboolean on_progress_draw(GtkWidget* widget, cairo_t* cr, gpointer user_data);
     static gboolean on_progress_button_press(GtkWidget* widget, GdkEventButton* event, gpointer user_data);
     static gboolean on_pending_seek_idle(gpointer user_data);
@@ -292,12 +311,12 @@ private:
     static void on_media_previous(GSimpleAction* action, GVariant* parameter, gpointer user_data);
     static gboolean on_restore_last_sources_idle(gpointer user_data);
     static gboolean on_preferences_save_timeout(gpointer user_data);
-    static gboolean on_continuous_preferences_commit_timeout(gpointer user_data);
 
     void build_ui(GtkApplication* app);
     void start_source_scan_worker();
     void stop_source_scan_worker();
     void source_scan_worker_loop();
+    void schedule_source_scan_completion_dispatch();
     void remember_open_directory_from_sources(const std::vector<std::string>& paths);
     bool open_source_paths(const std::vector<std::string>& paths,
                            bool replace_playlist,
@@ -319,6 +338,7 @@ private:
     void start_metadata_worker();
     void stop_metadata_worker();
     void metadata_worker_loop(std::size_t worker_index);
+    void schedule_metadata_completion_dispatch();
     void enqueue_initial_metadata_probes(const std::vector<std::string>& paths);
     void enqueue_metadata_probe(const std::string& path, bool move_to_front);
     void drain_metadata_probe_results();
@@ -403,18 +423,33 @@ private:
     void flush_preferences_save();
     void begin_continuous_preferences_interaction();
     void mark_continuous_preferences_dirty();
-    void schedule_continuous_preferences_commit();
     void commit_continuous_preferences();
-    void cancel_continuous_preferences_commit();
     void refresh_display(bool update_text = true,
                          bool update_progress = true);
     void refresh_display(const PlaybackStatusSnapshot& status,
                          bool update_text,
                          bool update_progress);
+    void refresh_progress_display(const PlaybackStatusSnapshot& status);
+    void pause_playback();
+    void resume_playback();
+    void schedule_progress_deadline();
+    void cancel_progress_deadline();
+    void reschedule_progress_deadline();
+    guint progress_deadline_delay_ms(const PlaybackTransportSnapshot& transport) const;
+    void install_playback_event_bridge();
+    void uninstall_playback_event_bridge();
+    void handle_playback_event(const PlaybackEvent& event);
+    void handle_transport_finished_event();
+    void close_finished_transport_for_manual_navigation();
+    void ensure_meter_timer_running();
+    void sync_meter_timer_to_settings();
+    void settle_meter_timer_after_stop();
     void stop_ui_updates();
     void cancel_pending_seek();
     void rebuild_playlist_view(bool reset_column_widths = true);
     void reset_playlist_column_widths();
+    void apply_playlist_field_width_limit(bool reset_column_widths);
+    void sync_playlist_field_renderer_binding();
     void update_playlist_sort_headers();
     void reset_playlist_sort_state();
     void cycle_playlist_sort(PlaylistSortKey key);
@@ -461,6 +496,8 @@ private:
                                               int preserved_viewport_height = 0);
     void account_playlist_search_window_resize_height(int window_height);
     void cancel_playlist_search_window_resize();
+    void complete_playlist_search_window_resize();
+    void queue_playlist_layout_reflow();
     void schedule_playlist_search_window_resize();
 
     std::unique_ptr<IAudioDecoder> create_decoder_for_entry(const PlaylistEntry& entry) const;
@@ -588,7 +625,7 @@ private:
     bool playlist_row_visible(std::size_t index) const;
     PlaylistScrollPolicy automatic_transport_scroll_policy(std::size_t index) const;
 
-    static std::string format_time(std::uint64_t samples_per_channel, std::uint32_t sample_rate = 44100);
+    static std::string format_time_seconds(std::uint64_t total_seconds);
     static std::string display_title_for(const PlaylistEntry& entry);
 
     GtkApplication* app_ = nullptr;
@@ -596,6 +633,8 @@ private:
     GtkWidget* display_track_ = nullptr;
     GtkWidget* display_time_ = nullptr;
     std::string display_time_text_ = "00:00 / 00:00";
+    std::uint64_t display_elapsed_seconds_ = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t display_total_seconds_ = std::numeric_limits<std::uint64_t>::max();
     GtkWidget* display_status_ = nullptr;
     GtkWidget* display_source_ = nullptr;
     GtkWidget* display_path_ = nullptr;
@@ -637,9 +676,6 @@ private:
     GtkWidget* diagnostics_active_output_value_ = nullptr;
     std::vector<GtkWidget*> stereo_tonal_dsp_controls_;
     std::optional<bool> applied_stereo_tonal_dsp_controls_enabled_;
-    bool stereo_tonal_dsp_transport_state_known_ = false;
-    bool stereo_tonal_dsp_transport_playing_ = false;
-    std::uint16_t stereo_tonal_dsp_transport_channels_ = 0;
 
     PlaybackEngine engine_;
     std::vector<PlaylistEntry> playlist_;
@@ -721,6 +757,7 @@ private:
     std::deque<SourceScanJob> source_scan_jobs_;
     std::deque<SourceScanCompletion> source_scan_completions_;
     std::atomic<bool> source_scan_completion_pending_{false};
+    std::atomic<bool> source_scan_dispatch_scheduled_{false};
     std::shared_ptr<std::atomic<bool>> active_source_scan_cancel_;
     bool source_scan_worker_stop_ = false;
     bool source_scan_active_ = false;
@@ -732,12 +769,14 @@ private:
     std::deque<MetadataProbeJob> metadata_jobs_;
     std::deque<MetadataProbeCompletion> metadata_completions_;
     std::atomic<bool> metadata_completion_pending_{false};
+    std::atomic<bool> metadata_dispatch_scheduled_{false};
     bool metadata_worker_stop_ = false;
     bool playlist_loading_ = false;
     std::uint64_t metadata_generation_ = 0;
     std::size_t metadata_total_files_ = 0;
     std::size_t metadata_completed_files_ = 0;
     std::size_t metadata_failed_files_ = 0;
+    std::chrono::steady_clock::time_point metadata_display_last_refresh_{};
     bool metadata_load_quiet_ = false;
     bool metadata_load_replace_playlist_ = false;
     std::vector<std::string> metadata_load_requested_sources_;
@@ -767,16 +806,30 @@ private:
     bool continuous_preferences_dirty_ = false;
     bool continuous_preferences_interaction_active_ = false;
     bool preferences_save_deferred_for_continuous_ = false;
-    guint continuous_preferences_commit_timeout_id_ = 0;
     std::unordered_map<std::string, CueSheet> cue_cache_;
     std::chrono::steady_clock::time_point clip_hold_until_{};
     std::uint32_t clip_hold_samples_ = 0;
-    guint ui_timer_id_ = 0;
+    guint progress_deadline_id_ = 0;
     guint meter_timer_id_ = 0;
+    guint playback_event_source_id_ = 0;
     std::chrono::steady_clock::time_point meter_last_update_{};
-    unsigned int ui_refresh_tick_ = 0;
     bool progress_blink_enabled_ = true;
+    std::shared_ptr<std::atomic<bool>> ui_dispatch_lifetime_;
     bool playlist_search_enabled_ = false;
+    static constexpr int kDefaultPlaylistFieldWidthChars = 25;
+    bool playlist_field_width_limit_enabled_ = false;
+    int playlist_field_width_chars_ = kDefaultPlaylistFieldWidthChars;
+    GtkCellRenderer* playlist_artist_renderer_ = nullptr;
+    GtkCellRenderer* playlist_title_renderer_ = nullptr;
+    GtkCellRenderer* playlist_album_renderer_ = nullptr;
+    GtkCellRenderer* playlist_source_renderer_ = nullptr;
+    GtkTreeViewColumn* playlist_artist_column_ = nullptr;
+    GtkTreeViewColumn* playlist_title_column_ = nullptr;
+    GtkTreeViewColumn* playlist_album_column_ = nullptr;
+    GtkTreeViewColumn* playlist_field_width_spacer_column_ = nullptr;
+    GtkTreeViewColumn* playlist_source_column_ = nullptr;
+    std::array<int, 4> playlist_field_width_initial_caps_ = {{-1, -1, -1, -1}};
+    bool playlist_field_cell_data_active_ = false;
     int playlist_rows_at_startup_ = 12;
     bool playlist_search_window_height_adjusted_ = false;
     int playlist_search_unrealized_height_delta_ = 0;
@@ -787,6 +840,7 @@ private:
     int playlist_search_window_resize_min_height_ = 0;
     int playlist_search_runtime_height_compensation_ = 0;
     unsigned int playlist_search_window_resize_attempts_ = 0;
+    bool playlist_search_window_resize_waiting_for_window_event_ = false;
     guint playlist_search_window_resize_idle_id_ = 0;
     bool playlist_selection_syncing_ = false;
     bool playlist_selection_handler_blocked_ = false;

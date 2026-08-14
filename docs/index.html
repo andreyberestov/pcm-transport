@@ -672,8 +672,11 @@ cmake --build build -j</code></pre>
     </div>
 
     <p class="note">
-      Dependencies: ALSA, GTK 3, libFLAC, libavformat, libavcodec,
-      libavutil and libswresample.
+      Dependencies: ALSA, GTK 3, libFLAC 1.3.3 or newer, and FFmpeg 4.4
+      or newer libraries: libavformat, libavcodec, libavutil and
+      libswresample. PCM Transport uses public library APIs and may
+      conservatively disable optional capabilities unavailable on the
+      supported baseline.
 
       FLAC decoding remains native through libFLAC. Other formats,
       metadata fallback and conversion paths use the FFmpeg libraries

@@ -25,6 +25,7 @@ public:
     std::string source_path() const override;
     PresentationEndKind presentation_end_kind() const noexcept override;
     TransportTruncationKind transport_truncation_kind() const noexcept override;
+    ResamplerRuntimeKind resampler_runtime_kind() const noexcept override;
     bool seek_to_sample(std::uint64_t sample_index) override;
     void request_abort() override;
     void request_stop_after_current_segment(std::uint64_t segment_end_sample) override;

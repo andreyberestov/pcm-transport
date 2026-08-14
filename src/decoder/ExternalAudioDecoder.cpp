@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "pcmtp/decoder/ExternalAudioDecoder.hpp"
+#include "pcmtp/decoder/ContainerBoundaryVerifier.hpp"
 
 #include <algorithm>
 #include <array>
@@ -40,6 +41,7 @@ extern "C" {
 #include <libavutil/samplefmt.h>
 #include <libavutil/version.h>
 #include <libswresample/swresample.h>
+#include <libswresample/version.h>
 }
 
 #include "pcmtp/util/Logger.hpp"
@@ -49,11 +51,27 @@ extern "C" {
 namespace pcmtp {
 namespace {
 
+#define PCMTP_FFMPEG_HAS_MODERN_CHANNEL_LAYOUT \
+    (LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(57, 24, 100) && \
+     LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(59, 24, 100) && \
+     LIBSWRESAMPLE_VERSION_INT >= AV_VERSION_INT(4, 5, 100))
+
+#define PCMTP_FFMPEG_HAS_MOV_AAC_INDEX_API \
+    (LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(58, 78, 100))
+
 constexpr auto kProbeTimeout = std::chrono::seconds(30);
 constexpr auto kVorbisOriginProbeTimeout = std::chrono::seconds(2);
 constexpr std::size_t kVorbisOriginMaximumDemuxPackets = 64;
 constexpr std::size_t kVorbisOriginMaximumAudioPackets = 16;
 constexpr std::uint64_t kVorbisOriginMaximumPayloadBytes = 4u * 1024u * 1024u;
+#if PCMTP_FFMPEG_HAS_MOV_AAC_INDEX_API
+constexpr auto kMovAacBoundaryProbeTimeout = std::chrono::seconds(2);
+constexpr std::size_t kMovAacMaximumHeadPackets = 16;
+constexpr std::int64_t kMovAacMaximumLeadingSkipSamples = 16384;
+constexpr std::size_t kMovAacMaximumTailPackets = 64;
+constexpr std::uint64_t kMovAacMaximumTailPayloadBytes = 4u * 1024u * 1024u;
+constexpr int kMovAacMaximumIndexEntries = 2000000;
+#endif
 constexpr std::size_t kOggMaximumPageSize = 27u + 255u + (255u * 255u);
 constexpr double kApeSeekPrerollSeconds = 3.0;
 constexpr double kRawAacSeekPrerollSeconds = 1.5;
@@ -251,6 +269,15 @@ bool format_name_has_token(const std::string& names, const std::string& token) {
     return false;
 }
 
+bool is_mov_family_format_name(const std::string& names) {
+    return format_name_has_token(names, "mov") ||
+           format_name_has_token(names, "mp4") ||
+           format_name_has_token(names, "m4a") ||
+           format_name_has_token(names, "3gp") ||
+           format_name_has_token(names, "3g2") ||
+           format_name_has_token(names, "mj2");
+}
+
 bool is_dsd_codec_name(const std::string& codec_name) {
     return starts_with(codec_name, "dsd_") || codec_name == "dst";
 }
@@ -318,7 +345,7 @@ std::uint16_t normalize_bits(int bits, AVSampleFormat sample_format, const std::
 }
 
 int stream_channels(const AVCodecParameters* parameters) {
-#if LIBAVUTIL_VERSION_MAJOR >= 57
+#if PCMTP_FFMPEG_HAS_MODERN_CHANNEL_LAYOUT
     return parameters != nullptr ? parameters->ch_layout.nb_channels : 0;
 #else
     return parameters != nullptr ? parameters->channels : 0;
@@ -326,7 +353,7 @@ int stream_channels(const AVCodecParameters* parameters) {
 }
 
 int frame_channels(const AVFrame* frame, const AVCodecContext* codec_context) {
-#if LIBAVUTIL_VERSION_MAJOR >= 57
+#if PCMTP_FFMPEG_HAS_MODERN_CHANNEL_LAYOUT
     if (frame != nullptr && frame->ch_layout.nb_channels > 0) {
         return frame->ch_layout.nb_channels;
     }
@@ -458,6 +485,50 @@ int interrupt_callback(void* opaque) {
     return state != nullptr && state->interrupted() ? 1 : 0;
 }
 
+void throw_if_global_probe_interrupted(const InterruptState* interrupt) {
+    if (interrupt != nullptr &&
+        (interrupt->cancelled() || interrupt->global_timed_out())) {
+        throw std::runtime_error(interrupt->global_timed_out()
+            ? "metadata probe timed out"
+            : "metadata probe cancelled");
+    }
+}
+
+struct AvFormatInputCloser {
+    void operator()(AVFormatContext* context) const {
+        if (context == nullptr) {
+            return;
+        }
+        AVFormatContext* closing = context;
+        avformat_close_input(&closing);
+    }
+};
+
+using ScopedAvFormatInput = std::unique_ptr<AVFormatContext, AvFormatInputCloser>;
+
+ScopedAvFormatInput open_bounded_input_context(const std::string& path,
+                                               InterruptState* interrupt) {
+    initialize_ffmpeg_logging();
+    AVFormatContext* context = avformat_alloc_context();
+    if (context == nullptr) {
+        return ScopedAvFormatInput{};
+    }
+    if (interrupt != nullptr) {
+        context->interrupt_callback.callback = interrupt_callback;
+        context->interrupt_callback.opaque = interrupt;
+    }
+
+    const int result = avformat_open_input(&context, path.c_str(), nullptr, nullptr);
+    if (result < 0) {
+        if (context != nullptr) {
+            avformat_close_input(&context);
+        }
+        throw_if_global_probe_interrupted(interrupt);
+        return ScopedAvFormatInput{};
+    }
+    return ScopedAvFormatInput(context);
+}
+
 AVFormatContext* open_input_context(const std::string& path,
                                     InterruptState* interrupt,
                                     bool find_stream_info) {
@@ -526,6 +597,628 @@ std::uint32_t read_le32(const unsigned char* p) {
            (static_cast<std::uint32_t>(p[2]) << 16) |
            (static_cast<std::uint32_t>(p[3]) << 24);
 }
+
+struct MovAacBoundaryEvidence {
+    bool exact_presentation = false;
+    std::uint64_t presentation_samples = 0;
+    ExactPresentationDrainPolicy drain_policy =
+        ExactPresentationDrainPolicy::ExactRangeRequired;
+    bool terminal_discard = false;
+};
+
+#if PCMTP_FFMPEG_HAS_MOV_AAC_INDEX_API
+
+struct PacketSkipSamples {
+    bool present = false;
+    std::uint32_t leading = 0;
+    std::uint32_t trailing = 0;
+    std::uint8_t leading_reason = 0;
+    std::uint8_t trailing_reason = 0;
+};
+
+PacketSkipSamples packet_skip_samples(const AVPacket* packet) {
+    PacketSkipSamples result;
+    if (packet == nullptr) {
+        return result;
+    }
+    std::size_t side_data_size = 0;
+    const std::uint8_t* side_data = av_packet_get_side_data(
+        packet, AV_PKT_DATA_SKIP_SAMPLES, &side_data_size);
+    if (side_data == nullptr || side_data_size < 10) {
+        return result;
+    }
+    result.present = true;
+    result.leading = read_le32(side_data);
+    result.trailing = read_le32(side_data + 4);
+    result.leading_reason = side_data[8];
+    result.trailing_reason = side_data[9];
+    return result;
+}
+
+struct ItunSmpbInfo {
+    bool present = false;
+    bool valid = false;
+    std::uint64_t priming = 0;
+    std::uint64_t remainder = 0;
+    std::uint64_t samples = 0;
+};
+
+bool parse_hex_u64_token(const char** cursor, std::uint64_t* value) {
+    if (cursor == nullptr || *cursor == nullptr || value == nullptr) {
+        return false;
+    }
+    const char* current = *cursor;
+    while (*current != '\0' &&
+           std::isspace(static_cast<unsigned char>(*current)) != 0) {
+        ++current;
+    }
+    if (*current == '\0') {
+        return false;
+    }
+
+    std::uint64_t parsed = 0;
+    std::size_t digits = 0;
+    while (*current != '\0' &&
+           std::isspace(static_cast<unsigned char>(*current)) == 0) {
+        unsigned int nibble = 0;
+        const unsigned char ch = static_cast<unsigned char>(*current);
+        if (ch >= '0' && ch <= '9') {
+            nibble = ch - '0';
+        } else if (ch >= 'a' && ch <= 'f') {
+            nibble = ch - 'a' + 10U;
+        } else if (ch >= 'A' && ch <= 'F') {
+            nibble = ch - 'A' + 10U;
+        } else {
+            return false;
+        }
+        if (digits >= 16 ||
+            parsed > (std::numeric_limits<std::uint64_t>::max() - nibble) / 16U) {
+            return false;
+        }
+        parsed = parsed * 16U + nibble;
+        ++digits;
+        ++current;
+    }
+    if (digits == 0) {
+        return false;
+    }
+    *cursor = current;
+    *value = parsed;
+    return true;
+}
+
+ItunSmpbInfo itun_smpb_info(const AVDictionary* metadata) {
+    ItunSmpbInfo result;
+    if (metadata == nullptr) {
+        return result;
+    }
+    const AVDictionaryEntry* entry = av_dict_get(
+        metadata, "iTunSMPB", nullptr, 0);
+    if (entry == nullptr || entry->value == nullptr) {
+        return result;
+    }
+    result.present = true;
+
+    const char* cursor = entry->value;
+    std::uint64_t reserved = 0;
+    if (!parse_hex_u64_token(&cursor, &reserved) ||
+        !parse_hex_u64_token(&cursor, &result.priming) ||
+        !parse_hex_u64_token(&cursor, &result.remainder) ||
+        !parse_hex_u64_token(&cursor, &result.samples)) {
+        return result;
+    }
+    // Match FFmpeg's conservative priming sanity range. The remaining fields
+    // are corroborated against packet timing before they become evidence.
+    result.valid = result.priming > 0 &&
+                   result.priming <
+                       static_cast<std::uint64_t>(kMovAacMaximumLeadingSkipSamples) &&
+                   result.samples > 0 &&
+                   result.samples <=
+                       static_cast<std::uint64_t>(
+                           std::numeric_limits<std::int64_t>::max());
+    return result;
+}
+
+ItunSmpbInfo combined_itun_smpb_info(const AVDictionary* container_metadata,
+                                      const AVDictionary* stream_metadata) {
+    const ItunSmpbInfo container = itun_smpb_info(container_metadata);
+    const ItunSmpbInfo stream = itun_smpb_info(stream_metadata);
+    if (!container.present) {
+        return stream;
+    }
+    if (!stream.present) {
+        return container;
+    }
+
+    ItunSmpbInfo combined = container;
+    combined.valid = container.valid && stream.valid &&
+                     container.priming == stream.priming &&
+                     container.remainder == stream.remainder &&
+                     container.samples == stream.samples;
+    return combined;
+}
+
+bool checked_add_int64(std::int64_t left,
+                       std::int64_t right,
+                       std::int64_t* result) {
+    if (result == nullptr ||
+        (right > 0 && left > std::numeric_limits<std::int64_t>::max() - right) ||
+        (right < 0 && left < std::numeric_limits<std::int64_t>::min() - right)) {
+        return false;
+    }
+    *result = left + right;
+    return true;
+}
+
+struct MovAacHeadEvidence {
+    bool valid = false;
+    std::int64_t nominal_frame_samples = 0;
+    std::int64_t first_packet_timestamp = AV_NOPTS_VALUE;
+};
+
+MovAacHeadEvidence probe_mov_aac_head_evidence(
+    const std::string& path,
+    int stream_index,
+    const AVStream* reference_stream,
+    AVCodecParameters* reference_parameters,
+    const ItunSmpbInfo& smpb,
+    InterruptState* interrupt) {
+    MovAacHeadEvidence evidence;
+    if (path.empty() || stream_index < 0 || reference_stream == nullptr ||
+        reference_parameters == nullptr) {
+        return evidence;
+    }
+
+    ScopedAvFormatInput head_context = open_bounded_input_context(path, interrupt);
+    if (!head_context || head_context->iformat == nullptr ||
+        head_context->iformat->name == nullptr ||
+        !is_mov_family_format_name(lower_copy(head_context->iformat->name)) ||
+        static_cast<unsigned int>(stream_index) >= head_context->nb_streams) {
+        return evidence;
+    }
+
+    AVStream* head_stream = head_context->streams[stream_index];
+    AVCodecParameters* head_parameters =
+        head_stream != nullptr ? head_stream->codecpar : nullptr;
+    if (head_stream == nullptr || head_parameters == nullptr ||
+        head_parameters->codec_type != AVMEDIA_TYPE_AUDIO ||
+        head_parameters->codec_id != AV_CODEC_ID_AAC ||
+        head_stream->id != reference_stream->id ||
+        head_parameters->sample_rate != reference_parameters->sample_rate ||
+        head_stream->time_base.num != reference_stream->time_base.num ||
+        head_stream->time_base.den != reference_stream->time_base.den) {
+        return evidence;
+    }
+
+    AVPacket* packet = av_packet_alloc();
+    if (packet == nullptr) {
+        return evidence;
+    }
+
+    for (std::size_t packet_count = 0;
+         packet_count < kMovAacMaximumHeadPackets;
+         ++packet_count) {
+        const int read_result = av_read_frame(head_context.get(), packet);
+        if (read_result < 0) {
+            av_packet_free(&packet);
+            throw_if_global_probe_interrupted(interrupt);
+            return evidence;
+        }
+        if (packet->stream_index != stream_index) {
+            av_packet_unref(packet);
+            continue;
+        }
+        if ((packet->flags & AV_PKT_FLAG_CORRUPT) != 0 ||
+            packet->pts == AV_NOPTS_VALUE || packet->dts == AV_NOPTS_VALUE ||
+            packet->dts != packet->pts || packet->duration <= 0 ||
+            packet->size <= 0) {
+            av_packet_free(&packet);
+            return evidence;
+        }
+
+        const PacketSkipSamples skip = packet_skip_samples(packet);
+        if (!skip.present || skip.leading == 0 || skip.trailing != 0 ||
+            skip.leading_reason != 0) {
+            av_packet_free(&packet);
+            return evidence;
+        }
+        std::int64_t presentation_start = 0;
+        if (!checked_add_int64(packet->pts,
+                               static_cast<std::int64_t>(skip.leading),
+                               &presentation_start) ||
+            presentation_start != 0) {
+            av_packet_free(&packet);
+            return evidence;
+        }
+
+        const int nominal_frame_samples =
+            av_get_audio_frame_duration2(reference_parameters, packet->size);
+        if (nominal_frame_samples <= 0 || nominal_frame_samples > 4096 ||
+            packet->duration != nominal_frame_samples) {
+            av_packet_free(&packet);
+            return evidence;
+        }
+        if (reference_parameters->frame_size > 0 &&
+            reference_parameters->frame_size != nominal_frame_samples) {
+            av_packet_free(&packet);
+            return evidence;
+        }
+        if (reference_parameters->initial_padding > 0 &&
+            static_cast<std::uint32_t>(reference_parameters->initial_padding) !=
+                skip.leading) {
+            av_packet_free(&packet);
+            return evidence;
+        }
+        if (smpb.valid && smpb.priming != skip.leading) {
+            av_packet_free(&packet);
+            return evidence;
+        }
+
+        evidence.valid = true;
+        evidence.nominal_frame_samples = nominal_frame_samples;
+        evidence.first_packet_timestamp = packet->pts;
+        av_packet_free(&packet);
+        return evidence;
+    }
+
+    av_packet_free(&packet);
+    throw_if_global_probe_interrupted(interrupt);
+    return evidence;
+}
+
+bool mov_aac_index_is_contiguous(
+    AVStream* stream,
+    std::int64_t nominal_frame_samples,
+    std::int64_t first_packet_timestamp,
+    std::int64_t last_packet_timestamp,
+    const InterruptState* interrupt) {
+    if (stream == nullptr || nominal_frame_samples <= 0 ||
+        first_packet_timestamp == AV_NOPTS_VALUE ||
+        last_packet_timestamp == AV_NOPTS_VALUE ||
+        last_packet_timestamp < first_packet_timestamp) {
+        return false;
+    }
+
+    // AVIndexEntry timestamps are an implementation-facing seek index and MOV
+    // edit-list handling can shift their absolute origin relative to demuxed
+    // packet PTS. Do not assign either timeline a physical/presentation meaning
+    // that FFmpeg's public API does not promise. For this conservative proof we
+    // require only an offset-independent invariant: the index must contain one
+    // dense entry per nominal AAC access unit across the packet timestamp span,
+    // and adjacent index entries must have the same nominal AAC cadence.
+    std::int64_t packet_span_signed = 0;
+    if (first_packet_timestamp < 0 &&
+        last_packet_timestamp >
+            std::numeric_limits<std::int64_t>::max() + first_packet_timestamp) {
+        return false;
+    }
+    packet_span_signed = last_packet_timestamp - first_packet_timestamp;
+    const std::uint64_t packet_span =
+        static_cast<std::uint64_t>(packet_span_signed);
+    const std::uint64_t nominal = static_cast<std::uint64_t>(nominal_frame_samples);
+    if (packet_span % nominal != 0) {
+        return false;
+    }
+    const std::uint64_t expected_entry_count = packet_span / nominal + 1;
+    if (expected_entry_count == 0 ||
+        expected_entry_count > static_cast<std::uint64_t>(kMovAacMaximumIndexEntries)) {
+        return false;
+    }
+
+    const int entry_count = avformat_index_get_entries_count(stream);
+    if (entry_count <= 0 || entry_count > kMovAacMaximumIndexEntries) {
+        return false;
+    }
+    if (static_cast<std::uint64_t>(entry_count) != expected_entry_count) {
+        return false;
+    }
+
+    const AVIndexEntry* first_entry = avformat_index_get_entry(stream, 0);
+    if (first_entry == nullptr) {
+        return false;
+    }
+    std::int64_t previous_timestamp = first_entry->timestamp;
+    for (int index = 1; index < entry_count; ++index) {
+        if ((index & 4095) == 0 && interrupt != nullptr && interrupt->interrupted()) {
+            return false;
+        }
+        const AVIndexEntry* entry = avformat_index_get_entry(stream, index);
+        std::int64_t expected_timestamp = 0;
+        if (entry == nullptr ||
+            !checked_add_int64(previous_timestamp,
+                               nominal_frame_samples,
+                               &expected_timestamp) ||
+            entry->timestamp != expected_timestamp) {
+            return false;
+        }
+        previous_timestamp = entry->timestamp;
+    }
+    return true;
+}
+
+bool mov_aac_auxiliary_streams_supported(const AVFormatContext* context,
+                                         int audio_stream_index) {
+    if (context == nullptr || audio_stream_index < 0 ||
+        static_cast<unsigned int>(audio_stream_index) >= context->nb_streams) {
+        return false;
+    }
+    for (unsigned int index = 0; index < context->nb_streams; ++index) {
+        if (static_cast<int>(index) == audio_stream_index) {
+            continue;
+        }
+        const AVStream* stream = context->streams[index];
+        if (stream == nullptr || stream->codecpar == nullptr ||
+            stream->codecpar->codec_type != AVMEDIA_TYPE_VIDEO ||
+            (stream->disposition & AV_DISPOSITION_ATTACHED_PIC) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Prove only AAC-LC/MOV presentations whose demuxed presentation timeline is
+// corroborated by bounded packet evidence at both ends of the stream. The
+// leading packet trim anchors the MOV presentation origin, while the terminal
+// nominal AAC access unit must reach a clean demux EOF and contain the MOV
+// presentation end. AVPacket::duration is only a bounded consistency check: it
+// must cover that presentation end and cannot extend beyond the nominal access
+// unit. The AVStream index is checked only for offset-independent dense AAC
+// cadence, never treated as a physical or presentation timestamp origin.
+// Optional iTunSMPB/trailing-padding data must agree with that packet proof.
+// Explicit terminal packet discard remains a separate decoder-EOF proof.
+// Any missing or conflicting evidence deliberately falls back to ET.
+MovAacBoundaryEvidence probe_mov_aac_boundary_evidence(
+    const std::string& path,
+    AVFormatContext* context,
+    int stream_index,
+    InterruptState* interrupt) {
+    MovAacBoundaryEvidence evidence;
+    if (context == nullptr || stream_index < 0 ||
+        static_cast<unsigned int>(stream_index) >= context->nb_streams) {
+        return evidence;
+    }
+    if (!mov_aac_auxiliary_streams_supported(context, stream_index)) {
+        return evidence;
+    }
+
+    AVStream* stream = context->streams[stream_index];
+    AVCodecParameters* parameters = stream != nullptr ? stream->codecpar : nullptr;
+    if (stream == nullptr || parameters == nullptr ||
+        parameters->codec_type != AVMEDIA_TYPE_AUDIO ||
+        parameters->codec_id != AV_CODEC_ID_AAC ||
+        parameters->profile != AV_PROFILE_AAC_LOW ||
+        parameters->sample_rate <= 0 ||
+        parameters->initial_padding < 0 || parameters->trailing_padding < 0 ||
+        stream->time_base.num != 1 ||
+        stream->time_base.den != parameters->sample_rate ||
+        stream->start_time != 0 || stream->duration <= 0) {
+        return evidence;
+    }
+
+    const std::uint64_t stream_presentation_samples =
+        static_cast<std::uint64_t>(stream->duration);
+    if (context->duration > 0) {
+        const std::int64_t container_samples = av_rescale_q_rnd(
+            context->duration,
+            AVRational{1, AV_TIME_BASE},
+            AVRational{1, parameters->sample_rate},
+            static_cast<AVRounding>(AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
+        if (container_samples <= 0) {
+            return evidence;
+        }
+        const std::int64_t duration_difference =
+            container_samples > stream->duration
+                ? container_samples - stream->duration
+                : stream->duration - container_samples;
+        if (duration_difference > 1) {
+            return evidence;
+        }
+    }
+
+    const ItunSmpbInfo smpb =
+        combined_itun_smpb_info(context->metadata, stream->metadata);
+    if (smpb.present && !smpb.valid) {
+        return evidence;
+    }
+
+    // FFmpeg may attach AV_PKT_DATA_SKIP_SAMPLES when packet iteration starts
+    // from a fresh MOV demux state. Seeking the already-open main context can
+    // preserve the negative packet timestamp while dropping that leading-trim
+    // side data. Read the first packets from a fresh bounded context without an
+    // application-level seek; keep the main context and its sample-table index
+    // for tail/index proof.
+    MovAacHeadEvidence head;
+    {
+        ScopedInterruptBudget head_budget(interrupt, kMovAacBoundaryProbeTimeout);
+        head = probe_mov_aac_head_evidence(
+            path, stream_index, stream, parameters, smpb, interrupt);
+    }
+    if (!head.valid) {
+        return evidence;
+    }
+    const std::int64_t nominal_frame_samples = head.nominal_frame_samples;
+    const std::int64_t first_packet_timestamp = head.first_packet_timestamp;
+
+    // Preserve the existing bounded tail/index budget independently of the
+    // additional bounded head open so accepted files do not lose verification
+    // time merely because the leading packet is now read from a fresh context.
+    ScopedInterruptBudget bounded_budget(interrupt, kMovAacBoundaryProbeTimeout);
+
+    AVPacket* packet = av_packet_alloc();
+    if (packet == nullptr) {
+        return evidence;
+    }
+
+    const std::int64_t tail_window = nominal_frame_samples * 16;
+    const std::int64_t seek_target = stream->duration > tail_window
+        ? stream->duration - tail_window
+        : 0;
+    const int seek_result = avformat_seek_file(
+        context,
+        stream_index,
+        std::numeric_limits<std::int64_t>::min(),
+        seek_target,
+        stream->duration,
+        AVSEEK_FLAG_BACKWARD);
+    if (seek_result < 0) {
+        av_packet_free(&packet);
+        throw_if_global_probe_interrupted(interrupt);
+        return evidence;
+    }
+    avformat_flush(context);
+
+    bool found_tail_audio_packet = false;
+    bool saw_clean_eof = false;
+    bool checked_seek_locality = false;
+    std::int64_t last_pts = AV_NOPTS_VALUE;
+    std::int64_t last_duration = 0;
+    std::int64_t last_frame_samples = 0;
+    PacketSkipSamples last_skip;
+    std::uint64_t payload_bytes = 0;
+    for (std::size_t packet_count = 0;
+         packet_count < kMovAacMaximumTailPackets;
+         ++packet_count) {
+        const int read_result = av_read_frame(context, packet);
+        if (read_result == AVERROR_EOF) {
+            saw_clean_eof = true;
+            break;
+        }
+        if (read_result < 0) {
+            av_packet_free(&packet);
+            throw_if_global_probe_interrupted(interrupt);
+            return evidence;
+        }
+        if (packet->stream_index != stream_index) {
+            av_packet_unref(packet);
+            continue;
+        }
+        if (packet->size > 0) {
+            const std::uint64_t packet_size = static_cast<std::uint64_t>(packet->size);
+            if (packet_size > kMovAacMaximumTailPayloadBytes - payload_bytes) {
+                av_packet_free(&packet);
+                return evidence;
+            }
+            payload_bytes += packet_size;
+        }
+        if ((packet->flags & AV_PKT_FLAG_CORRUPT) != 0 ||
+            packet->pts == AV_NOPTS_VALUE || packet->dts == AV_NOPTS_VALUE ||
+            packet->dts != packet->pts || packet->duration <= 0 ||
+            packet->size <= 0) {
+            av_packet_free(&packet);
+            return evidence;
+        }
+        if (!checked_seek_locality) {
+            const std::int64_t locality_floor = seek_target > nominal_frame_samples * 4
+                ? seek_target - nominal_frame_samples * 4
+                : std::numeric_limits<std::int64_t>::min();
+            if (packet->pts < locality_floor) {
+                av_packet_free(&packet);
+                return evidence;
+            }
+            checked_seek_locality = true;
+        }
+        const int frame_samples = av_get_audio_frame_duration2(parameters, packet->size);
+        if (frame_samples <= 0 || frame_samples != nominal_frame_samples ||
+            packet->duration > nominal_frame_samples) {
+            av_packet_free(&packet);
+            return evidence;
+        }
+        found_tail_audio_packet = true;
+        last_pts = packet->pts;
+        last_duration = packet->duration;
+        last_frame_samples = frame_samples;
+        last_skip = packet_skip_samples(packet);
+        av_packet_unref(packet);
+    }
+    av_packet_free(&packet);
+    throw_if_global_probe_interrupted(interrupt);
+
+    if (!saw_clean_eof || !found_tail_audio_packet ||
+        last_pts == AV_NOPTS_VALUE || last_duration <= 0 ||
+        last_frame_samples <= 0) {
+        return evidence;
+    }
+
+
+    std::int64_t packet_duration_end = 0;
+    std::int64_t physical_end = 0;
+    if (!checked_add_int64(last_pts, last_duration, &packet_duration_end) ||
+        !checked_add_int64(last_pts, last_frame_samples, &physical_end) ||
+        physical_end <= 0) {
+        return evidence;
+    }
+
+    // AVPacket::duration is demuxer timing metadata, not the authoritative
+    // presentation boundary. Supported FFmpeg/MOV combinations may expose a
+    // duration between the presentation remainder and the nominal AAC frame.
+    // Require only that it is self-consistent with the independently proven
+    // boundary: it must cover the MOV presentation end and, as already checked
+    // above, cannot exceed the nominal access-unit duration.
+    if (physical_end < stream->duration) {
+        return evidence;
+    }
+    const std::uint64_t trailing_padding = static_cast<std::uint64_t>(
+        physical_end - stream->duration);
+    if (trailing_padding >= static_cast<std::uint64_t>(nominal_frame_samples)) {
+        return evidence;
+    }
+    if (packet_duration_end < stream->duration || packet_duration_end > physical_end) {
+        return evidence;
+    }
+
+    if (!mov_aac_index_is_contiguous(
+            stream,
+            nominal_frame_samples,
+            first_packet_timestamp,
+            last_pts,
+            interrupt)) {
+        throw_if_global_probe_interrupted(interrupt);
+        return evidence;
+    }
+
+    // The exact span is the MOV presentation span established by the bounded
+    // packet timeline above. Optional gapless fields are corroborating facts,
+    // never substitutes for that packet proof.
+    if (smpb.valid &&
+        (smpb.samples != stream_presentation_samples ||
+         smpb.remainder != trailing_padding)) {
+        return evidence;
+    }
+    if (parameters->trailing_padding > 0 &&
+        static_cast<std::uint64_t>(parameters->trailing_padding) != trailing_padding) {
+        return evidence;
+    }
+    if (last_skip.present && last_skip.trailing > 0 &&
+        (last_skip.trailing_reason != 0 ||
+         static_cast<std::uint64_t>(last_skip.trailing) != trailing_padding)) {
+        return evidence;
+    }
+
+    evidence.exact_presentation = true;
+    evidence.presentation_samples = stream_presentation_samples;
+    evidence.drain_policy = trailing_padding == 0
+        ? ExactPresentationDrainPolicy::DecoderEofMatchesPresentation
+        : ExactPresentationDrainPolicy::ExactRangeRequired;
+    evidence.terminal_discard = trailing_padding > 0 &&
+        last_skip.present && last_skip.trailing_reason == 0 &&
+        static_cast<std::uint64_t>(last_skip.trailing) == trailing_padding;
+    return evidence;
+}
+
+#else
+
+MovAacBoundaryEvidence probe_mov_aac_boundary_evidence(
+    const std::string&,
+    AVFormatContext*,
+    int,
+    InterruptState*) {
+    // FFmpeg 4.4 predates the public AVStream index-entry accessor API used
+    // by the strict MOV/AAC proof. Keep normal AAC/MOV playback available and
+    // conservatively leave the presentation boundary unknown on this baseline.
+    return MovAacBoundaryEvidence{};
+}
+
+#endif
 
 bool read_exact(std::ifstream& input, unsigned char* data, std::size_t size) {
     input.read(reinterpret_cast<char*>(data), static_cast<std::streamsize>(size));
@@ -1349,6 +2042,7 @@ bool probe_wav_header_fast(const std::string& path,
     return true;
 }
 
+
 struct LibavProbeResult {
     ExternalAudioInfo info;
 };
@@ -1402,6 +2096,22 @@ LibavProbeResult probe_with_libav(const std::string& path,
             }
         }
         boundary_facts.stream_info_complete = true;
+        if (is_mov_family_format_name(boundary_facts.demuxer_name) &&
+            info.codec_name == "aac") {
+            const MovAacBoundaryEvidence aac_evidence =
+                probe_mov_aac_boundary_evidence(path, context, stream_index, &interrupt);
+            if (aac_evidence.exact_presentation &&
+                aac_evidence.presentation_samples ==
+                    static_cast<std::uint64_t>(stream->duration)) {
+                boundary_facts.mov_aac_exact_presentation_evidence = true;
+                boundary_facts.mov_aac_exact_presentation_drain_policy =
+                    aac_evidence.drain_policy;
+                if (aac_evidence.terminal_discard) {
+                    boundary_facts.decoder_eof_evidence_source =
+                        DecoderEofEvidenceSource::MovAacTerminalDiscard;
+                }
+            }
+        }
         if (format_name_has_token(boundary_facts.demuxer_name, "ogg") &&
             (info.codec_name == "vorbis" || info.codec_name == "opus") &&
             boundary_facts.stream_count == 1 &&
@@ -1415,9 +2125,30 @@ LibavProbeResult probe_with_libav(const std::string& path,
             libav_stream_supports_trusted_decoder_eof(boundary_facts);
 
         const SampleExtent stream_extent = classify_libav_stream_extent(boundary_facts);
+        ContainerBoundaryFacts container_boundary_facts;
+        container_boundary_facts.demuxer_name = boundary_facts.demuxer_name;
+        container_boundary_facts.codec_name = info.codec_name;
+        container_boundary_facts.sample_rate = info.format.sample_rate;
+        container_boundary_facts.channels = info.format.channels;
+        container_boundary_facts.block_align = parameters->block_align > 0
+            ? static_cast<std::uint32_t>(parameters->block_align) : 0;
+        int boundary_bits = parameters->bits_per_coded_sample;
+        if (boundary_bits <= 0) {
+            boundary_bits = av_get_exact_bits_per_sample(parameters->codec_id);
+        }
+        if (boundary_bits > 0 && boundary_bits <=
+                static_cast<int>(std::numeric_limits<std::uint16_t>::max())) {
+            container_boundary_facts.bits_per_coded_sample =
+                static_cast<std::uint16_t>(boundary_bits);
+        }
+        container_boundary_facts.initial_padding = parameters->initial_padding;
+        container_boundary_facts.trailing_padding = parameters->trailing_padding;
+        const SampleExtent verified_file_extent = verify_container_sample_extent(
+            path, container_boundary_facts);
         const SampleExtent container_extent = estimated_container_extent(
             context->duration, 1, AV_TIME_BASE, info.format.sample_rate);
-        SampleExtent selected_extent = stream_extent;
+        SampleExtent selected_extent = select_stronger_sample_extent(
+            stream_extent, verified_file_extent);
         if (format_name_has_token(boundary_facts.demuxer_name, "ogg") &&
             info.codec_name == "vorbis") {
             const std::optional<std::int64_t> presentation_start =
@@ -1458,6 +2189,8 @@ LibavProbeResult probe_with_libav(const std::string& path,
         info.total_samples_per_channel = selected_extent.samples;
         info.sample_extent_kind = selected_extent.kind;
         info.sample_extent_source = selected_extent.source;
+        info.sample_extent_drain_policy =
+            selected_extent.exact_presentation_drain_policy;
         info.probe_backend = "libavformat";
         avformat_close_input(&context);
         return LibavProbeResult{info};
@@ -1524,6 +2257,8 @@ struct ExternalAudioDecoder::Impl {
     std::vector<std::int16_t> conversion_buffer_s16;
     std::vector<std::int32_t> conversion_buffer_s32;
     std::vector<const std::uint8_t*> input_planes;
+    std::atomic<ResamplerRuntimeKind> resampler_runtime_kind{
+        ResamplerRuntimeKind::NotUsed};
     bool seeking = false;
     std::uint64_t seek_target_sample = 0;
     std::uint64_t output_timeline_sample = 0;
@@ -1534,7 +2269,7 @@ struct ExternalAudioDecoder::Impl {
     int configured_input_rate = 0;
     AVSampleFormat configured_input_format = AV_SAMPLE_FMT_NONE;
     int configured_channels = 0;
-#if LIBAVUTIL_VERSION_MAJOR >= 57
+#if PCMTP_FFMPEG_HAS_MODERN_CHANNEL_LAYOUT
     AVChannelLayout configured_input_layout{};
     bool configured_input_layout_valid = false;
 #else
@@ -1547,7 +2282,7 @@ struct ExternalAudioDecoder::Impl {
     }
 
     void clear_configured_input_layout() {
-#if LIBAVUTIL_VERSION_MAJOR >= 57
+#if PCMTP_FFMPEG_HAS_MODERN_CHANNEL_LAYOUT
         if (configured_input_layout_valid) {
             av_channel_layout_uninit(&configured_input_layout);
             configured_input_layout_valid = false;
@@ -1565,6 +2300,8 @@ struct ExternalAudioDecoder::Impl {
         swr_drained = false;
         pending_samples.clear();
         pending_offset = 0;
+        resampler_runtime_kind.store(
+            ResamplerRuntimeKind::NotUsed, std::memory_order_release);
         seeking = false;
         seek_target_sample = 0;
         output_timeline_sample = 0;
@@ -1696,12 +2433,14 @@ ExternalAudioInfo ExternalAudioDecoder::probe_metadata(const std::string& path,
     info.source_total_samples_per_channel = info.total_samples_per_channel;
     info.source_sample_extent_kind = info.sample_extent_kind;
     info.source_sample_extent_source = info.sample_extent_source;
+    info.source_exact_presentation_drain_policy = info.sample_extent_drain_policy;
 
     const std::uint32_t source_rate = info.format.sample_rate;
     SampleExtent source_extent;
     source_extent.samples = info.total_samples_per_channel;
     source_extent.kind = info.sample_extent_kind;
     source_extent.source = info.sample_extent_source;
+    source_extent.exact_presentation_drain_policy = info.sample_extent_drain_policy;
     SampleExtent output_extent = source_extent;
     if (forced_output_sample_rate > 0 && source_rate > 0 &&
         forced_output_sample_rate != source_rate) {
@@ -1710,6 +2449,7 @@ ExternalAudioInfo ExternalAudioDecoder::probe_metadata(const std::string& path,
         info.total_samples_per_channel = output_extent.samples;
         info.sample_extent_kind = output_extent.kind;
         info.sample_extent_source = output_extent.source;
+        info.sample_extent_drain_policy = output_extent.exact_presentation_drain_policy;
     }
     info.presentation_end_kind =
         presentation_end_kind_for_output(
@@ -1873,10 +2613,6 @@ public:
         return context_;
     }
 
-    SwrContext** address() noexcept {
-        return &context_;
-    }
-
     void reset(SwrContext* context) noexcept {
         if (context_ != context) {
             swr_free(&context_);
@@ -1894,7 +2630,7 @@ private:
     SwrContext* context_ = nullptr;
 };
 
-#if LIBAVUTIL_VERSION_MAJOR >= 57
+#if PCMTP_FFMPEG_HAS_MODERN_CHANNEL_LAYOUT
 class ChannelLayoutGuard final {
 public:
     ChannelLayoutGuard() = default;
@@ -1980,7 +2716,7 @@ void configure_resampler(DecoderImpl& impl,
         throw std::runtime_error("Invalid decoded audio frame format");
     }
 
-#if LIBAVUTIL_VERSION_MAJOR >= 57
+#if PCMTP_FFMPEG_HAS_MODERN_CHANNEL_LAYOUT
     ChannelLayoutGuard input_layout(
         resolved_input_layout(frame, impl.codec_context, channels));
     const bool layout_matches =
@@ -2011,40 +2747,47 @@ void configure_resampler(DecoderImpl& impl,
 
     const AVSampleFormat output_sample_format =
         output_format.bits_per_sample <= 16 ? AV_SAMPLE_FMT_S16 : AV_SAMPLE_FMT_S32;
-    SwrContextGuard new_context;
-#if LIBAVUTIL_VERSION_MAJOR >= 57
+#if PCMTP_FFMPEG_HAS_MODERN_CHANNEL_LAYOUT
     ChannelLayoutGuard output_layout;
     av_channel_layout_default(output_layout.get(), output_format.channels);
-    int result = swr_alloc_set_opts2(
-        new_context.address(),
-        output_layout.get(),
-        output_sample_format,
-        static_cast<int>(output_format.sample_rate),
-        input_layout.get(),
-        input_format,
-        input_rate,
-        0,
-        nullptr);
-    if (result < 0) {
-        throw std::runtime_error(
-            "Cannot configure FFmpeg API resampler: " + av_error_string(result));
-    }
+    const auto allocate_resampler_context = [&]() -> SwrContext* {
+        SwrContext* context = nullptr;
+        const int result = swr_alloc_set_opts2(
+            &context,
+            output_layout.get(),
+            output_sample_format,
+            static_cast<int>(output_format.sample_rate),
+            input_layout.get(),
+            input_format,
+            input_rate,
+            0,
+            nullptr);
+        if (result < 0) {
+            swr_free(&context);
+            throw std::runtime_error(
+                "Cannot configure FFmpeg API resampler: " + av_error_string(result));
+        }
+        return context;
+    };
 #else
     const std::int64_t output_layout =
         av_get_default_channel_layout(output_format.channels);
-    new_context.reset(swr_alloc_set_opts(
-        nullptr,
-        output_layout,
-        output_sample_format,
-        static_cast<int>(output_format.sample_rate),
-        static_cast<std::int64_t>(input_layout),
-        input_format,
-        input_rate,
-        0,
-        nullptr));
-    if (new_context.get() == nullptr) {
-        throw std::runtime_error("Cannot configure FFmpeg API resampler");
-    }
+    const auto allocate_resampler_context = [&]() -> SwrContext* {
+        SwrContext* context = swr_alloc_set_opts(
+            nullptr,
+            output_layout,
+            output_sample_format,
+            static_cast<int>(output_format.sample_rate),
+            static_cast<std::int64_t>(input_layout),
+            input_format,
+            input_rate,
+            0,
+            nullptr);
+        if (context == nullptr) {
+            throw std::runtime_error("Cannot configure FFmpeg API resampler");
+        }
+        return context;
+    };
 #endif
 
     const bool forced_rate_active =
@@ -2056,28 +2799,71 @@ void configure_resampler(DecoderImpl& impl,
     const bool quality_filter_active =
         forced_rate_active ||
         (dsd_source ? output_format.bits_per_sample <= 16 : forced_bits_active);
-    if (quality_filter_active) {
-        set_swr_option(new_context.get(), "resampler", "soxr");
-        const std::string precision =
-            std::to_string(soxr_precision(resample_quality));
-        set_swr_option(new_context.get(), "precision", precision.c_str());
-        set_swr_option_int(new_context.get(), "cheby", 0);
+
+    const auto apply_output_options = [&](SwrContext* context) {
         set_swr_option_int(
-            new_context.get(), "output_sample_bits", output_format.bits_per_sample);
+            context, "output_sample_bits", output_format.bits_per_sample);
         if (output_format.bits_per_sample <= 16) {
             set_swr_option(
-                new_context.get(), "dither_method", dither_method(bitdepth_quality));
+                context, "dither_method", dither_method(bitdepth_quality));
+        }
+    };
+
+    SwrContextGuard new_context;
+    new_context.reset(allocate_resampler_context());
+    bool initialized = false;
+    ResamplerRuntimeKind runtime_kind = ResamplerRuntimeKind::NotUsed;
+    int soxr_failure = 0;
+    if (quality_filter_active) {
+        const std::string precision =
+            std::to_string(soxr_precision(resample_quality));
+        int option_result = av_opt_set(new_context.get(), "resampler", "soxr", 0);
+        if (option_result >= 0) {
+            option_result = av_opt_set(
+                new_context.get(), "precision", precision.c_str(), 0);
+        }
+        if (option_result >= 0) {
+            option_result = av_opt_set_int(new_context.get(), "cheby", 0, 0);
+        }
+        if (option_result >= 0) {
+            apply_output_options(new_context.get());
+            const int init_result = swr_init(new_context.get());
+            if (init_result >= 0) {
+                initialized = true;
+                runtime_kind = ResamplerRuntimeKind::SoXr;
+            } else {
+                soxr_failure = init_result;
+            }
+        } else {
+            soxr_failure = option_result;
+        }
+
+        if (!initialized) {
+            std::string warning =
+                "FFmpeg SoXr resampler unavailable; falling back to the "
+                "built-in SWR engine";
+            if (soxr_failure < 0) {
+                warning += ": " + av_error_string(soxr_failure);
+            }
+            Logger::instance().warning(warning);
+            new_context.reset(allocate_resampler_context());
+            apply_output_options(new_context.get());
         }
     }
 
-    const int init_result = swr_init(new_context.get());
-    if (init_result < 0) {
-        throw std::runtime_error(
-            "Cannot initialize FFmpeg API resampler: " +
-            av_error_string(init_result));
+    if (!initialized) {
+        const int init_result = swr_init(new_context.get());
+        if (init_result < 0) {
+            throw std::runtime_error(
+                "Cannot initialize FFmpeg API resampler: " +
+                av_error_string(init_result));
+        }
+        if (quality_filter_active) {
+            runtime_kind = ResamplerRuntimeKind::FfmpegSwr;
+        }
     }
 
-#if LIBAVUTIL_VERSION_MAJOR >= 57
+#if PCMTP_FFMPEG_HAS_MODERN_CHANNEL_LAYOUT
     ChannelLayoutGuard retained_input_layout;
     const int copy_result =
         av_channel_layout_copy(retained_input_layout.get(), input_layout.get());
@@ -2094,13 +2880,14 @@ void configure_resampler(DecoderImpl& impl,
     impl.configured_input_rate = input_rate;
     impl.configured_input_format = input_format;
     impl.configured_channels = channels;
-#if LIBAVUTIL_VERSION_MAJOR >= 57
+#if PCMTP_FFMPEG_HAS_MODERN_CHANNEL_LAYOUT
     impl.configured_input_layout = retained_input_layout.release();
     impl.configured_input_layout_valid = true;
 #else
     impl.configured_input_layout = input_layout;
 #endif
     impl.swr_drained = false;
+    impl.resampler_runtime_kind.store(runtime_kind, std::memory_order_release);
 }
 
 std::optional<std::uint64_t> frame_timestamp_sample(
@@ -2268,7 +3055,8 @@ void ExternalAudioDecoder::open_decoder(std::uint64_t sample_index) {
         const AVCodec* decoder = avcodec_find_decoder(parameters->codec_id);
         if (decoder == nullptr) {
             close_decoder();
-            throw std::runtime_error("No FFmpeg decoder is available for " + codec_name_);
+            throw std::runtime_error("Decoder for " + codec_name_ +
+                                     " is unavailable in the installed FFmpeg build");
         }
         impl_->codec_context = avcodec_alloc_context3(decoder);
         if (impl_->codec_context == nullptr) {
@@ -2644,6 +3432,30 @@ PresentationEndKind ExternalAudioDecoder::presentation_end_kind() const noexcept
     return presentation_end_kind_;
 }
 
+ResamplerRuntimeKind ExternalAudioDecoder::resampler_runtime_kind() const noexcept {
+    if (!opened_ || impl_ == nullptr) {
+        return ResamplerRuntimeKind::NotUsed;
+    }
+    const ResamplerRuntimeKind runtime_kind =
+        impl_->resampler_runtime_kind.load(std::memory_order_acquire);
+    if (runtime_kind != ResamplerRuntimeKind::NotUsed) {
+        return runtime_kind;
+    }
+
+    const bool forced_rate_active =
+        forced_output_sample_rate_ > 0 &&
+        forced_output_sample_rate_ != source_format_.sample_rate;
+    const bool forced_bits_active =
+        forced_output_bits_per_sample_ > 0 &&
+        forced_output_bits_per_sample_ != source_format_.bits_per_sample;
+    const bool quality_filter_active =
+        forced_rate_active ||
+        (dsd_source_ ? format_.bits_per_sample <= 16 : forced_bits_active);
+    return quality_filter_active
+        ? ResamplerRuntimeKind::Initializing
+        : ResamplerRuntimeKind::NotUsed;
+}
+
 void ExternalAudioDecoder::request_abort() {
     if (impl_ != nullptr) {
         impl_->abort_requested.store(true, std::memory_order_release);
@@ -2732,5 +3544,8 @@ bool ExternalAudioDecoder::seek_to_sample(std::uint64_t sample_index) {
                              std::to_string(sample_index) + " for: " + path_);
     return true;
 }
+
+#undef PCMTP_FFMPEG_HAS_MOV_AAC_INDEX_API
+#undef PCMTP_FFMPEG_HAS_MODERN_CHANNEL_LAYOUT
 
 } // namespace pcmtp

@@ -1,4 +1,4 @@
-# PCM Transport v0.9.113
+# PCM Transport v0.9.114
 
 **PCM Transport** is a Linux desktop audio player focused on direct PCM playback, predictable DSP, and clear signal-path reporting.
 
@@ -34,7 +34,7 @@ Portions copyright © 2026 PCM Transport contributors.
 - GTK 3 desktop interface
 - Direct ALSA output
 - Native FLAC decoding through libFLAC
-- Direct FFmpeg library decoding and metadata probing for MP3, M4A, AAC, OGG, WAV, AIFF, APE, WV and other formats
+- Direct FFmpeg library decoding for MP3, M4A, AAC, OGG, WAV, AIFF, APE, WV and other formats
 - CUE support, including continuous CUE image playback
 - Local M3U / M3U8 playlist import
 - UTF-8 and Windows-1251 normalization for legacy metadata
@@ -194,10 +194,17 @@ exit
 
 - ALSA
 - GTK 3
-- libFLAC
-- FFmpeg shared libraries: libavformat, libavcodec, libavutil and libswresample
+- libFLAC 1.3.3 or newer
+- FFmpeg 4.4 or newer shared libraries: libavformat, libavcodec, libavutil and libswresample
 - rtkit-daemon (optional, for RTKit realtime audio-thread priority)
 - pkexec and setcap (optional, for granting persistent cap_sys_nice realtime permission)
+
+PCM Transport targets source compatibility from FFmpeg 4.4 and libFLAC
+1.3.3 through current mainstream releases using public library APIs. Newer
+library versions may enable stronger optional capabilities; on the supported
+baseline, unavailable optional capabilities degrade conservatively without
+disabling normal playback. Cross-major FFmpeg ABI compatibility is not
+assumed; build against the libraries supplied by the target distribution.
 
 FLAC decoding remains native through libFLAC when no Processing Rules
 are active. PCM Transport is also linked against the FFmpeg shared

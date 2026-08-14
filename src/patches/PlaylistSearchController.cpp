@@ -36,8 +36,6 @@ void PlaylistSearchController::install_in_panel(GtkBox* playlist_panel) {
         return;
     }
 
-    gtk_box_set_spacing(playlist_panel, 10);
-
     search_entry_ = gtk_search_entry_new();
     g_object_add_weak_pointer(G_OBJECT(search_entry_),
                               reinterpret_cast<gpointer*>(&search_entry_));

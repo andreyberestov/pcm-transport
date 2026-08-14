@@ -26,6 +26,8 @@ struct ExternalAudioInfo {
     std::uint64_t total_samples_per_channel = 0;
     std::uint64_t source_total_samples_per_channel = 0;
     bool source_supports_trusted_decoder_eof = false;
+    ExactPresentationDrainPolicy source_exact_presentation_drain_policy =
+        ExactPresentationDrainPolicy::DecoderEofMatchesPresentation;
     bool source_presentation_start_known = false;
     std::uint64_t source_presentation_start_sample = 0;
     GenericTags tags{};
@@ -38,6 +40,8 @@ struct ExternalAudioInfo {
     bool raw_aac = false;
     SampleExtentKind sample_extent_kind = SampleExtentKind::Unknown;
     SampleExtentSource sample_extent_source = SampleExtentSource::None;
+    ExactPresentationDrainPolicy sample_extent_drain_policy =
+        ExactPresentationDrainPolicy::DecoderEofMatchesPresentation;
     SampleExtentKind source_sample_extent_kind = SampleExtentKind::Unknown;
     SampleExtentSource source_sample_extent_source = SampleExtentSource::None;
     PresentationEndKind presentation_end_kind = PresentationEndKind::Unknown;
@@ -64,6 +68,7 @@ public:
     std::uint64_t total_samples_per_channel() const override;
     std::string source_path() const override;
     PresentationEndKind presentation_end_kind() const noexcept override;
+    ResamplerRuntimeKind resampler_runtime_kind() const noexcept override;
     bool seek_to_sample(std::uint64_t sample_index) override;
     void request_abort() override;
 

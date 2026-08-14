@@ -32,6 +32,7 @@ void fill_result_from_external_info(const ExternalAudioInfo& info, MediaProbeRes
     result->total_samples_per_channel = info.total_samples_per_channel;
     result->source_supports_trusted_decoder_eof =
         info.source_supports_trusted_decoder_eof;
+    result->sample_extent_drain_policy = info.sample_extent_drain_policy;
     result->source_presentation_start_known =
         info.source_presentation_start_known;
     result->source_presentation_start_sample =

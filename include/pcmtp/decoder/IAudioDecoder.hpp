@@ -18,6 +18,13 @@ enum class TransportTruncationKind {
     DecoderSegmentBoundary
 };
 
+enum class ResamplerRuntimeKind {
+    NotUsed,
+    Initializing,
+    SoXr,
+    FfmpegSwr
+};
+
 struct DecoderSegmentPosition {
     bool valid = false;
     std::size_t index = 0;
@@ -48,6 +55,9 @@ public:
     }
     virtual TransportTruncationKind transport_truncation_kind() const noexcept {
         return TransportTruncationKind::None;
+    }
+    virtual ResamplerRuntimeKind resampler_runtime_kind() const noexcept {
+        return ResamplerRuntimeKind::NotUsed;
     }
     virtual bool seek_to_sample(std::uint64_t sample_index) { (void)sample_index; return false; }
     virtual void request_abort() {}

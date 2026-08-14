@@ -85,6 +85,19 @@ void FlacStreamDecoder::open(const std::string& path) {
     Logger::instance().info("Opened FLAC stream: " + path);
 }
 
+void FlacStreamDecoder::open_at_sample(const std::string& path,
+                                       std::uint64_t sample_index) {
+    open(path);
+    if (sample_index == 0) {
+        return;
+    }
+    if (!seek_to_sample(sample_index)) {
+        reset_decoder();
+        throw std::runtime_error(
+            "Cannot seek FLAC decoder to requested sample");
+    }
+}
+
 const AudioFormat& FlacStreamDecoder::format() const {
     return format_;
 }
@@ -163,7 +176,22 @@ bool FlacStreamDecoder::seek_to_sample(std::uint64_t sample_index) {
         queued_samples_ = 0;
         reached_eof_ = false;
     }
-    return FLAC__stream_decoder_seek_absolute(decoder_, sample_index) != 0;
+
+    if (FLAC__stream_decoder_seek_absolute(decoder_, sample_index) != 0) {
+        return true;
+    }
+
+    const FLAC__StreamDecoderState state =
+        FLAC__stream_decoder_get_state(decoder_);
+    if (state == FLAC__STREAM_DECODER_SEEK_ERROR) {
+        // libFLAC requires flush/reset after a seek error before the decoder
+        // may be used again. Prefer the narrower flush; reset is a final
+        // recovery attempt for a decoder that cannot be flushed.
+        if (FLAC__stream_decoder_flush(decoder_) == 0) {
+            (void)FLAC__stream_decoder_reset(decoder_);
+        }
+    }
+    return false;
 }
 
 FlacFileProbe FlacStreamDecoder::probe_file(const std::string& path) {
@@ -298,11 +326,15 @@ void FlacStreamDecoder::fill_queue_if_needed() {
     if (Logger::instance().debug_enabled()) {
         Logger::instance().debug("FLAC queue low, decoding next frame");
     }
-    if (decoder_ == nullptr || FLAC__stream_decoder_process_single(decoder_) == 0) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        reached_eof_ = true;
-        Logger::instance().debug("FLAC process_single returned false, marking EOF");
-        return;
+    if (decoder_ == nullptr) {
+        throw std::runtime_error("FLAC decoder is not initialized");
+    }
+    if (FLAC__stream_decoder_process_single(decoder_) == 0) {
+        const FLAC__StreamDecoderState state =
+            FLAC__stream_decoder_get_state(decoder_);
+        throw std::runtime_error(
+            std::string("FLAC decode failed: ") +
+            FLAC__StreamDecoderStateString[state]);
     }
 
     const auto state = FLAC__stream_decoder_get_state(decoder_);

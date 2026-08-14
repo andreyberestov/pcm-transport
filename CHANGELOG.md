@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.9.114
+
+- Reworked playback around an event-driven model. Removed periodic transport polling and reduced unnecessary GUI wakeups.
+- Defined the library compatibility baseline: FFmpeg 4.4 or newer and libFLAC 1.3.3 or newer. Added public-API compatibility paths across supported FFmpeg versions.
+- Added verified separate-file gapless support for AIFF/AIF PCM, AU/SND PCM, CAF LPCM and TTA.
+- Added strict AAC-LC/MOV boundary verification. Ambiguous or inconsistent files remain on the normal non-gapless playback path.
+- Added optional character-based width limits for Artist, Title, Album and Source. Full metadata remains available for search, sorting and MPRIS. Default limit: 25 characters.
+- Added exact decoded-span handling for DSF and raw DFF DSD while keeping separate-file DSD gapless disabled.
+- Improved FLAC error handling and exact-range seeking.
+- Added automatic SoXr → FFmpeg SWR fallback and runtime resampler reporting.
+- Improved CUE and gapless transition handling under the new event model.
+- Improved Search window resizing and preference saving; removed redundant timers.
+- Added runtime library and realtime-service information to About.
+- Removed the obsolete experimental --file console playback path and cleaned up unused code.
+
 ## 0.9.113
 
 - Replace FFmpeg and FFprobe command-line processes with direct FFmpeg API integration for playback, seeking and metadata probing; building now requires the FFmpeg development libraries listed in README.

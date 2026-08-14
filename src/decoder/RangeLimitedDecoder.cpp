@@ -67,6 +67,9 @@ PresentationEndKind RangeLimitedDecoder::presentation_end_kind() const noexcept 
 TransportTruncationKind RangeLimitedDecoder::transport_truncation_kind() const noexcept {
     return TransportTruncationKind::ExactSampleBoundary;
 }
+ResamplerRuntimeKind RangeLimitedDecoder::resampler_runtime_kind() const noexcept {
+    return inner_->resampler_runtime_kind();
+}
 void RangeLimitedDecoder::request_abort() { inner_->request_abort(); }
 
 bool RangeLimitedDecoder::seek_to_sample(std::uint64_t sample_index) {

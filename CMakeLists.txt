@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(pcm_transport VERSION 0.9.113 LANGUAGES C CXX)
+project(pcm_transport VERSION 0.9.114 LANGUAGES C CXX)
 
 include(GNUInstallDirs)
 
@@ -9,12 +9,12 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(ALSA REQUIRED alsa)
-pkg_check_modules(FLAC REQUIRED flac)
+pkg_check_modules(FLAC REQUIRED flac>=1.3.3)
 pkg_check_modules(GTK3 REQUIRED gtk+-3.0)
-pkg_check_modules(AVFORMAT REQUIRED IMPORTED_TARGET libavformat)
-pkg_check_modules(AVCODEC REQUIRED IMPORTED_TARGET libavcodec)
-pkg_check_modules(AVUTIL REQUIRED IMPORTED_TARGET libavutil)
-pkg_check_modules(SWRESAMPLE REQUIRED IMPORTED_TARGET libswresample)
+pkg_check_modules(AVFORMAT REQUIRED IMPORTED_TARGET libavformat>=58.76.100)
+pkg_check_modules(AVCODEC REQUIRED IMPORTED_TARGET libavcodec>=58.134.100)
+pkg_check_modules(AVUTIL REQUIRED IMPORTED_TARGET libavutil>=56.70.100)
+pkg_check_modules(SWRESAMPLE REQUIRED IMPORTED_TARGET libswresample>=3.9.100)
 
 find_program(GLIB_COMPILE_RESOURCES_EXECUTABLE
     NAMES glib-compile-resources
@@ -77,6 +77,7 @@ add_executable(pcm_transport
     src/playlist/Mp3FastProbe.cpp
     src/playlist/SourceScanner.cpp
     src/decoder/FlacStreamDecoder.cpp
+    src/decoder/ContainerBoundaryVerifier.cpp
     src/decoder/ExternalAudioDecoder.cpp
     src/decoder/SampleBoundary.cpp
     src/decoder/RangeLimitedDecoder.cpp

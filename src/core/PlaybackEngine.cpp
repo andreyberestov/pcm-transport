@@ -4,7 +4,6 @@
 #include "pcmtp/core/PlaybackEngine.hpp"
 
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cerrno>
@@ -16,6 +15,7 @@
 #include <vector>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/eventfd.h>
 #include <sched.h>
 #include <unistd.h>
 #include <gio/gio.h>
@@ -60,6 +60,10 @@ constexpr int kPreEqHeadroomMaxTenthsDb = 150;
 constexpr std::uint32_t kNoMeterMeasurement = ~std::uint32_t{0};
 constexpr std::uint32_t kMaxMeterPeakUnits = kNoMeterMeasurement - 1;
 constexpr float kMeterPeakScale = 16777216.0f;
+constexpr std::uint32_t kPlaybackEventSegmentChanged = 1U << 0;
+constexpr std::uint32_t kPlaybackEventProcessingStateChanged = 1U << 1;
+constexpr std::uint32_t kPlaybackEventFinished = 1U << 2;
+constexpr std::uint32_t kPlaybackEventError = 1U << 3;
 
 std::uint32_t meter_peak_to_units(float peak) {
     if (!(peak > 0.0f)) {
@@ -97,17 +101,46 @@ void publish_meter_peak(std::atomic<std::uint32_t>& slot, float peak) {
 
 } // namespace
 
-PlaybackEngine::PlaybackEngine() = default;
+PlaybackEngine::PlaybackEngine() {
+    playback_event_fd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (playback_event_fd_ < 0) {
+        throw std::runtime_error(
+            std::string("Cannot create playback event mailbox: ") +
+            std::strerror(errno));
+    }
+}
 
-PlaybackEngine::~PlaybackEngine() { stop(); }
+PlaybackEngine::~PlaybackEngine() {
+    stop();
+    if (playback_event_fd_ >= 0) {
+        close(playback_event_fd_);
+        playback_event_fd_ = -1;
+    }
+}
 
 void PlaybackEngine::start(std::unique_ptr<IAudioDecoder> decoder,
                            std::unique_ptr<IAudioBackend> backend,
                            const std::string& device_name,
-                           std::uint64_t initial_samples_per_channel) {
+                           std::uint64_t initial_samples_per_channel,
+                           std::vector<std::uint64_t> logical_segment_offsets) {
     stop();
+    const std::uint64_t transport_generation =
+        transport_generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
     if (!decoder || !backend) {
         throw std::invalid_argument("PlaybackEngine::start received null decoder/backend");
+    }
+    if (!logical_segment_offsets.empty()) {
+        if (logical_segment_offsets.size() < 2 ||
+            logical_segment_offsets.front() != 0) {
+            throw std::invalid_argument(
+                "PlaybackEngine::start received an invalid logical segment timeline");
+        }
+        for (std::size_t i = 1; i < logical_segment_offsets.size(); ++i) {
+            if (logical_segment_offsets[i] < logical_segment_offsets[i - 1]) {
+                throw std::invalid_argument(
+                    "PlaybackEngine::start received a non-monotonic logical segment timeline");
+            }
+        }
     }
 
     const AudioFormat opened_format = decoder->format();
@@ -118,6 +151,8 @@ void PlaybackEngine::start(std::unique_ptr<IAudioDecoder> decoder,
     const DecoderSegmentPosition segment = decoder->segment_position();
     const TransportTruncationKind transport_truncation_kind =
         decoder->transport_truncation_kind();
+    const ResamplerRuntimeKind initial_resampler_runtime_kind =
+        decoder->resampler_runtime_kind();
 
     PlaybackStatusSnapshot initial_snapshot;
     initial_snapshot.playing = true;
@@ -146,7 +181,10 @@ void PlaybackEngine::start(std::unique_ptr<IAudioDecoder> decoder,
         clipped_samples_pending_.store(0, std::memory_order_relaxed);
         meter_transport_active_.store(true, std::memory_order_release);
         initial_samples_per_channel_ = initial_samples_per_channel;
+        logical_segment_offsets_ = std::move(logical_segment_offsets);
         format_ = opened_format;
+        resampler_runtime_kind_.store(
+            initial_resampler_runtime_kind, std::memory_order_release);
         {
             std::lock_guard<std::mutex> runtime_lock(runtime_mutex_);
             last_active_output_report_ = std::move(runtime_output_report);
@@ -155,8 +193,10 @@ void PlaybackEngine::start(std::unique_ptr<IAudioDecoder> decoder,
             std::lock_guard<std::mutex> lock(state_mutex_);
             snapshot_ = std::move(initial_snapshot);
             last_error_.clear();
+            publish_live_transport_position(initial_samples_per_channel, segment);
         }
-        playback_thread_ = std::thread(&PlaybackEngine::playback_loop, this);
+        playback_thread_ = std::thread(
+            &PlaybackEngine::playback_loop, this, transport_generation);
     } catch (...) {
         stop_requested_ = true;
         pause_requested_ = false;
@@ -168,9 +208,12 @@ void PlaybackEngine::start(std::unique_ptr<IAudioDecoder> decoder,
         }
         decoder_.reset();
         backend_.reset();
+        resampler_runtime_kind_.store(
+            ResamplerRuntimeKind::NotUsed, std::memory_order_release);
         device_name_.clear();
         format_ = AudioFormat{};
         initial_samples_per_channel_ = 0;
+        logical_segment_offsets_.clear();
         {
             std::lock_guard<std::mutex> runtime_lock(runtime_mutex_);
             last_active_output_report_.clear();
@@ -180,6 +223,7 @@ void PlaybackEngine::start(std::unique_ptr<IAudioDecoder> decoder,
             snapshot_ = PlaybackStatusSnapshot{};
             snapshot_.message = "Stopped";
             last_error_.clear();
+            publish_live_transport_position(0, DecoderSegmentPosition{});
         }
         throw;
     }
@@ -188,6 +232,7 @@ void PlaybackEngine::start(std::unique_ptr<IAudioDecoder> decoder,
 }
 
 void PlaybackEngine::stop() {
+    transport_generation_.fetch_add(1, std::memory_order_acq_rel);
     meter_transport_active_.store(false, std::memory_order_release);
     stop_requested_ = true;
     pause_requested_ = false;
@@ -197,6 +242,7 @@ void PlaybackEngine::stop() {
     pause_cv_.notify_all();
     join_threads();
     playback_thread_tid_.store(0, std::memory_order_relaxed);
+    clear_pending_playback_events();
     {
         std::lock_guard<std::mutex> lock(runtime_mutex_);
         realtime_priority_status_ = realtime_priority_enabled_.load(std::memory_order_relaxed)
@@ -208,6 +254,9 @@ void PlaybackEngine::stop() {
     }
     decoder_.reset();
     backend_.reset();
+    resampler_runtime_kind_.store(
+        ResamplerRuntimeKind::NotUsed, std::memory_order_release);
+    logical_segment_offsets_.clear();
     level_meter_peak_units_.store(kNoMeterMeasurement, std::memory_order_relaxed);
     clipped_samples_pending_.store(0, std::memory_order_relaxed);
     {
@@ -221,27 +270,34 @@ void PlaybackEngine::stop() {
         snapshot_.active_output_report.clear();
         if (!snapshot_.finished) {
             snapshot_.current_samples_per_channel = 0;
+            snapshot_.segment_position_valid = false;
+            snapshot_.segment_index = 0;
+            snapshot_.segment_samples_per_channel = 0;
+            publish_live_transport_position(0, DecoderSegmentPosition{});
             snapshot_.message = last_error_.empty() ? "Stopped" : last_error_;
         }
     }
 }
 
 void PlaybackEngine::pause() {
-    if (!is_playing()) return;
-    meter_transport_active_.store(false, std::memory_order_release);
-    pause_requested_ = true;
-    {
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        snapshot_.paused = true;
-        snapshot_.message = "Paused";
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    if (!snapshot_.playing) {
+        return;
     }
+    pause_requested_.store(true, std::memory_order_release);
+    meter_transport_active_.store(false, std::memory_order_release);
+    snapshot_.paused = true;
+    snapshot_.message = "Paused";
 }
 
 void PlaybackEngine::resume() {
-    pause_requested_ = false;
-    meter_transport_active_.store(is_playing(), std::memory_order_release);
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
+        if (!snapshot_.playing) {
+            return;
+        }
+        pause_requested_.store(false, std::memory_order_release);
+        meter_transport_active_.store(true, std::memory_order_release);
         snapshot_.paused = false;
         snapshot_.message = "Playing";
     }
@@ -289,19 +345,32 @@ void PlaybackEngine::set_clip_detection_enabled(bool enabled) {
 }
 int PlaybackEngine::bass_db() const { return bass_db_.load(std::memory_order_relaxed); }
 int PlaybackEngine::treble_db() const { return treble_db_.load(std::memory_order_relaxed); }
-PlaybackStatusSnapshot PlaybackEngine::snapshot() const { std::lock_guard<std::mutex> lock(state_mutex_); return snapshot_; }
+ResamplerRuntimeKind PlaybackEngine::resampler_runtime_kind() const noexcept {
+    return resampler_runtime_kind_.load(std::memory_order_acquire);
+}
+PlaybackStatusSnapshot PlaybackEngine::snapshot() const {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    PlaybackStatusSnapshot status = snapshot_;
+    const LiveTransportPosition live = read_live_transport_position();
+    status.current_samples_per_channel = live.current_samples_per_channel;
+    status.segment_position_valid = live.segment_position_valid;
+    status.segment_index = live.segment_index;
+    status.segment_samples_per_channel = live.segment_samples_per_channel;
+    return status;
+}
 PlaybackTransportSnapshot PlaybackEngine::transport_snapshot() const {
     std::lock_guard<std::mutex> lock(state_mutex_);
+    const LiveTransportPosition live = read_live_transport_position();
     PlaybackTransportSnapshot transport;
     transport.playing = snapshot_.playing;
     transport.paused = snapshot_.paused;
     transport.finished = snapshot_.finished;
     transport.format = snapshot_.format;
-    transport.current_samples_per_channel = snapshot_.current_samples_per_channel;
+    transport.current_samples_per_channel = live.current_samples_per_channel;
     transport.total_samples_per_channel = snapshot_.total_samples_per_channel;
-    transport.segment_position_valid = snapshot_.segment_position_valid;
-    transport.segment_index = snapshot_.segment_index;
-    transport.segment_samples_per_channel = snapshot_.segment_samples_per_channel;
+    transport.segment_position_valid = live.segment_position_valid;
+    transport.segment_index = live.segment_index;
+    transport.segment_samples_per_channel = live.segment_samples_per_channel;
     transport.transport_truncation_kind = snapshot_.transport_truncation_kind;
     return transport;
 }
@@ -317,7 +386,186 @@ PlaybackMeterSnapshot PlaybackEngine::consume_meter_snapshot() {
     meter.transport_active = meter_transport_active_.load(std::memory_order_acquire);
     return meter;
 }
-std::string PlaybackEngine::last_error() const { std::lock_guard<std::mutex> lock(state_mutex_); return last_error_; }
+void PlaybackEngine::publish_live_transport_position(
+    std::uint64_t current_samples_per_channel,
+    const DecoderSegmentPosition& segment) noexcept {
+    // One writer is active at a time: start() publishes before the playback
+    // thread starts, the playback thread publishes while active, and stop()
+    // publishes only after join().  The odd sequence marks an update in
+    // progress; release/acquire field operations make a reader that observes
+    // any new field also observe the changed sequence before accepting it.
+    const std::uint64_t previous_sequence = live_position_sequence_.fetch_add(
+        1, std::memory_order_relaxed);
+
+    live_current_samples_per_channel_.store(
+        current_samples_per_channel, std::memory_order_release);
+    live_segment_position_valid_.store(segment.valid, std::memory_order_release);
+    live_segment_index_.store(segment.index, std::memory_order_release);
+    live_segment_samples_per_channel_.store(
+        segment.samples_per_channel, std::memory_order_release);
+
+    live_position_sequence_.store(previous_sequence + 2,
+                                  std::memory_order_release);
+}
+
+PlaybackEngine::LiveTransportPosition
+PlaybackEngine::read_live_transport_position() const noexcept {
+    while (true) {
+        const std::uint64_t before = live_position_sequence_.load(
+            std::memory_order_acquire);
+        if ((before & 1U) != 0) {
+            continue;
+        }
+
+        LiveTransportPosition live;
+        live.current_samples_per_channel =
+            live_current_samples_per_channel_.load(std::memory_order_acquire);
+        live.segment_position_valid =
+            live_segment_position_valid_.load(std::memory_order_acquire);
+        live.segment_index =
+            live_segment_index_.load(std::memory_order_acquire);
+        live.segment_samples_per_channel =
+            live_segment_samples_per_channel_.load(std::memory_order_acquire);
+
+        const std::uint64_t after = live_position_sequence_.load(
+            std::memory_order_acquire);
+        if (before == after && (after & 1U) == 0) {
+            return live;
+        }
+    }
+}
+
+int PlaybackEngine::playback_event_fd() const noexcept {
+    return playback_event_fd_;
+}
+
+std::size_t PlaybackEngine::drain_playback_events(
+    std::array<PlaybackEvent, 4>& events) noexcept {
+    if (playback_event_fd_ < 0) {
+        return 0;
+    }
+
+    std::uint64_t wake_count = 0;
+    while (true) {
+        const ssize_t result = read(playback_event_fd_,
+                                    &wake_count,
+                                    sizeof(wake_count));
+        if (result == static_cast<ssize_t>(sizeof(wake_count))) {
+            continue;
+        }
+        if (result < 0 && errno == EINTR) {
+            continue;
+        }
+        break;
+    }
+
+    const std::uint32_t pending = pending_playback_event_bits_.exchange(
+        0, std::memory_order_acq_rel);
+    std::size_t count = 0;
+    const auto append = [&](PlaybackEventKind kind,
+                            std::uint64_t generation) {
+        events[count++] = PlaybackEvent{kind, generation};
+    };
+    if ((pending & kPlaybackEventSegmentChanged) != 0) {
+        append(PlaybackEventKind::SegmentChanged,
+               pending_segment_generation_.load(std::memory_order_acquire));
+    }
+    if ((pending & kPlaybackEventProcessingStateChanged) != 0) {
+        append(PlaybackEventKind::ProcessingStateChanged,
+               pending_processing_state_generation_.load(std::memory_order_acquire));
+    }
+    if ((pending & kPlaybackEventFinished) != 0) {
+        append(PlaybackEventKind::Finished,
+               pending_finished_generation_.load(std::memory_order_acquire));
+    }
+    if ((pending & kPlaybackEventError) != 0) {
+        append(PlaybackEventKind::Error,
+               pending_error_generation_.load(std::memory_order_acquire));
+    }
+    return count;
+}
+
+bool PlaybackEngine::consume_finished_transport() {
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        if (snapshot_.playing || !snapshot_.finished) {
+            return false;
+        }
+    }
+
+    stop();
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        snapshot_.finished = false;
+        snapshot_.current_samples_per_channel = 0;
+        snapshot_.segment_position_valid = false;
+        snapshot_.segment_index = 0;
+        snapshot_.segment_samples_per_channel = 0;
+        publish_live_transport_position(0, DecoderSegmentPosition{});
+        snapshot_.message = last_error_.empty() ? "Stopped" : last_error_;
+    }
+    return true;
+}
+
+std::uint64_t PlaybackEngine::transport_generation() const noexcept {
+    return transport_generation_.load(std::memory_order_acquire);
+}
+
+void PlaybackEngine::emit_playback_event(
+    PlaybackEventKind kind,
+    std::uint64_t transport_generation) noexcept {
+    std::uint32_t bit = 0;
+    switch (kind) {
+        case PlaybackEventKind::SegmentChanged:
+            pending_segment_generation_.store(transport_generation,
+                                              std::memory_order_release);
+            bit = kPlaybackEventSegmentChanged;
+            break;
+        case PlaybackEventKind::ProcessingStateChanged:
+            pending_processing_state_generation_.store(
+                transport_generation, std::memory_order_release);
+            bit = kPlaybackEventProcessingStateChanged;
+            break;
+        case PlaybackEventKind::Finished:
+            pending_finished_generation_.store(transport_generation,
+                                               std::memory_order_release);
+            bit = kPlaybackEventFinished;
+            break;
+        case PlaybackEventKind::Error:
+            pending_error_generation_.store(transport_generation,
+                                            std::memory_order_release);
+            bit = kPlaybackEventError;
+            break;
+    }
+    pending_playback_event_bits_.fetch_or(bit, std::memory_order_release);
+
+    if (playback_event_fd_ < 0) {
+        return;
+    }
+    const std::uint64_t wake = 1;
+    while (write(playback_event_fd_, &wake, sizeof(wake)) < 0 && errno == EINTR) {
+    }
+}
+
+void PlaybackEngine::clear_pending_playback_events() noexcept {
+    pending_playback_event_bits_.store(0, std::memory_order_release);
+    if (playback_event_fd_ < 0) {
+        return;
+    }
+    std::uint64_t wake_count = 0;
+    while (true) {
+        const ssize_t result = read(playback_event_fd_,
+                                    &wake_count,
+                                    sizeof(wake_count));
+        if (result == static_cast<ssize_t>(sizeof(wake_count))) {
+            continue;
+        }
+        if (result < 0 && errno == EINTR) {
+            continue;
+        }
+        break;
+    }
+}
 
 void PlaybackEngine::set_realtime_priority_enabled(bool enabled) {
     realtime_priority_enabled_.store(enabled, std::memory_order_relaxed);
@@ -681,7 +929,7 @@ std::string PlaybackEngine::active_output_report() const {
     return last_active_output_report_;
 }
 
-void PlaybackEngine::playback_loop() {
+void PlaybackEngine::playback_loop(std::uint64_t transport_generation) {
     playback_thread_tid_.store(static_cast<long>(syscall(SYS_gettid)), std::memory_order_relaxed);
     if (realtime_priority_enabled_.load(std::memory_order_relaxed)) {
         try_set_realtime_priority_for_current_thread();
@@ -696,7 +944,17 @@ void PlaybackEngine::playback_loop() {
             ch, (static_cast<std::size_t>(4096) / ch) * ch);
         std::vector<PcmSample> block(block_samples);
         std::uint64_t played_samples_per_channel = initial_samples_per_channel_;
-        auto last_update = std::chrono::steady_clock::now();
+        std::size_t next_logical_boundary = logical_segment_offsets_.size();
+        if (logical_segment_offsets_.size() >= 2) {
+            next_logical_boundary = static_cast<std::size_t>(
+                std::upper_bound(logical_segment_offsets_.begin(),
+                                 logical_segment_offsets_.end(),
+                                 played_samples_per_channel) -
+                logical_segment_offsets_.begin());
+        }
+        DecoderSegmentPosition last_published_segment = decoder_->segment_position();
+        ResamplerRuntimeKind last_published_resampler_runtime_kind =
+            resampler_runtime_kind_.load(std::memory_order_acquire);
         int active_bass_db = stereo_tonal_dsp_allowed
             ? bass_db_.load(std::memory_order_relaxed)
             : 0;
@@ -717,6 +975,8 @@ void PlaybackEngine::playback_loop() {
             wait_if_paused();
             if (stop_requested_) break;
             const std::size_t got = decoder_->read_samples(block.data(), block.size());
+            const ResamplerRuntimeKind current_resampler_runtime_kind =
+                decoder_->resampler_runtime_kind();
             if (got > block.size()) {
                 throw std::runtime_error("Decoder returned more PCM samples than requested");
             }
@@ -831,23 +1091,48 @@ void PlaybackEngine::playback_loop() {
                 }
             }
             played_samples_per_channel += got / ch;
-            const auto now = std::chrono::steady_clock::now();
-            if (now - last_update >= std::chrono::milliseconds(16)) {
-                const DecoderSegmentPosition segment = decoder_->segment_position();
-                {
-                    std::lock_guard<std::mutex> lock(state_mutex_);
-                    snapshot_.current_samples_per_channel = played_samples_per_channel;
-                    snapshot_.segment_position_valid = segment.valid;
-                    snapshot_.segment_index = segment.index;
-                    snapshot_.segment_samples_per_channel = segment.samples_per_channel;
-                    snapshot_.message = pause_requested_ ? "Paused" : "Playing";
+            const DecoderSegmentPosition segment = decoder_->segment_position();
+            publish_live_transport_position(played_samples_per_channel, segment);
+            const bool processing_state_changed =
+                current_resampler_runtime_kind !=
+                last_published_resampler_runtime_kind;
+            if (processing_state_changed) {
+                resampler_runtime_kind_.store(
+                    current_resampler_runtime_kind, std::memory_order_release);
+                last_published_resampler_runtime_kind =
+                    current_resampler_runtime_kind;
+            }
+            const bool decoder_segment_changed = segment.valid &&
+                (!last_published_segment.valid ||
+                 segment.index != last_published_segment.index);
+            bool logical_segment_changed = false;
+            while (next_logical_boundary + 1 < logical_segment_offsets_.size() &&
+                   played_samples_per_channel >=
+                       logical_segment_offsets_[next_logical_boundary]) {
+                logical_segment_changed = true;
+                ++next_logical_boundary;
+            }
+            const bool segment_changed =
+                decoder_segment_changed || logical_segment_changed;
+            if (segment_changed) {
+                if (segment.valid) {
+                    last_published_segment = segment;
                 }
-                last_update = now;
+                emit_playback_event(PlaybackEventKind::SegmentChanged,
+                                    transport_generation);
+            } else if (segment.valid) {
+                last_published_segment = segment;
+            }
+            if (processing_state_changed) {
+                emit_playback_event(PlaybackEventKind::ProcessingStateChanged,
+                                    transport_generation);
             }
         }
         if (backend_ && !stop_requested_) backend_->drain();
+        bool naturally_finished = false;
         {
             const DecoderSegmentPosition segment = decoder_->segment_position();
+            publish_live_transport_position(played_samples_per_channel, segment);
             std::lock_guard<std::mutex> lock(state_mutex_);
             snapshot_.current_samples_per_channel = played_samples_per_channel;
             snapshot_.segment_position_valid = segment.valid;
@@ -857,14 +1142,23 @@ void PlaybackEngine::playback_loop() {
             snapshot_.playing = false;
             snapshot_.paused = false;
             snapshot_.message = last_error_.empty() ? "Stopped" : last_error_;
+            naturally_finished = snapshot_.finished;
         }
         meter_transport_active_.store(false, std::memory_order_release);
         level_meter_peak_units_.store(kNoMeterMeasurement, std::memory_order_relaxed);
+        if (naturally_finished) {
+            emit_playback_event(PlaybackEventKind::Finished,
+                                transport_generation);
+        }
     } catch (const std::exception& ex) {
         set_error(ex.what());
         { std::lock_guard<std::mutex> lock(state_mutex_); snapshot_.playing = false; snapshot_.paused = false; snapshot_.message = last_error_; }
+        emit_playback_event(PlaybackEventKind::Error,
+                            transport_generation);
     } catch (...) {
         set_error("Unknown playback error");
+        emit_playback_event(PlaybackEventKind::Error,
+                            transport_generation);
     }
 }
 

@@ -182,7 +182,9 @@ bool rule_matches(const DeclaredSampleCountRule& rule,
 }
 
 SampleExtent exact_presentation_extent(std::uint64_t samples,
-                                       SampleExtentSource source) {
+                                       SampleExtentSource source,
+                                       ExactPresentationDrainPolicy drain_policy =
+                                           ExactPresentationDrainPolicy::DecoderEofMatchesPresentation) {
     SampleExtent extent;
     if (samples == 0) {
         return extent;
@@ -190,6 +192,7 @@ SampleExtent exact_presentation_extent(std::uint64_t samples,
     extent.samples = samples;
     extent.kind = SampleExtentKind::ExactPresentationSpan;
     extent.source = source;
+    extent.exact_presentation_drain_policy = drain_policy;
     return extent;
 }
 
@@ -219,6 +222,20 @@ SampleExtent demuxer_declared_sample_count_evidence(
         ? exact_presentation_extent(exact_samples,
                                     SampleExtentSource::DemuxerDeclaredSampleCount)
         : SampleExtent{};
+}
+
+SampleExtent mov_aac_presentation_evidence(
+    const LibavStreamBoundaryFacts& facts,
+    std::uint64_t exact_samples) {
+    if (!facts.mov_aac_exact_presentation_evidence ||
+        !mov_family_demuxer(facts.demuxer_name) ||
+        facts.codec_name != "aac") {
+        return SampleExtent{};
+    }
+    return exact_presentation_extent(
+        exact_samples,
+        SampleExtentSource::MovAacPresentationBoundary,
+        facts.mov_aac_exact_presentation_drain_policy);
 }
 
 int extent_strength(SampleExtentKind kind) {
@@ -275,7 +292,6 @@ bool libav_stream_supports_trusted_decoder_eof(
         facts.time_base_num <= 0 ||
         facts.time_base_den <= 0 ||
         facts.sample_rate == 0 ||
-        facts.stream_count != 1 ||
         facts.audio_stream_count != 1) {
         return false;
     }
@@ -285,8 +301,13 @@ bool libav_stream_supports_trusted_decoder_eof(
     // policy layer; transport and gapless code consume only PresentationEndKind.
     switch (facts.decoder_eof_evidence_source) {
     case DecoderEofEvidenceSource::OggTerminalEos:
-        return demuxer_has_token(facts.demuxer_name, "ogg") &&
+        return facts.stream_count == 1 &&
+               demuxer_has_token(facts.demuxer_name, "ogg") &&
                (facts.codec_name == "vorbis" || facts.codec_name == "opus");
+    case DecoderEofEvidenceSource::MovAacTerminalDiscard:
+        return facts.mov_aac_exact_presentation_evidence &&
+               mov_family_demuxer(facts.demuxer_name) &&
+               facts.codec_name == "aac";
     case DecoderEofEvidenceSource::None:
         return false;
     }
@@ -301,10 +322,14 @@ PresentationEndKind presentation_end_kind_for_output(
     if (output_extent.kind == SampleExtentKind::ExactPresentationSpan) {
         return PresentationEndKind::ExactSampleSpan;
     }
-    if ((source_extent.kind == SampleExtentKind::ExactPresentationSpan &&
-         output_extent.kind == SampleExtentKind::EstimatedTimeline &&
-         output_extent.source == SampleExtentSource::RateConvertedTimeline) ||
-        source_supports_trusted_decoder_eof) {
+    if (source_supports_trusted_decoder_eof) {
+        return PresentationEndKind::TrustedDecoderEof;
+    }
+    if (source_extent.kind == SampleExtentKind::ExactPresentationSpan &&
+        source_extent.exact_presentation_drain_policy ==
+            ExactPresentationDrainPolicy::DecoderEofMatchesPresentation &&
+        output_extent.kind == SampleExtentKind::EstimatedTimeline &&
+        output_extent.source == SampleExtentSource::RateConvertedTimeline) {
         return PresentationEndKind::TrustedDecoderEof;
     }
     return PresentationEndKind::Unknown;
@@ -340,6 +365,8 @@ SampleExtent classify_libav_stream_extent(const LibavStreamBoundaryFacts& facts)
 
     selected = select_stronger_sample_extent(
         selected, demuxer_declared_sample_count_evidence(facts, exact_samples));
+    selected = select_stronger_sample_extent(
+        selected, mov_aac_presentation_evidence(facts, exact_samples));
     return selected;
 }
 
@@ -369,6 +396,8 @@ SampleExtent transform_sample_extent_for_output(
     }
 
     SampleExtent transformed;
+    transformed.exact_presentation_drain_policy =
+        source_extent.exact_presentation_drain_policy;
     transformed.samples = rounded_rate_converted_samples(
         source_extent.samples, source_sample_rate, output_sample_rate);
     if (transformed.samples > 0) {
@@ -412,6 +441,20 @@ const char* sample_extent_source_name(SampleExtentSource source) noexcept {
         return "PCM data size";
     case SampleExtentSource::CodecGaplessMetadata:
         return "codec gapless metadata";
+    case SampleExtentSource::MovAacPresentationBoundary:
+        return "verified MOV AAC presentation boundary";
+    case SampleExtentSource::AiffPcmData:
+        return "verified AIFF PCM data";
+    case SampleExtentSource::AuPcmData:
+        return "verified AU PCM data";
+    case SampleExtentSource::CafLpcmData:
+        return "verified CAF LPCM data";
+    case SampleExtentSource::TtaSampleCount:
+        return "verified TTA sample count";
+    case SampleExtentSource::DsfSampleCount:
+        return "verified DSF sample count";
+    case SampleExtentSource::DffDsdData:
+        return "verified DFF DSD data";
     case SampleExtentSource::CueIndex:
         return "CUE index";
     case SampleExtentSource::None:

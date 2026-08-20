@@ -31,7 +31,7 @@ Portions copyright © 2026 PCM Transport contributors.
 
 ## Features
 
-- GTK 3.16+ desktop interface
+- GTK 3 desktop interface
 - Direct ALSA output
 - Native FLAC decoding through libFLAC
 - Direct FFmpeg library decoding for MP3, M4A, AAC, OGG, WAV, AIFF, APE, WV and other formats
@@ -39,7 +39,7 @@ Portions copyright © 2026 PCM Transport contributors.
 - Local M3U / M3U8 playlist import
 - UTF-8 and Windows-1251 normalization for legacy metadata
 - Same-format gapless playback where possible
-- Optional SoXr resampling and bit-depth rules
+- Optional SoXR resampling and bit-depth rules
 - Baxandall-style Bass/Treble controls and Deep Bass presets
 - MPRIS integration (media keys, cover art)
 
@@ -210,7 +210,7 @@ assumed; build against the libraries supplied by the target distribution.
 FLAC decoding remains native through libFLAC when no Processing Rules
 are active. PCM Transport is also linked against the FFmpeg shared
 libraries for other formats, metadata fallback and conversion paths.
-The ffmpeg and ffprobe command-line tools are not used. RTKit support uses GLib/GIO 2.52+ D-Bus; no separate RTKit build dependency is required. Persistent realtime permission can be granted with pkexec/setcap cap_sys_nice and requires a player restart.
+The ffmpeg and ffprobe command-line tools are not used. RTKit support uses GLib/GIO 2.52+ D-Bus; no separate RTKit build dependency is required. Direct realtime permission can be granted through pkexec/setcap cap_sys_nice and requires a player restart.
 
 ---
 
@@ -257,9 +257,6 @@ If the application does not appear in your menu or file associations do not work
 
 ## Compatibility
 
-- C++17
-- GTK 3.16 or newer
-- GLib / GIO 2.52 or newer
 - Arch, Debian, Ubuntu, ALT Linux and similar Linux distributions
 - X11 and Wayland through GTK
 

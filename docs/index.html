@@ -510,7 +510,7 @@
           </svg>
         </div>
         <h3>Direct ALSA output</h3>
-        <p>Native Linux playback with GTK 3.16+ and ALSA — no PulseAudio or PipeWire required.</p>
+        <p>Direct ALSA playback — no PulseAudio or PipeWire required.</p>
       </div>
 
       <div class="card">
@@ -672,16 +672,16 @@ cmake --build build -j</code></pre>
     </div>
 
     <p class="note">
-      Dependencies: ALSA, GTK 3.16+, GLib/GIO 2.52+, libFLAC 1.3.3 or newer, and FFmpeg 4.4
-      or newer libraries: libavformat, libavcodec, libavutil and
-      libswresample. PCM Transport uses public library APIs and may
+      Dependencies: ALSA, GTK 3.16 or newer, GLib/GIO 2.52 or newer,
+      libFLAC 1.3.3 or newer, and FFmpeg 4.4 or newer libraries:
+      libavformat, libavcodec, libavutil and libswresample. PCM Transport uses public library APIs and may
       conservatively disable optional capabilities unavailable on the
       supported baseline.
 
       FLAC decoding remains native through libFLAC. Other formats,
       metadata fallback and conversion paths use the FFmpeg libraries
       directly. The ffmpeg and ffprobe command-line tools are not used.
-      Realtime audio priority is optional (via RTKit or cap_sys_nice).
+      Realtime audio priority is optional and can use RTKit or direct CAP_SYS_NICE scheduling.
     </p>
 
     <h2>Project goals</h2>

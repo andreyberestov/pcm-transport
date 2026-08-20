@@ -27,18 +27,17 @@ Contributions should:
 
 - use portable C++17 and avoid GNU-only C++ extensions;
 - preserve `CMAKE_CXX_EXTENSIONS OFF`;
-- keep GTK on the GTK 3.16+ C API from C++ code;
+- use the GTK 3 C API from C++ code;
 - preserve the supported baseline of GTK 3.16, GLib/GIO 2.52, FFmpeg 4.4 and libFLAC 1.3.3;
 - use public FFmpeg APIs and explicit version/capability checks;
-- preserve `RangeLimitedDecoder` bounded transport for entries with known sample
-  ranges;
+- do not replace direct FFmpeg library integration with ffmpeg/ffprobe subprocesses for playback or metadata probing;
+- preserve `RangeLimitedDecoder` bounded transport for entries with known sample ranges;
 - avoid unnecessary new dependencies;
 - preserve existing behavior unless the change intentionally modifies it;
 - follow the existing architecture and coding style;
 - be reviewed and tested before acceptance.
 
-A contribution may be declined even when technically valid if it does not fit the
-project's scope, architecture, dependency policy, or maintenance goals.
+A contribution may be declined even when technically valid if it does not fit the project's scope, architecture, dependency policy, or maintenance goals.
 
 ## AI-assisted contributions
 

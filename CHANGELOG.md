@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.9.115
+
+- Replaced the configurable startup playlist row count with restoration of the last normal main-window size. The factory and reset size keeps a 12-row playlist, while user resizing is remembered across sessions.
+- Replaced automatic character-based playlist field limiting with optional remembered column widths. User-adjusted widths are restored across sessions, while the normal adaptive playlist layout remains unchanged when the option is disabled.
+- Improved realtime scheduling: RTKit fallback now works correctly on standard desktop systems, while optional direct RT permission is handled separately and clearly in Settings.
+- Reworked playlist search around native GtkSearchEntry handling and removed the application-side search debounce timer.
+- Restored native GTK rendering for secondary controls while keeping PCM-specific styling limited to the main player interface where needed.
+- Set the minimum GUI stack to GTK 3.16 and GLib/GIO 2.52. GTK 3.22+ uses the current GdkMonitor work-area API while GTK 3.16–3.20 retains the compatible GdkScreen path.
+- Improved AppImage realtime handling: persistent capability grant/revoke is disabled in the read-only AppImage environment while runtime RTKit support remains available.
+- Hardened CUE and M3U/M3U8 loading with bounded reads and invalid local-path checks.
+- Improved FLAC bit-perfect diagnostics with direct subprocess execution, cancellation and temporary-file cleanup.
+- Improved MPRIS registration, GTK widget cleanup and several dialog, sizing and compiler-warning edge cases.
+- Updated project documentation.
+
 ## 0.9.114
 
 - Reworked playback around an event-driven model. Removed periodic transport polling and reduced unnecessary GUI wakeups.

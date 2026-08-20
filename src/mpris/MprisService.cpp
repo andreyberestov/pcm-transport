@@ -10,6 +10,8 @@
 #include <cstring>
 #include <utility>
 
+#include "pcmtp/util/Logger.hpp"
+
 namespace pcmtp {
 namespace {
 
@@ -718,6 +720,10 @@ void MprisService::register_object(GDBusConnection* connection) {
     GError* error = nullptr;
     GDBusNodeInfo* introspection = g_dbus_node_info_new_for_xml(kIntrospectionXml, &error);
     if (introspection == nullptr) {
+        const std::string message = error != nullptr && error->message != nullptr
+            ? error->message
+            : "invalid introspection XML";
+        Logger::instance().error("MPRIS introspection failed: " + message);
         if (error != nullptr) {
             g_error_free(error);
         }
@@ -731,24 +737,42 @@ void MprisService::register_object(GDBusConnection* connection) {
         {0},
     };
 
-    if (registration_ids_.empty()) {
-        for (GDBusInterfaceInfo** iface = introspection->interfaces; *iface != nullptr; ++iface) {
-            GError* register_error = nullptr;
-            const unsigned int registration_id = g_dbus_connection_register_object(connection,
-                                                                                   kObjectPath,
-                                                                                   *iface,
-                                                                                   &interface_vtable,
-                                                                                   this,
-                                                                                   nullptr,
-                                                                                   &register_error);
-            if (registration_id == 0) {
-                if (register_error != nullptr) {
-                    g_error_free(register_error);
-                }
-                continue;
+    if (!registration_ids_.empty()) {
+        g_dbus_node_info_unref(introspection);
+        return;
+    }
+
+    bool registration_complete = true;
+    for (GDBusInterfaceInfo** iface = introspection->interfaces; *iface != nullptr; ++iface) {
+        GError* register_error = nullptr;
+        const unsigned int registration_id = g_dbus_connection_register_object(connection,
+                                                                                kObjectPath,
+                                                                                *iface,
+                                                                                &interface_vtable,
+                                                                                this,
+                                                                                nullptr,
+                                                                                &register_error);
+        if (registration_id == 0) {
+            const char* interface_name = (*iface)->name != nullptr ? (*iface)->name : "unknown";
+            const std::string message = register_error != nullptr && register_error->message != nullptr
+                ? register_error->message
+                : "registration failed";
+            Logger::instance().error(std::string("MPRIS interface registration failed (") +
+                                       interface_name + "): " + message);
+            if (register_error != nullptr) {
+                g_error_free(register_error);
             }
-            registration_ids_.push_back(registration_id);
+            registration_complete = false;
+            break;
         }
+        registration_ids_.push_back(registration_id);
+    }
+
+    if (!registration_complete) {
+        for (unsigned int registration_id : registration_ids_) {
+            g_dbus_connection_unregister_object(connection, registration_id);
+        }
+        registration_ids_.clear();
     }
 
     g_dbus_node_info_unref(introspection);

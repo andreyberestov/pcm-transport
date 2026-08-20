@@ -36,7 +36,7 @@
       "@type": "Person",
       "name": "Andrey Berestov"
     },
-    "license": "https://www.gnu.org/licenses/gpl-3.0.en.html",
+    "license": "https://spdx.org/licenses/GPL-3.0-only.html",
     "codeRepository": "https://github.com/andreyberestov/pcm-transport",
     "url": "https://andreyberestov.github.io/pcm-transport/",
     "downloadUrl": "https://github.com/andreyberestov/pcm-transport/releases",
@@ -510,7 +510,7 @@
           </svg>
         </div>
         <h3>Direct ALSA output</h3>
-        <p>Native Linux playback with GTK 3 and ALSA — no PulseAudio or PipeWire required.</p>
+        <p>Native Linux playback with GTK 3.16+ and ALSA — no PulseAudio or PipeWire required.</p>
       </div>
 
       <div class="card">
@@ -672,7 +672,7 @@ cmake --build build -j</code></pre>
     </div>
 
     <p class="note">
-      Dependencies: ALSA, GTK 3, libFLAC 1.3.3 or newer, and FFmpeg 4.4
+      Dependencies: ALSA, GTK 3.16+, GLib/GIO 2.52+, libFLAC 1.3.3 or newer, and FFmpeg 4.4
       or newer libraries: libavformat, libavcodec, libavutil and
       libswresample. PCM Transport uses public library APIs and may
       conservatively disable optional capabilities unavailable on the
@@ -698,12 +698,12 @@ cmake --build build -j</code></pre>
     <section class="development-box">
       <h2>Development note</h2>
       <p>
-        PCM Transport is an independently maintained project developed with the assistance of AI coding tools. The project author defines the requirements and product direction, reviews and integrates changes, and tests each release before publication.
+        PCM Transport is an independently maintained project developed with the assistance of AI coding tools. The project maintainer defines the requirements and product direction, reviews and integrates changes, and tests each release before publication.
       </p>
     </section>
 
      <section class="development-author">
-      <h2>Author</h2>
+      <h2>Author and Maintainer</h2>
       <p>
         <a href="https://github.com/andreyberestov">Andrey Berestov</a>
       </p>
@@ -718,9 +718,10 @@ cmake --build build -j</code></pre>
     <section class="license-box">
       <h2>License</h2>
       <p>
-        PCM Transport is released under the GNU General Public License v3.0.
+        PCM Transport is released under the GNU General Public License v3.0 only.
         See the <a href="https://github.com/andreyberestov/pcm-transport/blob/main/LICENSE">LICENSE</a>
-        file in the repository for details.
+        file in the repository for details. Third-party component notices are listed in
+        <a href="https://github.com/andreyberestov/pcm-transport/blob/main/THIRD_PARTY_NOTICES.md">THIRD_PARTY_NOTICES.md</a>.
       </p>
     </section>
     
@@ -734,10 +735,10 @@ cmake --build build -j</code></pre>
 
     <footer class="footer">
       <p>PCM Transport is an open-source Linux audio player project by Andrey Berestov.</p>
-      <p>Licensed under GNU GPL v3.0.</p>
+      <p>Licensed under GNU GPL v3.0 only.</p>
       <p>Feedback and bug reports: <a href="https://github.com/andreyberestov/pcm-transport/issues">GitHub Issues</a></p>
       <p>PCM Transport — Copyright © 2026 Andrey Berestov.</p>
-      <p>Portions copyright © 2026 their respective contributors.</p>
+      <p>Portions copyright © 2026 PCM Transport contributors.</p>
     </footer>
   </main>
 </body>

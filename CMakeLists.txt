@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(pcm_transport VERSION 0.9.114 LANGUAGES C CXX)
+project(pcm_transport VERSION 0.9.115 LANGUAGES C CXX)
 
 include(GNUInstallDirs)
 
@@ -10,7 +10,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(ALSA REQUIRED alsa)
 pkg_check_modules(FLAC REQUIRED flac>=1.3.3)
-pkg_check_modules(GTK3 REQUIRED gtk+-3.0)
+pkg_check_modules(GTK3 REQUIRED gtk+-3.0>=3.16)
+pkg_check_modules(GLIB_GIO REQUIRED glib-2.0>=2.52 gio-2.0>=2.52)
 pkg_check_modules(AVFORMAT REQUIRED IMPORTED_TARGET libavformat>=58.76.100)
 pkg_check_modules(AVCODEC REQUIRED IMPORTED_TARGET libavcodec>=58.134.100)
 pkg_check_modules(AVUTIL REQUIRED IMPORTED_TARGET libavutil>=56.70.100)

@@ -15,6 +15,7 @@
 #include <vector>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/resource.h>
 #include <sys/eventfd.h>
 #include <sched.h>
 #include <unistd.h>
@@ -684,8 +685,105 @@ bool rtkit_get_max_realtime_priority(GDBusConnection* connection, int& max_prior
     return true;
 }
 
+bool rtkit_get_rttime_usec_max(GDBusConnection* connection, rlim_t& rttime_usec_max, std::string& error_message) {
+    rttime_usec_max = 0;
+    if (connection == nullptr) {
+        error_message = "invalid D-Bus connection";
+        return false;
+    }
+
+    GError* error = nullptr;
+    GVariant* result = g_dbus_connection_call_sync(connection,
+                                                   "org.freedesktop.RealtimeKit1",
+                                                   "/org/freedesktop/RealtimeKit1",
+                                                   "org.freedesktop.DBus.Properties",
+                                                   "Get",
+                                                   g_variant_new("(ss)", "org.freedesktop.RealtimeKit1", "RTTimeUSecMax"),
+                                                   G_VARIANT_TYPE("(v)"),
+                                                   G_DBUS_CALL_FLAGS_NONE,
+                                                   1500,
+                                                   nullptr,
+                                                   &error);
+    if (result == nullptr) {
+        error_message = gerror_message("RTKit RTTimeUSecMax query failed", error);
+        if (error != nullptr) g_error_free(error);
+        return false;
+    }
+
+    GVariant* value = nullptr;
+    g_variant_get(result, "(v)", &value);
+    gint64 service_value = 0;
+    if (value != nullptr) {
+        if (g_variant_type_equal(g_variant_get_type(value), G_VARIANT_TYPE_INT64)) {
+            service_value = g_variant_get_int64(value);
+        }
+        g_variant_unref(value);
+    }
+    g_variant_unref(result);
+
+    if (service_value <= 0) {
+        error_message = "RTKit RTTimeUSecMax is not usable";
+        return false;
+    }
+
+    const guint64 unsigned_value = static_cast<guint64>(service_value);
+    if (unsigned_value > static_cast<guint64>(std::numeric_limits<rlim_t>::max())) {
+        error_message = "RTKit RTTimeUSecMax exceeds the local rlimit range";
+        return false;
+    }
+
+    rttime_usec_max = static_cast<rlim_t>(unsigned_value);
+    return true;
+}
+
+bool prepare_rtkit_rttime_limit(rlim_t rttime_usec_max, std::string& error_message) {
+    if (rttime_usec_max == 0 || rttime_usec_max == RLIM_INFINITY) {
+        error_message = "RTKit RTTimeUSecMax is not usable";
+        return false;
+    }
+
+    rlimit current{};
+    if (getrlimit(RLIMIT_RTTIME, &current) != 0) {
+        error_message = std::string("RTKit RLIMIT_RTTIME query failed: ") + std::strerror(errno);
+        return false;
+    }
+
+    if (current.rlim_max != RLIM_INFINITY &&
+        current.rlim_max >= static_cast<rlim_t>(1) &&
+        current.rlim_max <= rttime_usec_max) {
+        return true;
+    }
+
+    if (current.rlim_max == 0) {
+        error_message = "RTKit RLIMIT_RTTIME hard limit is zero";
+        return false;
+    }
+
+    rlimit adjusted = current;
+    adjusted.rlim_max = rttime_usec_max;
+    if (adjusted.rlim_cur == RLIM_INFINITY ||
+        adjusted.rlim_cur == 0 ||
+        adjusted.rlim_cur > adjusted.rlim_max) {
+        adjusted.rlim_cur = adjusted.rlim_max;
+    }
+
+    if (setrlimit(RLIMIT_RTTIME, &adjusted) != 0) {
+        error_message = std::string("RTKit RLIMIT_RTTIME setup failed: ") + std::strerror(errno);
+        return false;
+    }
+    return true;
+}
+
+int base_scheduler_policy(int policy) {
+#ifdef SCHED_RESET_ON_FORK
+    return policy & ~SCHED_RESET_ON_FORK;
+#else
+    return policy;
+#endif
+}
+
 const char* policy_display_name(int policy) {
-    switch (policy) {
+    switch (base_scheduler_policy(policy)) {
         case SCHED_RR: return "SCHED_RR";
         case SCHED_FIFO: return "SCHED_FIFO";
         case SCHED_OTHER: return "TS";
@@ -764,6 +862,15 @@ bool rtkit_make_thread_realtime(long tid, int requested_priority, int& effective
         max_priority = 20;
     }
 
+    rlim_t rttime_usec_max = 0;
+    std::string rttime_error;
+    if (!rtkit_get_rttime_usec_max(connection, rttime_usec_max, rttime_error) ||
+        !prepare_rtkit_rttime_limit(rttime_usec_max, rttime_error)) {
+        g_object_unref(connection);
+        error_message = rttime_error.empty() ? "RTKit realtime limit setup failed" : rttime_error;
+        return false;
+    }
+
     effective_priority = std::max(1, std::min(requested_priority, max_priority));
     GError* error = nullptr;
     GVariant* result = g_dbus_connection_call_sync(connection,
@@ -812,8 +919,9 @@ std::string PlaybackEngine::verified_realtime_priority_status(long tid) const {
     if (sched_getparam(static_cast<pid_t>(tid), &param) != 0) {
         return "Realtime priority: status unavailable, TID " + std::to_string(tid);
     }
-    if (policy == SCHED_RR || policy == SCHED_FIFO) {
-        return std::string("Realtime priority: active, ") + policy_display_name(policy) + " " +
+    const int base_policy = base_scheduler_policy(policy);
+    if (base_policy == SCHED_RR || base_policy == SCHED_FIFO) {
+        return std::string("Realtime priority: active, ") + policy_display_name(base_policy) + " " +
                std::to_string(param.sched_priority) + ", TID " + std::to_string(tid);
     }
     return std::string("Realtime priority: not active, scheduler ") + policy_display_name(policy) +

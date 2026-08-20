@@ -4,6 +4,7 @@
 #include "pcmtp/playlist/M3uPlaylistReader.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <fstream>
 #include <sstream>
@@ -71,22 +72,30 @@ int hex_value(char ch) {
     return -1;
 }
 
-std::string percent_decode(const std::string& value) {
-    std::string out;
-    out.reserve(value.size());
+bool percent_decode(const std::string& value, std::string* output) {
+    if (output == nullptr) {
+        return false;
+    }
+
+    output->clear();
+    output->reserve(value.size());
     for (std::size_t i = 0; i < value.size(); ++i) {
+        char decoded = value[i];
         if (value[i] == '%' && i + 2 < value.size()) {
             const int hi = hex_value(value[i + 1]);
             const int lo = hex_value(value[i + 2]);
             if (hi >= 0 && lo >= 0) {
-                out.push_back(static_cast<char>((hi << 4) | lo));
+                decoded = static_cast<char>((hi << 4) | lo);
                 i += 2;
-                continue;
             }
         }
-        out.push_back(value[i]);
+        if (decoded == '\0') {
+            output->clear();
+            return false;
+        }
+        output->push_back(decoded);
     }
-    return out;
+    return true;
 }
 
 bool local_file_uri_to_path(const std::string& uri, std::string& out_path) {
@@ -96,12 +105,15 @@ bool local_file_uri_to_path(const std::string& uri, std::string& out_path) {
     std::string rest = uri.substr(7);
     if (starts_with_ci(rest, "localhost/")) {
         rest = rest.substr(9);
-        out_path = "/" + percent_decode(rest);
+        std::string decoded;
+        if (!percent_decode(rest, &decoded)) {
+            return false;
+        }
+        out_path = "/" + decoded;
         return true;
     }
     if (!rest.empty() && rest[0] == '/') {
-        out_path = percent_decode(rest);
-        return true;
+        return percent_decode(rest, &out_path);
     }
     return false;
 }
@@ -130,9 +142,25 @@ std::vector<std::string> M3uPlaylistReader::read_local_paths(const std::string& 
         throw std::runtime_error("Cannot open playlist: " + path);
     }
 
-    std::ostringstream ss;
-    ss << input.rdbuf();
-    const std::string normalized_text = pcmtp::text::normalize_text_file_bytes(ss.str());
+    constexpr std::size_t kMaxPlaylistFileBytes = 64U * 1024U * 1024U;
+    constexpr std::size_t kTextReadChunkBytes = 64U * 1024U;
+    std::string bytes;
+    std::array<char, kTextReadChunkBytes> buffer{};
+    while (input) {
+        input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const std::streamsize count = input.gcount();
+        if (count > 0) {
+            const std::size_t chunk_size = static_cast<std::size_t>(count);
+            if (bytes.size() > kMaxPlaylistFileBytes - chunk_size) {
+                throw std::runtime_error("Playlist file exceeds 64 MiB limit: " + path);
+            }
+            bytes.append(buffer.data(), chunk_size);
+        }
+    }
+    if (!input.eof()) {
+        throw std::runtime_error("Cannot read playlist: " + path);
+    }
+    const std::string normalized_text = pcmtp::text::normalize_text_file_bytes(bytes);
 
     std::vector<std::string> paths;
     std::istringstream lines(normalized_text);
@@ -142,10 +170,10 @@ std::vector<std::string> M3uPlaylistReader::read_local_paths(const std::string& 
             line.pop_back();
         }
         line = trim_copy(line);
-        if (line.empty()) {
+        if (line.empty() || line.find('\0') != std::string::npos) {
             continue;
         }
-        if (!line.empty() && line[0] == '#') {
+        if (line[0] == '#') {
             continue;
         }
         if (is_remote_or_stream_uri(line)) {

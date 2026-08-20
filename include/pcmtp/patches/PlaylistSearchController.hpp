@@ -44,17 +44,17 @@ public:
     void shutdown();
 
 private:
-    static void on_search_changed(GtkEditable* editable, gpointer user_data);
-    static gboolean on_filter_visible(GtkTreeModel* model, GtkTreeIter* iter, gpointer user_data);
-    static gboolean on_refilter_timeout(gpointer user_data);
-    static gboolean on_search_entry_key_press(GtkWidget* widget, GdkEventKey* event, gpointer user_data);
+    static void on_search_changed(GtkSearchEntry* entry, gpointer user_data);
+    static void on_search_entry_activate(GtkEntry* entry, gpointer user_data);
+    static void on_stop_search(GtkSearchEntry* entry, gpointer user_data);
+    static gboolean on_filter_visible(GtkTreeModel* model,
+                                      GtkTreeIter* iter,
+                                      gpointer user_data);
 
-    void cancel_pending_refilter();
-    void schedule_refilter();
-    void append_to_search_entry(const char* text);
     void focus_search_entry();
     void set_search_text(const std::string& text);
-    void update_filter_text(const std::string& text);
+    bool update_filter_text(const std::string& text);
+    void apply_search_text(const std::string& text);
 
     Delegate& delegate_;
     GtkTreeModelFilter* filter_ = nullptr;
@@ -62,8 +62,8 @@ private:
     std::string filter_text_;
     bool invalidated_ = false;
     gulong search_changed_handler_id_ = 0;
-    gulong search_key_press_handler_id_ = 0;
-    guint refilter_timeout_id_ = 0;
+    gulong search_activate_handler_id_ = 0;
+    gulong search_stop_handler_id_ = 0;
 };
 
 } // namespace pcmtp

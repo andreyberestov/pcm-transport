@@ -4,6 +4,7 @@
 #include "pcmtp/cue/CueParser.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <dirent.h>
 #include <fstream>
@@ -20,14 +21,37 @@ namespace pcmtp {
 
 namespace {
 
+constexpr std::size_t kMaxCueFileBytes = 4U * 1024U * 1024U;
+constexpr std::size_t kTextReadChunkBytes = 64U * 1024U;
+
 std::string read_normalized_cue_text(const std::string& path) {
     std::ifstream input(path.c_str(), std::ios::binary);
     if (!input) {
         throw std::runtime_error("Cannot open CUE file: " + path);
     }
-    std::ostringstream ss;
-    ss << input.rdbuf();
-    return pcmtp::text::normalize_text_file_bytes(ss.str());
+
+    std::string bytes;
+    std::array<char, kTextReadChunkBytes> buffer{};
+    while (input) {
+        input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const std::streamsize count = input.gcount();
+        if (count > 0) {
+            const std::size_t chunk_size = static_cast<std::size_t>(count);
+            if (bytes.size() > kMaxCueFileBytes - chunk_size) {
+                throw std::runtime_error("CUE file exceeds 4 MiB limit: " + path);
+            }
+            bytes.append(buffer.data(), chunk_size);
+        }
+    }
+    if (!input.eof()) {
+        throw std::runtime_error("Cannot read CUE file: " + path);
+    }
+
+    std::string normalized = pcmtp::text::normalize_text_file_bytes(bytes);
+    if (normalized.find('\0') != std::string::npos) {
+        throw std::runtime_error("CUE file contains NUL bytes: " + path);
+    }
+    return normalized;
 }
 
 std::string trim(const std::string& value) {

@@ -1,10 +1,10 @@
-# PCM Transport v0.9.114
+# PCM Transport v0.9.115
 
 **PCM Transport** is a Linux desktop audio player focused on direct PCM playback, predictable DSP, and clear signal-path reporting.
 
 ---
 
-## Author
+## Author and Maintainer
 
 [Andrey Berestov](https://github.com/andreyberestov)
 
@@ -31,7 +31,7 @@ Portions copyright © 2026 PCM Transport contributors.
 
 ## Features
 
-- GTK 3 desktop interface
+- GTK 3.16+ desktop interface
 - Direct ALSA output
 - Native FLAC decoding through libFLAC
 - Direct FFmpeg library decoding for MP3, M4A, AAC, OGG, WAV, AIFF, APE, WV and other formats
@@ -193,7 +193,8 @@ exit
 ### Runtime
 
 - ALSA
-- GTK 3
+- GTK 3.16 or newer
+- GLib / GIO 2.52 or newer
 - libFLAC 1.3.3 or newer
 - FFmpeg 4.4 or newer shared libraries: libavformat, libavcodec, libavutil and libswresample
 - rtkit-daemon (optional, for RTKit realtime audio-thread priority)
@@ -209,7 +210,7 @@ assumed; build against the libraries supplied by the target distribution.
 FLAC decoding remains native through libFLAC when no Processing Rules
 are active. PCM Transport is also linked against the FFmpeg shared
 libraries for other formats, metadata fallback and conversion paths.
-The ffmpeg and ffprobe command-line tools are not used. RTKit support uses GLib/GIO D-Bus from GTK 3; no separate RTKit build dependency is required. Persistent realtime permission can be granted with pkexec/setcap cap_sys_nice and requires a player restart.
+The ffmpeg and ffprobe command-line tools are not used. RTKit support uses GLib/GIO 2.52+ D-Bus; no separate RTKit build dependency is required. Persistent realtime permission can be granted with pkexec/setcap cap_sys_nice and requires a player restart.
 
 ---
 
@@ -257,7 +258,8 @@ If the application does not appear in your menu or file associations do not work
 ## Compatibility
 
 - C++17
-- GTK 3
+- GTK 3.16 or newer
+- GLib / GIO 2.52 or newer
 - Arch, Debian, Ubuntu, ALT Linux and similar Linux distributions
 - X11 and Wayland through GTK
 
@@ -265,10 +267,12 @@ If the application does not appear in your menu or file associations do not work
 
 ## Development note
 
-PCM Transport is an independently maintained project developed with the assistance of AI coding tools. The project author defines the requirements and product direction, reviews and integrates changes, and tests each release before publication.
+PCM Transport is an independently maintained project developed with the assistance of AI coding tools. The project maintainer defines the requirements and product direction, reviews and integrates changes, and tests each release before publication.
 
 ---
 
 ## License
 
-GNU General Public License v3.0. See `LICENSE`.
+GNU General Public License v3.0 only (`GPL-3.0-only`). See `LICENSE`.
+
+Third-party component notices: `THIRD_PARTY_NOTICES.md`.

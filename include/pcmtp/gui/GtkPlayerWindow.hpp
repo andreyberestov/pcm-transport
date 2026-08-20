@@ -4,6 +4,7 @@
 #pragma once
 
 #include <gtk/gtk.h>
+#include <gio/gio.h>
 
 #include <array>
 #include <atomic>
@@ -275,15 +276,18 @@ private:
     static void on_playlist_scrolled_size_allocate(GtkWidget* widget,
                                                    GtkAllocation* allocation,
                                                    gpointer user_data);
-    static void on_playlist_field_cell_data(GtkTreeViewColumn* column,
-                                            GtkCellRenderer* renderer,
-                                            GtkTreeModel* model,
-                                            GtkTreeIter* iter,
-                                            gpointer user_data);
+    static void on_playlist_column_fixed_width_notify(GObject* object,
+                                                      GParamSpec* pspec,
+                                                      gpointer user_data);
     static gboolean on_playlist_search_window_resize_idle(gpointer user_data);
     static gboolean on_window_configure_event(GtkWidget* widget,
                                               GdkEventConfigure* event,
                                               gpointer user_data);
+    static gboolean on_window_state_event(GtkWidget* widget,
+                                          GdkEventWindowState* event,
+                                          gpointer user_data);
+    static gboolean on_window_geometry_tracking_ready_idle(gpointer user_data);
+    static gboolean on_window_geometry_restore_guard_idle(gpointer user_data);
     static gboolean on_window_delete_event(GtkWidget* widget, GdkEvent* event, gpointer user_data);
     static void on_window_destroy(GtkWidget* widget, gpointer user_data);
     static gboolean on_meter_draw(GtkWidget* widget, cairo_t* cr, gpointer user_data);
@@ -448,8 +452,12 @@ private:
     void cancel_pending_seek();
     void rebuild_playlist_view(bool reset_column_widths = true);
     void reset_playlist_column_widths();
-    void apply_playlist_field_width_limit(bool reset_column_widths);
-    void sync_playlist_field_renderer_binding();
+    void apply_playlist_column_width_memory(bool capture_current_widths);
+    void capture_current_playlist_column_widths();
+    void remember_resized_playlist_column(GtkTreeViewColumn* column);
+    void update_playlist_column_widths_dirty_state();
+    void request_playlist_column_widths_checkpoint();
+    void commit_playlist_column_widths_checkpoint();
     void update_playlist_sort_headers();
     void reset_playlist_sort_state();
     void cycle_playlist_sort(PlaylistSortKey key);
@@ -499,6 +507,16 @@ private:
     void complete_playlist_search_window_resize();
     void queue_playlist_layout_reflow();
     void schedule_playlist_search_window_resize();
+    bool main_window_has_normal_size_state() const;
+    void remember_normal_window_size(int width, int height);
+    void update_window_geometry_dirty_state();
+    void remember_user_window_size(int width, int height);
+    void capture_current_normal_window_size();
+    void request_window_geometry_checkpoint();
+    void commit_window_geometry_checkpoint();
+    void begin_programmatic_window_resize(int width, int height);
+    void cancel_window_geometry_tracking_sources();
+    void reset_window_size_to_default();
 
     std::unique_ptr<IAudioDecoder> create_decoder_for_entry(const PlaylistEntry& entry) const;
     GaplessTrackSpec gapless_spec_for_entry(const PlaylistEntry& entry) const;
@@ -749,6 +767,8 @@ private:
     std::mt19937_64 random_generator_;
     std::thread bitperfect_test_worker_;
     std::shared_ptr<std::atomic<bool>> bitperfect_test_cancel_;
+    std::mutex bitperfect_subprocess_mutex_;
+    GSubprocess* bitperfect_subprocess_ = nullptr;
     std::string last_open_directory_;
     std::string saved_last_open_directory_;
     std::thread source_scan_worker_;
@@ -816,21 +836,39 @@ private:
     bool progress_blink_enabled_ = true;
     std::shared_ptr<std::atomic<bool>> ui_dispatch_lifetime_;
     bool playlist_search_enabled_ = false;
-    static constexpr int kDefaultPlaylistFieldWidthChars = 25;
-    bool playlist_field_width_limit_enabled_ = false;
-    int playlist_field_width_chars_ = kDefaultPlaylistFieldWidthChars;
+    bool playlist_column_widths_remember_enabled_ = false;
+    std::array<int, 5> saved_playlist_column_widths_ = {{-1, -1, -1, -1, -1}};
+    std::array<int, 5> runtime_playlist_column_widths_ = {{-1, -1, -1, -1, -1}};
+    bool playlist_column_widths_dirty_ = false;
+    bool playlist_column_widths_checkpoint_pending_ = false;
+    bool playlist_column_widths_applying_ = false;
+    GtkCellRenderer* playlist_track_renderer_ = nullptr;
     GtkCellRenderer* playlist_artist_renderer_ = nullptr;
     GtkCellRenderer* playlist_title_renderer_ = nullptr;
     GtkCellRenderer* playlist_album_renderer_ = nullptr;
     GtkCellRenderer* playlist_source_renderer_ = nullptr;
+    GtkTreeViewColumn* playlist_track_column_ = nullptr;
     GtkTreeViewColumn* playlist_artist_column_ = nullptr;
     GtkTreeViewColumn* playlist_title_column_ = nullptr;
     GtkTreeViewColumn* playlist_album_column_ = nullptr;
-    GtkTreeViewColumn* playlist_field_width_spacer_column_ = nullptr;
     GtkTreeViewColumn* playlist_source_column_ = nullptr;
-    std::array<int, 4> playlist_field_width_initial_caps_ = {{-1, -1, -1, -1}};
-    bool playlist_field_cell_data_active_ = false;
-    int playlist_rows_at_startup_ = 12;
+    int default_window_height_without_search_ = 0;
+    int saved_window_width_ = 0;
+    int saved_window_height_ = 0;
+    bool saved_window_size_valid_ = false;
+    int runtime_normal_window_width_ = 0;
+    int runtime_normal_window_height_ = 0;
+    bool runtime_normal_window_size_valid_ = false;
+    bool runtime_window_size_user_defined_ = false;
+    bool window_geometry_dirty_ = false;
+    bool window_geometry_checkpoint_pending_ = false;
+    bool window_geometry_tracking_enabled_ = false;
+    bool window_geometry_programmatic_resize_pending_ = false;
+    int window_geometry_programmatic_width_ = 0;
+    int window_geometry_programmatic_height_ = 0;
+    bool window_geometry_restore_guard_ = false;
+    guint window_geometry_tracking_ready_idle_id_ = 0;
+    guint window_geometry_restore_guard_idle_id_ = 0;
     bool playlist_search_window_height_adjusted_ = false;
     int playlist_search_unrealized_height_delta_ = 0;
     bool playlist_search_window_resize_pending_ = false;

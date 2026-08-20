@@ -68,11 +68,9 @@ constexpr int kClipIndicatorHoldMs = 700;
 constexpr guint kPreferencesSaveDebounceMs = 350;
 constexpr int kDefaultWindowWidth = 900;
 constexpr int kDefaultWindowHeight = 660;
-constexpr int kMinPlaylistRows = 10;
-constexpr int kMaxPlaylistRows = 20;
-constexpr int kMinPlaylistFieldWidthChars = 10;
-constexpr int kMaxPlaylistFieldWidthChars = 200;
-constexpr int kPlaylistFieldWidthSpacerMinPixels = 6;
+constexpr int kDefaultPlaylistRows = 12;
+constexpr gint kPlaylistCellXPad = 6;
+constexpr gint kPlaylistCellYPad = 2;
 constexpr gint kDialogOuterMargin = 14;
 constexpr gint kDialogContentFooterSpacing = 8;
 constexpr gint kDialogButtonSpacing = 6;
@@ -87,21 +85,20 @@ constexpr std::array<const char*, 4> kEmbeddedApplicationIconResources = {{
     "/org/berestov/pcmtransport/icons/hicolor/128x128/apps/org.berestov.pcmtransport.png"
 }};
 
-int playlist_field_width_spacer_min_width(GtkTreeViewColumn* column) {
-    int width = kPlaylistFieldWidthSpacerMinPixels;
+int playlist_column_header_min_width(GtkTreeViewColumn* column) {
     if (column == nullptr) {
-        return width;
+        return 1;
     }
 
     GtkWidget* header_button = gtk_tree_view_column_get_button(column);
     if (header_button == nullptr) {
-        return width;
+        return 1;
     }
 
     int minimum_width = 0;
     int natural_width = 0;
     gtk_widget_get_preferred_width(header_button, &minimum_width, &natural_width);
-    return std::max(width, minimum_width);
+    return std::max(1, minimum_width);
 }
 
 struct DsdRateDefinition {
@@ -234,13 +231,48 @@ bool has_exact_sample_range(bool start_known,
     return start_known && end_known && end_sample >= start_sample;
 }
 
-int clamp_window_height_to_workarea(GtkWidget* window, int requested_height) {
+bool get_window_workarea(GtkWidget* window, GdkRectangle* workarea) {
+    if (workarea == nullptr) {
+        return false;
+    }
+
+#if GTK_CHECK_VERSION(3, 22, 0)
+    GdkWindow* gdk_window = nullptr;
+    if (window != nullptr && gtk_widget_get_realized(window)) {
+        gdk_window = gtk_widget_get_window(window);
+    }
+
+    GdkDisplay* display = gdk_window != nullptr
+        ? gdk_window_get_display(gdk_window)
+        : (window != nullptr ? gtk_widget_get_display(window) : nullptr);
+    if (display == nullptr) {
+        display = gdk_display_get_default();
+    }
+    if (display == nullptr) {
+        return false;
+    }
+
+    GdkMonitor* monitor = gdk_window != nullptr
+        ? gdk_display_get_monitor_at_window(display, gdk_window)
+        : nullptr;
+    if (monitor == nullptr) {
+        monitor = gdk_display_get_primary_monitor(display);
+    }
+    if (monitor == nullptr && gdk_display_get_n_monitors(display) > 0) {
+        monitor = gdk_display_get_monitor(display, 0);
+    }
+    if (monitor == nullptr) {
+        return false;
+    }
+
+    gdk_monitor_get_workarea(monitor, workarea);
+#else
     GdkScreen* screen = window != nullptr ? gtk_widget_get_screen(window) : nullptr;
     if (screen == nullptr) {
         screen = gdk_screen_get_default();
     }
     if (screen == nullptr) {
-        return requested_height;
+        return false;
     }
 
     gint monitor = -1;
@@ -256,9 +288,28 @@ int clamp_window_height_to_workarea(GtkWidget* window, int requested_height) {
     if (monitor < 0) {
         monitor = 0;
     }
+
+    gdk_screen_get_monitor_workarea(screen, monitor, workarea);
+#endif
+
+    return workarea->width > 0 && workarea->height > 0;
+}
+
+int clamp_window_width_to_workarea(GtkWidget* window, int requested_width) {
     GdkRectangle workarea{};
-    gdk_screen_get_monitor_workarea(screen, monitor, &workarea);
-    if (workarea.height <= 0) {
+    if (!get_window_workarea(window, &workarea)) {
+        return requested_width;
+    }
+
+    const int safe_width = std::max(
+        1,
+        static_cast<int>(std::floor(static_cast<double>(workarea.width) * 0.95)));
+    return std::min(requested_width, safe_width);
+}
+
+int clamp_window_height_to_workarea(GtkWidget* window, int requested_height) {
+    GdkRectangle workarea{};
+    if (!get_window_workarea(window, &workarea)) {
         return requested_height;
     }
 
@@ -835,6 +886,13 @@ std::string current_executable_path() {
     return std::string(buffer);
 }
 
+bool is_appimage_runtime() {
+    const gchar* appimage = g_getenv("APPIMAGE");
+    const gchar* appdir = g_getenv("APPDIR");
+    return (appimage != nullptr && *appimage != '\0') ||
+           (appdir != nullptr && *appdir != '\0');
+}
+
 std::string preferred_tool_path(const char* primary, const char* fallback, const char* name) {
     if (primary != nullptr && access(primary, X_OK) == 0) return std::string(primary);
     if (fallback != nullptr && access(fallback, X_OK) == 0) return std::string(fallback);
@@ -865,10 +923,6 @@ std::string runtime_environment_text(const char* rtkit_status) {
     const char* ffmpeg_version = av_version_info();
     const char* flac_version = FLAC__VERSION_STRING;
     const char* alsa_version = snd_asoundlib_version();
-    const bool pkexec_available = executable_tool_available(
-        "/usr/bin/pkexec", "/bin/pkexec", "pkexec");
-    const bool setcap_available = executable_tool_available(
-        "/usr/sbin/setcap", "/usr/bin/setcap", "setcap");
 
     std::ostringstream ss;
     ss << "Runtime environment:\n"
@@ -881,9 +935,18 @@ std::string runtime_environment_text(const char* rtkit_status) {
        << " · GTK: " << gtk_get_major_version() << '.' << gtk_get_minor_version() << '.'
        << gtk_get_micro_version()
        << " · ALSA: " << (alsa_version != nullptr ? alsa_version : "unknown") << '\n'
-       << "RTKit: " << (rtkit_status != nullptr ? rtkit_status : "checking...") << '\n'
-       << "Realtime tools: pkexec " << (pkexec_available ? "available" : "not available")
-       << " · setcap " << (setcap_available ? "available" : "not available");
+       << "RTKit: " << (rtkit_status != nullptr ? rtkit_status : "checking...") << '\n';
+
+    if (is_appimage_runtime()) {
+        ss << "Direct RT permission: unavailable in AppImage (read-only application payload)";
+    } else {
+        const bool pkexec_available = executable_tool_available(
+            "/usr/bin/pkexec", "/bin/pkexec", "pkexec");
+        const bool setcap_available = executable_tool_available(
+            "/usr/sbin/setcap", "/usr/bin/setcap", "setcap");
+        ss << "Realtime tools: pkexec " << (pkexec_available ? "available" : "not available")
+           << " · setcap " << (setcap_available ? "available" : "not available");
+    }
     return ss.str();
 }
 
@@ -965,23 +1028,72 @@ SpawnResult run_argv_sync(const std::vector<std::string>& args) {
     return result;
 }
 
-std::string persistent_rt_permission_status() {
+enum class DirectRtPermissionState {
+    Unavailable,
+    Unknown,
+    Granted,
+    NotGranted,
+};
+
+struct DirectRtPermissionStatus {
+    DirectRtPermissionState state = DirectRtPermissionState::Unknown;
+    std::string text;
+};
+
+DirectRtPermissionStatus direct_rt_permission_status() {
+    if (is_appimage_runtime()) {
+        return {DirectRtPermissionState::Unavailable,
+                "Direct RT permission: unavailable in AppImage"};
+    }
     const std::string exe = current_executable_path();
-    if (exe.empty()) return "Persistent RT permission: executable path unavailable";
+    if (exe.empty()) {
+        return {DirectRtPermissionState::Unknown,
+                "Direct RT permission: executable path unavailable"};
+    }
     const std::string getcap = preferred_tool_path("/usr/sbin/getcap", "/usr/bin/getcap", "getcap");
     const SpawnResult result = run_argv_sync({getcap, exe});
     if (!result.ok) {
-        return "Persistent RT permission: unknown (getcap unavailable)";
+        return {DirectRtPermissionState::Unknown,
+                "Direct RT permission: status unavailable (getcap unavailable)"};
     }
     if (result.output.find("cap_sys_nice") != std::string::npos) {
-        return "Persistent RT permission: granted; restart required if granted during this session";
+        return {DirectRtPermissionState::Granted,
+                "Direct RT permission: granted"};
     }
-    return "Persistent RT permission: not granted";
+    return {DirectRtPermissionState::NotGranted,
+            "Direct RT permission: not granted"};
 }
 
-std::string apply_persistent_rt_permission(bool grant) {
+void update_direct_rt_permission_controls(GtkWidget* status_label,
+                                          GtkWidget* grant_button,
+                                          GtkWidget* revoke_button) {
+    const DirectRtPermissionStatus status = direct_rt_permission_status();
+    if (status_label != nullptr && GTK_IS_LABEL(status_label)) {
+        gtk_label_set_text(GTK_LABEL(status_label), status.text.c_str());
+        gtk_label_set_xalign(GTK_LABEL(status_label), 0.0f);
+    }
+
+    gboolean grant_sensitive = FALSE;
+    gboolean revoke_sensitive = FALSE;
+    if (status.state == DirectRtPermissionState::Granted) {
+        revoke_sensitive = TRUE;
+    } else if (status.state == DirectRtPermissionState::NotGranted) {
+        grant_sensitive = TRUE;
+    }
+    if (grant_button != nullptr) {
+        gtk_widget_set_sensitive(grant_button, grant_sensitive);
+    }
+    if (revoke_button != nullptr) {
+        gtk_widget_set_sensitive(revoke_button, revoke_sensitive);
+    }
+}
+
+std::string apply_direct_rt_permission(bool grant) {
+    if (is_appimage_runtime()) {
+        return "Direct RT permission is unavailable in AppImage because the application payload is read-only.";
+    }
     const std::string exe = current_executable_path();
-    if (exe.empty()) return "Persistent RT permission: executable path unavailable";
+    if (exe.empty()) return "Direct RT permission: executable path unavailable";
     const std::string setcap = preferred_tool_path("/usr/sbin/setcap", "/usr/bin/setcap", "setcap");
     std::vector<std::string> args;
     args.push_back("pkexec");
@@ -995,10 +1107,10 @@ std::string apply_persistent_rt_permission(bool grant) {
     const SpawnResult result = run_argv_sync(args);
     if (result.ok) {
         return grant
-            ? "Persistent RT permission: granted. Restart PCM Transport to use it."
-            : "Persistent RT permission: revoked for next start. Restart PCM Transport.";
+            ? "Direct RT permission granted. Restart PCM Transport to use direct realtime scheduling."
+            : "Direct RT permission revoked for the next start. Restart PCM Transport.";
     }
-    std::string msg = grant ? "Persistent RT permission grant failed" : "Persistent RT permission revoke failed";
+    std::string msg = grant ? "Direct RT permission grant failed" : "Direct RT permission revoke failed";
     if (!result.error.empty()) msg += ": " + result.error;
     return msg;
 }
@@ -1063,6 +1175,7 @@ void show_runtime_message(GtkWindow* parent, const char* title, const std::strin
         title != nullptr ? title : "PCM Transport",
         parent,
         GTK_DIALOG_MODAL,
+        NULL,
         NULL);
     const PcmDialogLayout layout = create_pcm_dialog_layout(
         dialog, PcmDialogLayoutMode::Compact);
@@ -1102,11 +1215,6 @@ void set_realtime_status_label(GtkWidget* label, const std::string& status) {
     gtk_widget_set_tooltip_text(label, status.c_str());
 }
 
-std::string realtime_settings_status_text(PlaybackEngine& engine) {
-    const std::string rt = engine.refresh_realtime_priority_status();
-    return rt + "\n" + persistent_rt_permission_status();
-}
-
 void add_probe_cell(GtkGrid* grid, GtkWidget* child, int column, int row, bool header, bool ok = false, bool fail = false) {
     gtk_widget_set_hexpand(child, TRUE);
     gtk_widget_set_vexpand(child, FALSE);
@@ -1129,6 +1237,7 @@ void show_alsa_probe_table_dialog(GtkWindow* parent, const AlsaProbeMatrix& matr
     GtkWidget* dialog = gtk_dialog_new_with_buttons("ALSA device probe",
                                                     parent,
                                                     GTK_DIALOG_MODAL,
+                                                    NULL,
                                                     NULL);
     const PcmDialogLayout layout = create_pcm_dialog_layout(
         dialog, PcmDialogLayoutMode::Expandable);
@@ -1139,14 +1248,25 @@ void show_alsa_probe_table_dialog(GtkWindow* parent, const AlsaProbeMatrix& matr
     gtk_box_pack_start(GTK_BOX(area), box, FALSE, FALSE, 0);
 
     GtkWidget* title = gtk_label_new(nullptr);
-    const std::string title_text = "<b>ALSA device probe</b>\nDevice: " + matrix.device_name + "\nMode: playback, RW_INTERLEAVED, stereo";
-    gtk_label_set_markup(GTK_LABEL(title), title_text.c_str());
+    gtk_label_set_markup(GTK_LABEL(title), "<b>ALSA device probe</b>");
     gtk_label_set_xalign(GTK_LABEL(title), 0.0f);
     gtk_box_pack_start(GTK_BOX(box), title, FALSE, FALSE, 0);
 
+    gchar* valid_device_name = g_utf8_make_valid(matrix.device_name.data(),
+                                                  static_cast<gssize>(matrix.device_name.size()));
+    const std::string device_name = valid_device_name != nullptr
+        ? std::string(valid_device_name)
+        : std::string();
+    g_free(valid_device_name);
+    GtkWidget* probe_context = gtk_label_new(
+        ("Device: " + device_name + "\nMode: playback, RW_INTERLEAVED, stereo").c_str());
+    gtk_label_set_xalign(GTK_LABEL(probe_context), 0.0f);
+    gtk_label_set_selectable(GTK_LABEL(probe_context), TRUE);
+    gtk_box_pack_start(GTK_BOX(box), probe_context, FALSE, FALSE, 0);
+
     GtkWidget* scrolled = gtk_scrolled_window_new(nullptr, nullptr);
-    gtk_widget_set_size_request(scrolled, 720, 156);
-    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolled), GTK_POLICY_AUTOMATIC, GTK_POLICY_NEVER);
+    gtk_scrolled_window_set_min_content_height(GTK_SCROLLED_WINDOW(scrolled), 156);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolled), GTK_POLICY_NEVER, GTK_POLICY_NEVER);
     gtk_widget_set_margin_top(scrolled, 2);
     gtk_widget_set_margin_bottom(scrolled, 2);
     GtkWidget* grid = gtk_grid_new();
@@ -1204,24 +1324,6 @@ std::string safe_utf8_for_display(const std::string& text_value) {
         return text_value;
     }
     return pcmtp::text::normalize_metadata_value(text_value);
-}
-
-std::string playlist_field_limited_presentation(const std::string& text_value,
-                                                int max_chars) {
-    const std::string display = safe_utf8_for_display(text_value);
-    if (max_chars < 0) {
-        return display;
-    }
-
-    const glong chars = g_utf8_strlen(display.c_str(), -1);
-    if (chars <= max_chars) {
-        return display;
-    }
-
-    const char* end = g_utf8_offset_to_pointer(display.c_str(), max_chars);
-    std::string limited(display.c_str(), static_cast<std::size_t>(end - display.c_str()));
-    limited += "\xE2\x80\xA6"; // U+2026 HORIZONTAL ELLIPSIS.
-    return limited;
 }
 
 int compare_playlist_text(const std::string& left,
@@ -1319,16 +1421,6 @@ void set_widget_opacity_if_changed(GtkWidget* widget, double opacity) {
     if (widget == nullptr) return;
     if (std::fabs(gtk_widget_get_opacity(widget) - opacity) < 0.0001) return;
     gtk_widget_set_opacity(widget, opacity);
-}
-
-std::string shell_quote(const std::string& value) {
-    std::string out = "'";
-    for (char ch : value) {
-        if (ch == '\'') out += "'\\''";
-        else out += ch;
-    }
-    out += "'";
-    return out;
 }
 
 void append_text_view(GtkWidget* view, const std::string& text) {
@@ -1786,7 +1878,7 @@ std::vector<GtkPlayerWindow::DsdPcmRule> parse_dsd_pcm_rules(const std::string& 
     return out;
 }
 
-std::string shell_escape_cmd(const std::string& value) {
+std::string shell_quote_argument(const std::string& value) {
     std::string out = "'";
     for (char c : value) {
         if (c == '\'') out += "'\\''"; else out.push_back(c);
@@ -2511,7 +2603,11 @@ PcmDialogLayout create_pcm_dialog_layout(GtkWidget* dialog,
     gtk_style_context_add_class(gtk_widget_get_style_context(native_content),
                                 "pcm-dialog-host");
 
+    // GtkDialog has no non-deprecated accessor for its bottom action area.
+    // PCM Transport keeps its own footer to preserve stable dialog geometry.
+G_GNUC_BEGIN_IGNORE_DEPRECATIONS
     GtkWidget* native_actions = gtk_dialog_get_action_area(GTK_DIALOG(dialog));
+G_GNUC_END_IGNORE_DEPRECATIONS
     if (native_actions != nullptr) {
         gtk_container_set_border_width(GTK_CONTAINER(native_actions), 0);
         clear_widget_margins(native_actions);
@@ -2847,6 +2943,9 @@ void GtkPlayerWindow::queue_playlist_layout_reflow() {
 void GtkPlayerWindow::complete_playlist_search_window_resize() {
     cancel_playlist_search_window_resize();
     queue_playlist_layout_reflow();
+    if (window_geometry_checkpoint_pending_ && !ui_closing_) {
+        save_preferences();
+    }
 }
 
 void GtkPlayerWindow::schedule_playlist_search_window_resize() {
@@ -2863,14 +2962,210 @@ void GtkPlayerWindow::schedule_playlist_search_window_resize() {
         nullptr);
 }
 
+bool GtkPlayerWindow::main_window_has_normal_size_state() const {
+    if (window_ == nullptr || !gtk_widget_get_realized(window_)) {
+        return true;
+    }
+
+    GdkWindow* gdk_window = gtk_widget_get_window(window_);
+    if (gdk_window == nullptr) {
+        return true;
+    }
+
+    const GdkWindowState state = gdk_window_get_state(gdk_window);
+    return (state & (GDK_WINDOW_STATE_MAXIMIZED |
+                     GDK_WINDOW_STATE_FULLSCREEN |
+                     GDK_WINDOW_STATE_ICONIFIED)) == 0;
+}
+
+void GtkPlayerWindow::remember_normal_window_size(int width, int height) {
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+    runtime_normal_window_width_ = width;
+    runtime_normal_window_height_ = height;
+    runtime_normal_window_size_valid_ = true;
+}
+
+void GtkPlayerWindow::update_window_geometry_dirty_state() {
+    if (runtime_window_size_user_defined_) {
+        window_geometry_dirty_ =
+            !saved_window_size_valid_ ||
+            !runtime_normal_window_size_valid_ ||
+            runtime_normal_window_width_ != saved_window_width_ ||
+            runtime_normal_window_height_ != saved_window_height_;
+        return;
+    }
+
+    window_geometry_dirty_ = saved_window_size_valid_;
+}
+
+void GtkPlayerWindow::remember_user_window_size(int width, int height) {
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+    remember_normal_window_size(width, height);
+    runtime_window_size_user_defined_ = true;
+    update_window_geometry_dirty_state();
+}
+
+void GtkPlayerWindow::capture_current_normal_window_size() {
+    if (window_ == nullptr || !main_window_has_normal_size_state()) {
+        return;
+    }
+
+    int width = 0;
+    int height = 0;
+    gtk_window_get_size(GTK_WINDOW(window_), &width, &height);
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+
+    const bool changed =
+        !runtime_normal_window_size_valid_ ||
+        width != runtime_normal_window_width_ ||
+        height != runtime_normal_window_height_;
+    remember_normal_window_size(width, height);
+    if (changed && runtime_window_size_user_defined_) {
+        update_window_geometry_dirty_state();
+    }
+}
+
+void GtkPlayerWindow::request_window_geometry_checkpoint() {
+    window_geometry_checkpoint_pending_ = true;
+}
+
+void GtkPlayerWindow::commit_window_geometry_checkpoint() {
+    if (!window_geometry_checkpoint_pending_) {
+        return;
+    }
+    if (playlist_search_window_resize_pending_ && !ui_closing_) {
+        return;
+    }
+    window_geometry_checkpoint_pending_ = false;
+
+    capture_current_normal_window_size();
+    if (!window_geometry_dirty_) {
+        return;
+    }
+
+    if (runtime_window_size_user_defined_ && runtime_normal_window_size_valid_) {
+        saved_window_width_ = runtime_normal_window_width_;
+        saved_window_height_ = runtime_normal_window_height_;
+        saved_window_size_valid_ = true;
+    } else {
+        saved_window_width_ = 0;
+        saved_window_height_ = 0;
+        saved_window_size_valid_ = false;
+    }
+    window_geometry_dirty_ = false;
+}
+
+void GtkPlayerWindow::begin_programmatic_window_resize(int width, int height) {
+    window_geometry_programmatic_resize_pending_ = width > 0 && height > 0;
+    window_geometry_programmatic_width_ = width;
+    window_geometry_programmatic_height_ = height;
+    if (!window_geometry_programmatic_resize_pending_) {
+        return;
+    }
+
+    window_geometry_restore_guard_ = true;
+    if (window_geometry_restore_guard_idle_id_ != 0) {
+        g_source_remove(window_geometry_restore_guard_idle_id_);
+    }
+    window_geometry_restore_guard_idle_id_ = g_idle_add_full(
+        G_PRIORITY_LOW,
+        GtkPlayerWindow::on_window_geometry_restore_guard_idle,
+        this,
+        nullptr);
+}
+
+void GtkPlayerWindow::cancel_window_geometry_tracking_sources() {
+    if (window_geometry_tracking_ready_idle_id_ != 0) {
+        g_source_remove(window_geometry_tracking_ready_idle_id_);
+        window_geometry_tracking_ready_idle_id_ = 0;
+    }
+    if (window_geometry_restore_guard_idle_id_ != 0) {
+        g_source_remove(window_geometry_restore_guard_idle_id_);
+        window_geometry_restore_guard_idle_id_ = 0;
+    }
+}
+
+void GtkPlayerWindow::reset_window_size_to_default() {
+    if (window_ == nullptr) {
+        return;
+    }
+
+    const int base_height = default_window_height_without_search_ > 0
+        ? default_window_height_without_search_
+        : kDefaultWindowHeight;
+    const int applied_base_height =
+        clamp_window_height_to_workarea(window_, base_height);
+
+    int search_delta = 0;
+    const bool search_visible = playlist_search_enabled_ && search_controller_ != nullptr;
+    if (search_visible) {
+        const int entry_height = search_controller_->search_entry_natural_height();
+        const int spacing = playlist_panel_ != nullptr
+            ? gtk_box_get_spacing(GTK_BOX(playlist_panel_))
+            : 0;
+        search_delta = std::max(0, entry_height + spacing);
+    }
+
+    const int target_width =
+        clamp_window_width_to_workarea(window_, kDefaultWindowWidth);
+    const int target_height = clamp_window_height_to_workarea(
+        window_, base_height + search_delta);
+    const int applied_search_delta = search_visible
+        ? std::max(0, target_height - applied_base_height)
+        : 0;
+
+    cancel_playlist_search_window_resize();
+    playlist_search_window_height_adjusted_ = search_visible;
+    playlist_search_unrealized_height_delta_ = applied_search_delta;
+    playlist_search_runtime_height_compensation_ = applied_search_delta;
+
+    runtime_window_size_user_defined_ = false;
+    remember_normal_window_size(target_width, target_height);
+    update_window_geometry_dirty_state();
+
+    if (gtk_widget_get_realized(window_)) {
+        int current_width = 0;
+        int current_height = 0;
+        gtk_window_get_size(GTK_WINDOW(window_), &current_width, &current_height);
+        if (!main_window_has_normal_size_state() ||
+            current_width != target_width || current_height != target_height) {
+            begin_programmatic_window_resize(target_width, target_height);
+        }
+        gtk_window_unmaximize(GTK_WINDOW(window_));
+        gtk_window_resize(GTK_WINDOW(window_), target_width, target_height);
+    } else {
+        gtk_window_set_default_size(GTK_WINDOW(window_), target_width, target_height);
+    }
+    queue_playlist_layout_reflow();
+}
+
 void GtkPlayerWindow::on_playlist_scrolled_size_allocate(
     GtkWidget*,
     GtkAllocation*,
     gpointer user_data) {
     auto* self = static_cast<GtkPlayerWindow*>(user_data);
-    if (self != nullptr) {
-        self->schedule_playlist_search_window_resize();
+    if (self == nullptr) {
+        return;
     }
+
+    self->schedule_playlist_search_window_resize();
+}
+
+void GtkPlayerWindow::on_playlist_column_fixed_width_notify(
+    GObject* object,
+    GParamSpec*,
+    gpointer user_data) {
+    auto* self = static_cast<GtkPlayerWindow*>(user_data);
+    if (self == nullptr || object == nullptr || !GTK_IS_TREE_VIEW_COLUMN(object)) {
+        return;
+    }
+    self->remember_resized_playlist_column(GTK_TREE_VIEW_COLUMN(object));
 }
 
 gboolean GtkPlayerWindow::on_window_configure_event(
@@ -2878,11 +3173,60 @@ gboolean GtkPlayerWindow::on_window_configure_event(
     GdkEventConfigure* event,
     gpointer user_data) {
     auto* self = static_cast<GtkPlayerWindow*>(user_data);
-    if (self == nullptr || !self->playlist_search_window_resize_pending_) {
+    if (self == nullptr) {
         return FALSE;
     }
 
-    if (event != nullptr && event->height > 0) {
+    const bool valid_size =
+        event != nullptr && event->width > 0 && event->height > 0;
+    const bool normal_state = valid_size && self->main_window_has_normal_size_state();
+    const bool search_resize_pending = self->playlist_search_window_resize_pending_;
+
+    if (normal_state) {
+        const bool changed =
+            !self->runtime_normal_window_size_valid_ ||
+            event->width != self->runtime_normal_window_width_ ||
+            event->height != self->runtime_normal_window_height_;
+
+        if (!self->window_geometry_tracking_enabled_) {
+            self->remember_normal_window_size(event->width, event->height);
+        } else if (search_resize_pending) {
+            self->remember_normal_window_size(event->width, event->height);
+            if (changed && self->runtime_window_size_user_defined_) {
+                self->update_window_geometry_dirty_state();
+            }
+        } else if (self->window_geometry_programmatic_resize_pending_) {
+            self->remember_normal_window_size(event->width, event->height);
+            const bool expected_size =
+                std::abs(event->width - self->window_geometry_programmatic_width_) <= 2 &&
+                std::abs(event->height - self->window_geometry_programmatic_height_) <= 2;
+            if (expected_size) {
+                self->window_geometry_programmatic_resize_pending_ = false;
+                self->window_geometry_programmatic_width_ = 0;
+                self->window_geometry_programmatic_height_ = 0;
+                self->window_geometry_restore_guard_ = false;
+                if (self->window_geometry_restore_guard_idle_id_ != 0) {
+                    g_source_remove(self->window_geometry_restore_guard_idle_id_);
+                    self->window_geometry_restore_guard_idle_id_ = 0;
+                }
+            }
+        } else if (self->window_geometry_restore_guard_) {
+            self->remember_normal_window_size(event->width, event->height);
+            self->window_geometry_restore_guard_ = false;
+            if (self->window_geometry_restore_guard_idle_id_ != 0) {
+                g_source_remove(self->window_geometry_restore_guard_idle_id_);
+                self->window_geometry_restore_guard_idle_id_ = 0;
+            }
+        } else if (changed) {
+            self->remember_user_window_size(event->width, event->height);
+        }
+    }
+
+    if (!search_resize_pending) {
+        return FALSE;
+    }
+
+    if (valid_size) {
         self->account_playlist_search_window_resize_height(event->height);
     }
     self->playlist_search_window_resize_waiting_for_window_event_ = false;
@@ -2890,71 +3234,64 @@ gboolean GtkPlayerWindow::on_window_configure_event(
     return FALSE;
 }
 
-void GtkPlayerWindow::on_playlist_field_cell_data(GtkTreeViewColumn* column,
-                                                   GtkCellRenderer* renderer,
-                                                   GtkTreeModel* model,
-                                                   GtkTreeIter* iter,
-                                                   gpointer user_data) {
+gboolean GtkPlayerWindow::on_window_state_event(
+    GtkWidget*,
+    GdkEventWindowState* event,
+    gpointer user_data) {
     auto* self = static_cast<GtkPlayerWindow*>(user_data);
-    if (self == nullptr || column == nullptr || renderer == nullptr ||
-        model == nullptr || iter == nullptr) {
-        return;
+    if (self == nullptr || event == nullptr) {
+        return FALSE;
     }
 
-    std::size_t slot = 0;
-    int model_column = -1;
-    if (column == self->playlist_artist_column_) {
-        slot = 0;
-        model_column = COL_ARTIST;
-    } else if (column == self->playlist_title_column_) {
-        slot = 1;
-        model_column = COL_TITLE;
-    } else if (column == self->playlist_album_column_) {
-        slot = 2;
-        model_column = COL_ALBUM;
-    } else if (column == self->playlist_source_column_) {
-        slot = 3;
-        model_column = COL_SOURCE;
-    } else {
-        return;
+    const GdkWindowState relevant_states = static_cast<GdkWindowState>(
+        GDK_WINDOW_STATE_MAXIMIZED |
+        GDK_WINDOW_STATE_FULLSCREEN |
+        GDK_WINDOW_STATE_ICONIFIED);
+    if ((event->changed_mask & relevant_states) == 0) {
+        return FALSE;
     }
 
-    gchar* model_text = nullptr;
-    gtk_tree_model_get(model, iter, model_column, &model_text, -1);
-    const std::string full_text = model_text != nullptr ? model_text : "";
-    g_free(model_text);
-
-    std::string presentation = full_text;
-    PangoEllipsizeMode ellipsize = PANGO_ELLIPSIZE_NONE;
-    if (self->playlist_field_width_limit_enabled_) {
-        const int initial_cap = self->playlist_field_width_initial_caps_[slot];
-        const int fixed_width = gtk_tree_view_column_get_fixed_width(column);
-        if (initial_cap > 0) {
-            // Limited columns start with a strict character-capped presentation.
-            // GtkTreeViewColumn::fixed-width is the durable user-resize state:
-            // expanding beyond the configured initial cap reveals the full model
-            // value, while shrinking keeps the capped presentation and lets Pango
-            // ellipsize it further if necessary.
-            if (fixed_width <= initial_cap) {
-                const int max_chars = std::max(
-                    kMinPlaylistFieldWidthChars,
-                    std::min(kMaxPlaylistFieldWidthChars, self->playlist_field_width_chars_));
-                presentation = playlist_field_limited_presentation(full_text, max_chars);
-            }
-            ellipsize = PANGO_ELLIPSIZE_END;
-        } else if (fixed_width > 0) {
-            // A field that is already within the configured character limit uses
-            // normal GTK GROW_ONLY sizing. Once the user explicitly resizes that
-            // column, GTK records the width in fixed-width; only then enable end
-            // ellipsis for further manual shrink.
-            ellipsize = PANGO_ELLIPSIZE_END;
-        }
+    if (self->window_geometry_restore_guard_idle_id_ != 0) {
+        g_source_remove(self->window_geometry_restore_guard_idle_id_);
+        self->window_geometry_restore_guard_idle_id_ = 0;
     }
 
-    g_object_set(renderer,
-                 "text", presentation.c_str(),
-                 "ellipsize", ellipsize,
-                 nullptr);
+    const bool now_normal = (event->new_window_state & relevant_states) == 0;
+    self->window_geometry_restore_guard_ = now_normal;
+    if (now_normal && self->window_geometry_tracking_enabled_) {
+        self->window_geometry_restore_guard_idle_id_ = g_idle_add_full(
+            G_PRIORITY_LOW,
+            GtkPlayerWindow::on_window_geometry_restore_guard_idle,
+            self,
+            nullptr);
+    }
+    return FALSE;
+}
+
+gboolean GtkPlayerWindow::on_window_geometry_tracking_ready_idle(gpointer user_data) {
+    auto* self = static_cast<GtkPlayerWindow*>(user_data);
+    if (self == nullptr) {
+        return G_SOURCE_REMOVE;
+    }
+    self->window_geometry_tracking_ready_idle_id_ = 0;
+    if (!self->ui_closing_) {
+        self->capture_current_normal_window_size();
+        self->window_geometry_tracking_enabled_ = true;
+    }
+    return G_SOURCE_REMOVE;
+}
+
+gboolean GtkPlayerWindow::on_window_geometry_restore_guard_idle(gpointer user_data) {
+    auto* self = static_cast<GtkPlayerWindow*>(user_data);
+    if (self == nullptr) {
+        return G_SOURCE_REMOVE;
+    }
+    self->window_geometry_restore_guard_idle_id_ = 0;
+    self->window_geometry_restore_guard_ = false;
+    self->window_geometry_programmatic_resize_pending_ = false;
+    self->window_geometry_programmatic_width_ = 0;
+    self->window_geometry_programmatic_height_ = 0;
+    return G_SOURCE_REMOVE;
 }
 
 gboolean GtkPlayerWindow::on_playlist_search_window_resize_idle(gpointer user_data) {
@@ -3283,6 +3620,7 @@ GtkPlayerWindow::GtkPlayerWindow()
 
 GtkPlayerWindow::~GtkPlayerWindow() {
     ui_closing_ = true;
+    cancel_window_geometry_tracking_sources();
     uninstall_playback_event_bridge();
     stop_bitperfect_test_worker();
     flush_preferences_save();
@@ -3394,42 +3732,40 @@ void GtkPlayerWindow::build_ui(GtkApplication* app) {
     start_metadata_worker();
     window_ = gtk_application_window_new(app);
     gtk_window_set_icon_name(GTK_WINDOW(window_), kApplicationId);
-    gtk_window_set_title(GTK_WINDOW(window_), "PCM Transport v0.9.114");
+    gtk_window_set_title(GTK_WINDOW(window_), "PCM Transport v0.9.115");
     gtk_window_set_default_size(GTK_WINDOW(window_), kDefaultWindowWidth, kDefaultWindowHeight);
     gtk_container_set_border_width(GTK_CONTAINER(window_), 16);
 
+    GtkStyleContext* window_style = gtk_widget_get_style_context(window_);
+    gtk_style_context_add_class(window_style, "pcm-main-window");
+
     GtkCssProvider* provider = gtk_css_provider_new();
     const char* css =
-        "window { background: #2b2f34; }"
+        ".pcm-main-window { background: #2b2f34; }"
         ".rack { background: linear-gradient(to bottom, #9aa0a6, #8f949a); border-radius: 12px; padding: 18px; }"
         ".display { background: #0f2413; color: #9cff9c; border-radius: 8px; padding: 12px; font-family: monospace; }"
         ".display-track { font-size: 18px; }"
         ".display-time { font-size: 24px; font-weight: bold; }"
         ".transport-button { min-height: 42px; min-width: 46px; font-weight: bold; padding: 2px 8px; }"
-        ".playlist-search-entry { border-radius: 6px; min-height: 32px; }"
+        ".playlist-search-entry { min-height: 32px; border-radius: 6px; }"
         ".transport-button-thin { min-height: 19px; min-width: 86px; font-weight: bold; padding: 1px 8px; }"
-        ".transport-icon { font-size: 18px; color: #25313a; }"
-        ".transport-mode { font-size: 11px; font-weight: bold; padding: 2px 6px; color: #25313a; }"
-        "treeview.view:selected, treeview.view:selected:focus { background-color: #6f7780; color: #ffffff; }"
-        "treeview.view:selected:hover { background-color: #78818a; color: #ffffff; }"
-        "notebook > header > tabs > tab:checked { box-shadow: inset 0 -3px #6f7780; }"
-        "scale trough highlight { background-color: #6f7780; background-image: none; border-color: #6f7780; }"
-        "scale slider { background-color: #eeeeee; background-image: none; border-color: #9a9a9a; }"
-        "scale slider:hover { background-color: #ffffff; border-color: #7c838a; }"
-        "checkbutton check { background-image: none; border-color: #9a9a9a; }"
-        "checkbutton check:checked { background-color: #6f7780; background-image: none; border-color: #6f7780; color: #ffffff; }"
-        "checkbutton check:checked:hover { background-color: #78818a; border-color: #78818a; }"
-        ".small-label { color: #e8ebee; }"
+        ".transport-icon { font-size: 18px; }"
+        ".transport-mode { font-size: 11px; font-weight: bold; padding: 2px 6px; }"
+        "#playlist-view.view:selected, #playlist-view.view:selected:focus { background-color: #6f7780; color: #ffffff; }"
+        "#playlist-view.view:selected:hover { background-color: #78818a; color: #ffffff; }"
         ".display-badge { color: #ff5959; border: 1px solid #ff5959; border-radius: 3px; padding: 2px 6px; font-size: 10px; font-weight: bold; margin-left: 6px; }"
         ".meter-caption { color: #d6d8db; font-size: 10px; font-weight: bold; }"
-        ".section-label { font-weight: bold; }"
-        ".progress-area { min-height: 14px; }"
         ".pcm-dialog-host { margin: 0; padding: 0; border-width: 0; }"
         ".alsa-probe-cell { border: 1px solid #9aa1a8; padding: 3px 5px; color: #25313a; background-color: #f7f7f7; }"
         ".alsa-probe-header { font-weight: bold; color: #25313a; background-color: #e6e9ec; }"
         ".alsa-probe-ok { color: #1a7f37; font-weight: bold; }"
         ".alsa-probe-fail { color: #a12a2a; font-weight: bold; }";
-    gtk_css_provider_load_from_data(provider, css, -1, nullptr);
+    GError* css_error = nullptr;
+    gtk_css_provider_load_from_data(provider, css, -1, &css_error);
+    if (css_error != nullptr) {
+        Logger::instance().error(std::string("Failed to load GTK CSS: ") + css_error->message);
+        g_error_free(css_error);
+    }
     gtk_style_context_add_provider_for_screen(gdk_screen_get_default(),
                                               GTK_STYLE_PROVIDER(provider),
                                               GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
@@ -3662,6 +3998,10 @@ void GtkPlayerWindow::build_ui(GtkApplication* app) {
         playlist_view_ = gtk_tree_view_new_with_model(GTK_TREE_MODEL(playlist_store_));
     }
     gtk_widget_set_name(playlist_view_, "playlist-view");
+    g_signal_connect(playlist_view_,
+                     "size-allocate",
+                     G_CALLBACK(GtkPlayerWindow::on_playlist_scrolled_size_allocate),
+                     this);
     gtk_tree_selection_set_mode(gtk_tree_view_get_selection(GTK_TREE_VIEW(playlist_view_)), GTK_SELECTION_SINGLE);
     gtk_container_add(GTK_CONTAINER(scrolled), playlist_view_);
     gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(playlist_view_), TRUE);
@@ -3680,14 +4020,22 @@ void GtkPlayerWindow::build_ui(GtkApplication* app) {
                      this);
 
     GtkCellRenderer* renderer = gtk_cell_renderer_text_new();
-    g_object_set(renderer, "xpad", 6, "ypad", 2, nullptr);
+    playlist_track_renderer_ = renderer;
+    g_object_set(renderer,
+                 "xpad", kPlaylistCellXPad,
+                 "ypad", kPlaylistCellYPad,
+                 nullptr);
     GtkTreeViewColumn* col_track = gtk_tree_view_column_new_with_attributes("#", renderer, "text", COL_TRACKNO, nullptr);
+    playlist_track_column_ = col_track;
     gtk_tree_view_column_set_resizable(col_track, TRUE);
     gtk_tree_view_append_column(GTK_TREE_VIEW(playlist_view_), col_track);
 
     renderer = gtk_cell_renderer_text_new();
     playlist_artist_renderer_ = renderer;
-    g_object_set(renderer, "xpad", 6, "ypad", 2, nullptr);
+    g_object_set(renderer,
+                 "xpad", kPlaylistCellXPad,
+                 "ypad", kPlaylistCellYPad,
+                 nullptr);
     GtkTreeViewColumn* col_artist = gtk_tree_view_column_new_with_attributes("Artist", renderer, "text", COL_ARTIST, nullptr);
     playlist_artist_column_ = col_artist;
     gtk_tree_view_column_set_resizable(col_artist, TRUE);
@@ -3695,7 +4043,10 @@ void GtkPlayerWindow::build_ui(GtkApplication* app) {
 
     renderer = gtk_cell_renderer_text_new();
     playlist_title_renderer_ = renderer;
-    g_object_set(renderer, "xpad", 6, "ypad", 2, nullptr);
+    g_object_set(renderer,
+                 "xpad", kPlaylistCellXPad,
+                 "ypad", kPlaylistCellYPad,
+                 nullptr);
     GtkTreeViewColumn* col_title = gtk_tree_view_column_new_with_attributes("Title", renderer, "text", COL_TITLE, nullptr);
     playlist_title_column_ = col_title;
     gtk_tree_view_column_set_resizable(col_title, TRUE);
@@ -3703,7 +4054,10 @@ void GtkPlayerWindow::build_ui(GtkApplication* app) {
 
     renderer = gtk_cell_renderer_text_new();
     playlist_album_renderer_ = renderer;
-    g_object_set(renderer, "xpad", 6, "ypad", 2, nullptr);
+    g_object_set(renderer,
+                 "xpad", kPlaylistCellXPad,
+                 "ypad", kPlaylistCellYPad,
+                 nullptr);
     GtkTreeViewColumn* col_album = gtk_tree_view_column_new_with_attributes("Album", renderer, "text", COL_ALBUM, nullptr);
     playlist_album_column_ = col_album;
     gtk_tree_view_column_set_expand(col_album, TRUE);
@@ -3711,28 +4065,12 @@ void GtkPlayerWindow::build_ui(GtkApplication* app) {
     gtk_tree_view_append_column(GTK_TREE_VIEW(playlist_view_), col_album);
     playlist_expand_column_ = col_album;
 
-    // When field limiting is active, this presentation-only spacer takes the
-    // same role that Album expansion has in the normal layout: it receives any
-    // spare viewport width and therefore keeps Source at the right edge. GTK
-    // redistributes that space directly as real columns are resized, so no
-    // geometry polling, delayed correction or manual viewport arithmetic is
-    // required. The fixed width is only the minimum visual gap.
-    GtkTreeViewColumn* field_width_spacer = gtk_tree_view_column_new();
-    playlist_field_width_spacer_column_ = field_width_spacer;
-    gtk_tree_view_column_set_sizing(field_width_spacer, GTK_TREE_VIEW_COLUMN_FIXED);
-    gtk_tree_view_column_set_fixed_width(field_width_spacer,
-                                         kPlaylistFieldWidthSpacerMinPixels);
-    gtk_tree_view_column_set_min_width(field_width_spacer,
-                                       kPlaylistFieldWidthSpacerMinPixels);
-    gtk_tree_view_column_set_expand(field_width_spacer, FALSE);
-    gtk_tree_view_column_set_resizable(field_width_spacer, FALSE);
-    gtk_tree_view_column_set_clickable(field_width_spacer, FALSE);
-    gtk_tree_view_column_set_visible(field_width_spacer, FALSE);
-    gtk_tree_view_append_column(GTK_TREE_VIEW(playlist_view_), field_width_spacer);
-
     renderer = gtk_cell_renderer_text_new();
     playlist_source_renderer_ = renderer;
-    g_object_set(renderer, "xpad", 6, "ypad", 2, nullptr);
+    g_object_set(renderer,
+                 "xpad", kPlaylistCellXPad,
+                 "ypad", kPlaylistCellYPad,
+                 nullptr);
     GtkTreeViewColumn* col_source = gtk_tree_view_column_new_with_attributes("Source", renderer, "text", COL_SOURCE, nullptr);
     playlist_source_column_ = col_source;
     gtk_tree_view_column_set_resizable(col_source, TRUE);
@@ -3761,7 +4099,25 @@ void GtkPlayerWindow::build_ui(GtkApplication* app) {
     configure_sort_column(col_title, "Title", PlaylistSortKey::Title, 2);
     configure_sort_column(col_album, "Album", PlaylistSortKey::Album, 3);
     configure_sort_column(col_source, "Source", PlaylistSortKey::Source, 4);
-    apply_playlist_field_width_limit(false);
+
+    // GtkTreeView permits a resizable column to be dragged below the header
+    // button's themed minimum. Clamp only the track-number column to that
+    // GTK-reported minimum so the header never receives a negative content
+    // allocation while preserving normal user resizing above it.
+    gtk_tree_view_column_set_min_width(
+        col_track, playlist_column_header_min_width(col_track));
+
+    const std::array<GtkTreeViewColumn*, 5> resizable_playlist_columns = {{
+        col_track, col_artist, col_title, col_album, col_source
+    }};
+    for (GtkTreeViewColumn* column : resizable_playlist_columns) {
+        g_signal_connect(column,
+                         "notify::fixed-width",
+                         G_CALLBACK(GtkPlayerWindow::on_playlist_column_fixed_width_notify),
+                         this);
+    }
+
+    apply_playlist_column_width_memory(false);
     update_playlist_sort_headers();
 
     // Make child visibility and GTK theme metrics available without mapping the
@@ -3860,8 +4216,8 @@ void GtkPlayerWindow::build_ui(GtkApplication* app) {
         GtkCellRenderer* fallback_renderer = gtk_cell_renderer_text_new();
         g_object_set(fallback_renderer,
                      "text", "Ag",
-                     "xpad", 6,
-                     "ypad", 2,
+                     "xpad", kPlaylistCellXPad,
+                     "ypad", kPlaylistCellYPad,
                      nullptr);
         gint fallback_minimum_height = 0;
         gint fallback_natural_height = 0;
@@ -3887,19 +4243,30 @@ void GtkPlayerWindow::build_ui(GtkApplication* app) {
         std::max(renderer_height,
                  std::max(0, static_cast<int>(expander_size))) +
             std::max(0, static_cast<int>(vertical_separator)));
-    const int ten_row_content_height =
-        header_height + kMinPlaylistRows * row_height;
+    const int default_playlist_content_height =
+        header_height + kDefaultPlaylistRows * row_height;
+
+    // Use a temporary 12-row requisition only to measure the factory-default
+    // top-level size. Restore the normal unconstrained widget requests before
+    // the window is mapped so the user can freely shrink the playlist later.
+    const int previous_min_content_height =
+        gtk_scrolled_window_get_min_content_height(GTK_SCROLLED_WINDOW(scrolled));
+    gint previous_scale_width_request = -1;
+    gint previous_scale_height_request = -1;
+    gtk_widget_get_size_request(soft_volume_scale_,
+                                &previous_scale_width_request,
+                                &previous_scale_height_request);
 
     gtk_scrolled_window_set_min_content_height(
         GTK_SCROLLED_WINDOW(scrolled),
-        ten_row_content_height);
+        default_playlist_content_height);
     gtk_widget_queue_resize(scrolled);
 
-    const int measured_playlist_minimum_height =
+    const int measured_playlist_default_height =
         preferred_widget_minimum_height(scrolled);
-    const int minimum_playlist_height = measured_playlist_minimum_height > 0
-        ? measured_playlist_minimum_height
-        : ten_row_content_height;
+    const int default_playlist_height = measured_playlist_default_height > 0
+        ? measured_playlist_default_height
+        : default_playlist_content_height;
 
     const int scale_minimum_height =
         preferred_widget_minimum_height(soft_volume_scale_);
@@ -3912,57 +4279,72 @@ void GtkPlayerWindow::build_ui(GtkApplication* app) {
     gtk_widget_set_size_request(
         soft_volume_scale_,
         52,
-        std::max(1, minimum_playlist_height - softvol_chrome_height));
+        std::max(1, default_playlist_height - softvol_chrome_height));
 
-    playlist_rows_at_startup_ = std::max(
-        kMinPlaylistRows,
-        std::min(kMaxPlaylistRows, playlist_rows_at_startup_));
-
-    // Size the logical window from its root content. GtkWindow requisitions
-    // may include backend- or decoration-dependent additions.
+    // Size the logical factory-default window from its root content. The
+    // default remains exactly 12 playlist rows, but there is no runtime minimum
+    // row count once the measurement transaction is complete.
     gtk_widget_queue_resize(softvol_box);
     gtk_widget_queue_resize(outer);
     const int outer_natural_height = preferred_widget_natural_height(outer);
     const int window_border_width = static_cast<int>(
         gtk_container_get_border_width(GTK_CONTAINER(window_)));
-    const int ten_row_window_height = outer_natural_height > 0
+    default_window_height_without_search_ = outer_natural_height > 0
         ? outer_natural_height + 2 * std::max(0, window_border_width)
         : kDefaultWindowHeight;
+
+    gtk_scrolled_window_set_min_content_height(
+        GTK_SCROLLED_WINDOW(scrolled),
+        previous_min_content_height);
+    gtk_widget_set_size_request(soft_volume_scale_,
+                                previous_scale_width_request,
+                                previous_scale_height_request);
+    gtk_widget_queue_resize(scrolled);
+    gtk_widget_queue_resize(softvol_box);
+    gtk_widget_queue_resize(outer);
+    const int applied_default_height_without_search =
+        clamp_window_height_to_workarea(window_, default_window_height_without_search_);
 
     if (startup_search_visible) {
         search_controller_->set_search_entry_visible(true);
     }
 
-    const int requested_window_height_without_search =
-        ten_row_window_height +
-        (playlist_rows_at_startup_ - kMinPlaylistRows) * row_height;
-    const int applied_window_height_without_search =
-        clamp_window_height_to_workarea(window_,
-            requested_window_height_without_search);
-
-    int applied_window_height = applied_window_height_without_search;
-    playlist_search_window_height_adjusted_ = false;
-    playlist_search_unrealized_height_delta_ = 0;
-    playlist_search_runtime_height_compensation_ = 0;
+    int requested_search_delta = 0;
     if (startup_search_visible) {
         const int entry_height = search_controller_->search_entry_natural_height();
         const int spacing = playlist_panel_ != nullptr
-                                ? gtk_box_get_spacing(GTK_BOX(playlist_panel_))
-                                : 0;
-        const int requested_search_delta = std::max(0, entry_height + spacing);
-        applied_window_height = clamp_window_height_to_workarea(window_,
-            requested_window_height_without_search + requested_search_delta);
-        playlist_search_unrealized_height_delta_ = std::max(
-            0,
-            applied_window_height - applied_window_height_without_search);
-        playlist_search_runtime_height_compensation_ =
-            playlist_search_unrealized_height_delta_;
-        playlist_search_window_height_adjusted_ = true;
+            ? gtk_box_get_spacing(GTK_BOX(playlist_panel_))
+            : 0;
+        requested_search_delta = std::max(0, entry_height + spacing);
     }
 
+    const int factory_default_height = clamp_window_height_to_workarea(
+        window_, default_window_height_without_search_ + requested_search_delta);
+
+    int initial_window_width = kDefaultWindowWidth;
+    int initial_window_height = factory_default_height;
+    if (saved_window_size_valid_) {
+        initial_window_width =
+            clamp_window_width_to_workarea(window_, saved_window_width_);
+        initial_window_height =
+            clamp_window_height_to_workarea(window_, saved_window_height_);
+    }
+
+    playlist_search_window_height_adjusted_ = startup_search_visible;
+    playlist_search_unrealized_height_delta_ = startup_search_visible
+        ? (saved_window_size_valid_
+            ? requested_search_delta
+            : std::max(0, factory_default_height - applied_default_height_without_search))
+        : 0;
+    playlist_search_runtime_height_compensation_ =
+        playlist_search_unrealized_height_delta_;
+
+    initial_window_width =
+        clamp_window_width_to_workarea(window_, initial_window_width);
     gtk_window_set_default_size(GTK_WINDOW(window_),
-                                kDefaultWindowWidth,
-                                applied_window_height);
+                                initial_window_width,
+                                initial_window_height);
+    remember_normal_window_size(initial_window_width, initial_window_height);
 
     gtk_widget_add_events(btn_open_, GDK_BUTTON_PRESS_MASK);
     g_signal_connect(btn_open_, "button-press-event",
@@ -3982,6 +4364,8 @@ void GtkPlayerWindow::build_ui(GtkApplication* app) {
     apply_playlist_search_handler_connections();
     g_signal_connect(window_, "configure-event",
                      G_CALLBACK(GtkPlayerWindow::on_window_configure_event), this);
+    g_signal_connect(window_, "window-state-event",
+                     G_CALLBACK(GtkPlayerWindow::on_window_state_event), this);
     g_signal_connect(window_, "delete-event", G_CALLBACK(GtkPlayerWindow::on_window_delete_event), this);
     g_signal_connect(window_, "destroy", G_CALLBACK(GtkPlayerWindow::on_window_destroy), this);
     refresh_device_list();
@@ -3993,6 +4377,15 @@ void GtkPlayerWindow::build_ui(GtkApplication* app) {
     gtk_widget_show_all(window_);
     if (playlist_search_enabled_) {
         adjust_playlist_search_window_height(true);
+    }
+    window_geometry_tracking_ready_idle_id_ = g_idle_add_full(
+        G_PRIORITY_LOW,
+        GtkPlayerWindow::on_window_geometry_tracking_ready_idle,
+        this,
+        nullptr);
+    if (window_geometry_tracking_ready_idle_id_ == 0) {
+        capture_current_normal_window_size();
+        window_geometry_tracking_enabled_ = true;
     }
     schedule_last_sources_restore();
 }
@@ -4432,7 +4825,11 @@ gboolean GtkPlayerWindow::on_progress_deadline(gpointer user_data) {
 gboolean GtkPlayerWindow::on_window_delete_event(GtkWidget*, GdkEvent*, gpointer user_data) {
     auto* self = static_cast<GtkPlayerWindow*>(user_data);
     if (self != nullptr) {
+        self->capture_current_normal_window_size();
+        self->request_window_geometry_checkpoint();
+        self->request_playlist_column_widths_checkpoint();
         self->ui_closing_ = true;
+        self->cancel_window_geometry_tracking_sources();
         self->uninstall_playback_event_bridge();
         self->flush_preferences_save();
         self->stop_ui_updates();
@@ -4445,6 +4842,7 @@ void GtkPlayerWindow::on_window_destroy(GtkWidget*, gpointer user_data) {
     auto* self = static_cast<GtkPlayerWindow*>(user_data);
     if (self != nullptr) {
         self->ui_closing_ = true;
+        self->cancel_window_geometry_tracking_sources();
         self->uninstall_playback_event_bridge();
         self->stop_ui_updates();
         self->cancel_pending_seek();
@@ -4481,14 +4879,19 @@ void GtkPlayerWindow::on_window_destroy(GtkWidget*, gpointer user_data) {
             self->search_controller_->invalidate();
         }
         self->playlist_view_ = nullptr;
+        self->playlist_track_renderer_ = nullptr;
         self->playlist_artist_renderer_ = nullptr;
         self->playlist_title_renderer_ = nullptr;
         self->playlist_album_renderer_ = nullptr;
         self->playlist_source_renderer_ = nullptr;
+        self->playlist_track_column_ = nullptr;
         self->playlist_artist_column_ = nullptr;
         self->playlist_title_column_ = nullptr;
         self->playlist_album_column_ = nullptr;
         self->playlist_source_column_ = nullptr;
+        self->playlist_expand_column_ = nullptr;
+        self->playlist_sort_columns_.fill(nullptr);
+        self->playlist_sort_header_labels_.fill(nullptr);
         if (self->playlist_store_ != nullptr) {
             g_object_unref(self->playlist_store_);
             self->playlist_store_ = nullptr;
@@ -8410,8 +8813,8 @@ void GtkPlayerWindow::finalize_loaded_playlist(bool rebuild_view) {
 
     if (rebuild_view) {
         rebuild_playlist_view();
-    } else if (playlist_field_width_limit_enabled_) {
-        apply_playlist_field_width_limit(true);
+    } else if (playlist_column_widths_remember_enabled_) {
+        apply_playlist_column_width_memory(false);
     }
     if (!playlist_.empty()) {
         sync_playlist_selection_after_transport_change(current_track_index_, true);
@@ -9357,6 +9760,7 @@ void GtkPlayerWindow::open_settings_dialog() {
     GtkWidget* dialog = gtk_dialog_new_with_buttons("Audio settings",
                                                     GTK_WINDOW(window_),
                                                     GTK_DIALOG_MODAL,
+                                                    NULL,
                                                     NULL);
     const PcmDialogLayout layout = create_pcm_dialog_layout(
         dialog, PcmDialogLayoutMode::Expandable);
@@ -9404,18 +9808,38 @@ void GtkPlayerWindow::open_settings_dialog() {
     gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(alsa_24_combo), "s32le", "Prefer S32_LE");
     gtk_combo_box_set_active(GTK_COMBO_BOX(alsa_24_combo), alsa_24bit_preference_combo_index(alsa_24bit_container_preference_));
 
-    const std::string rt_status_text = realtime_settings_status_text(engine_);
+    const bool appimage_runtime = is_appimage_runtime();
+    const std::string rt_status_text = engine_.refresh_realtime_priority_status();
     GtkWidget* rt_check = gtk_check_button_new_with_label("Use realtime audio thread priority");
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(rt_check), realtime_audio_priority_enabled_ ? TRUE : FALSE);
-    gtk_widget_set_tooltip_text(rt_check, "Tries direct SCHED_RR first. Uses RTKit as a runtime fallback when available. Persistent permission can be granted with cap_sys_nice.");
+    gtk_widget_set_tooltip_text(
+        rt_check,
+        "Automatically tries direct SCHED_RR first and uses RTKit as a runtime fallback when available.");
     GtkWidget* rt_status = gtk_label_new(nullptr);
     set_realtime_status_label(rt_status, rt_status_text);
     gtk_widget_set_hexpand(rt_status, FALSE);
 
-    GtkWidget* rt_grant_button = gtk_button_new_with_label("Grant persistent RT permission");
-    GtkWidget* rt_revoke_button = gtk_button_new_with_label("Revoke RT permission");
-    gtk_widget_set_tooltip_text(rt_grant_button, "Runs pkexec setcap cap_sys_nice=eip on the current PCM Transport executable. Restart required.");
-    gtk_widget_set_tooltip_text(rt_revoke_button, "Runs pkexec setcap -r on the current PCM Transport executable. Restart required.");
+    GtkWidget* rt_permission_status = gtk_label_new(nullptr);
+    gtk_label_set_xalign(GTK_LABEL(rt_permission_status), 0.0f);
+    const char* direct_rt_tooltip =
+        "Optional. Allows PCM Transport to use direct realtime scheduling without RTKit. Restart required after changing this permission.";
+    gtk_widget_set_tooltip_text(rt_permission_status, direct_rt_tooltip);
+
+    GtkWidget* rt_grant_button = gtk_button_new_with_label("Grant direct RT permission");
+    GtkWidget* rt_revoke_button = gtk_button_new_with_label("Revoke");
+    if (appimage_runtime) {
+        const char* appimage_rt_tooltip =
+            "Direct RT permission is unavailable in AppImage because the application payload is read-only. RTKit runtime fallback remains available when supported by the system.";
+        gtk_widget_set_tooltip_text(rt_grant_button, appimage_rt_tooltip);
+        gtk_widget_set_tooltip_text(rt_revoke_button, appimage_rt_tooltip);
+    } else {
+        gtk_widget_set_tooltip_text(rt_grant_button, direct_rt_tooltip);
+        gtk_widget_set_tooltip_text(
+            rt_revoke_button,
+            "Removes the direct realtime capability from the PCM Transport executable. Restart required.");
+    }
+    update_direct_rt_permission_controls(
+        rt_permission_status, rt_grant_button, rt_revoke_button);
 
     GtkWidget* alsa24_row = gtk_grid_new();
     gtk_grid_set_column_spacing(GTK_GRID(alsa24_row), 8);
@@ -9423,10 +9847,13 @@ void GtkPlayerWindow::open_settings_dialog() {
     gtk_grid_attach(GTK_GRID(alsa24_row), alsa_24_combo, 1, 0, 1, 1);
 
     GtkWidget* rt_row = gtk_grid_new();
-    gtk_grid_set_column_spacing(GTK_GRID(rt_row), 8);
     gtk_grid_attach(GTK_GRID(rt_row), rt_check, 0, 0, 1, 1);
-    gtk_grid_attach(GTK_GRID(rt_row), rt_grant_button, 1, 0, 1, 1);
-    gtk_grid_attach(GTK_GRID(rt_row), rt_revoke_button, 2, 0, 1, 1);
+
+    GtkWidget* rt_permission_row = gtk_grid_new();
+    gtk_grid_set_column_spacing(GTK_GRID(rt_permission_row), 8);
+    gtk_grid_attach(GTK_GRID(rt_permission_row), rt_permission_status, 0, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(rt_permission_row), rt_grant_button, 1, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(rt_permission_row), rt_revoke_button, 2, 0, 1, 1);
 
     GtkWidget* ui_sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
     gtk_widget_set_margin_top(ui_sep, 8);
@@ -9443,66 +9870,33 @@ void GtkPlayerWindow::open_settings_dialog() {
         gtk_check_button_new_with_label("Enable playlist search filter");
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(playlist_search_check), playlist_search_enabled_ ? TRUE : FALSE);
 
-    GtkWidget* playlist_field_width_check =
-        gtk_check_button_new_with_label("Limit playlist field width");
+    GtkWidget* playlist_column_widths_check =
+        gtk_check_button_new_with_label("Remember playlist column widths");
     gtk_toggle_button_set_active(
-        GTK_TOGGLE_BUTTON(playlist_field_width_check),
-        playlist_field_width_limit_enabled_ ? TRUE : FALSE);
+        GTK_TOGGLE_BUTTON(playlist_column_widths_check),
+        playlist_column_widths_remember_enabled_ ? TRUE : FALSE);
     gtk_widget_set_tooltip_text(
-        playlist_field_width_check,
-        "Limits only displayed playlist cell width. Search, sorting and metadata keep the full text.");
+        playlist_column_widths_check,
+        "Remembers manually adjusted playlist column widths. Text that does not fit is shown with an ellipsis.");
 
-    GtkWidget* playlist_field_width_row = gtk_grid_new();
-    gtk_grid_set_column_spacing(GTK_GRID(playlist_field_width_row), 8);
-    gtk_widget_set_margin_start(playlist_field_width_row, 22);
-    GtkWidget* playlist_field_width_label = gtk_label_new("Maximum width:");
-    gtk_label_set_xalign(GTK_LABEL(playlist_field_width_label), 0.0f);
-    GtkWidget* playlist_field_width_spin = gtk_spin_button_new_with_range(
-        kMinPlaylistFieldWidthChars,
-        kMaxPlaylistFieldWidthChars,
-        1.0);
-    gtk_spin_button_set_numeric(GTK_SPIN_BUTTON(playlist_field_width_spin), TRUE);
-    gtk_spin_button_set_value(
-        GTK_SPIN_BUTTON(playlist_field_width_spin),
-        static_cast<double>(playlist_field_width_chars_));
-    gtk_entry_set_width_chars(GTK_ENTRY(playlist_field_width_spin), 4);
-    gtk_widget_set_halign(playlist_field_width_spin, GTK_ALIGN_START);
-    GtkWidget* playlist_field_width_units = gtk_label_new("characters");
-    gtk_label_set_xalign(GTK_LABEL(playlist_field_width_units), 0.0f);
-    gtk_grid_attach(GTK_GRID(playlist_field_width_row), playlist_field_width_label, 0, 0, 1, 1);
-    gtk_grid_attach(GTK_GRID(playlist_field_width_row), playlist_field_width_spin, 1, 0, 1, 1);
-    gtk_grid_attach(GTK_GRID(playlist_field_width_row), playlist_field_width_units, 2, 0, 1, 1);
-    gtk_widget_set_sensitive(
-        playlist_field_width_row,
-        playlist_field_width_limit_enabled_ ? TRUE : FALSE);
-    g_signal_connect(playlist_field_width_check, "toggled", G_CALLBACK(+[](
-        GtkToggleButton* button, gpointer user_data) {
-        GtkWidget* dependent = GTK_WIDGET(user_data);
-        if (dependent != nullptr) {
-            gtk_widget_set_sensitive(
-                dependent,
-                gtk_toggle_button_get_active(button));
+    GtkWidget* window_size_row = gtk_grid_new();
+    gtk_grid_set_column_spacing(GTK_GRID(window_size_row), 8);
+    GtkWidget* window_size_label = gtk_label_new("Window size:");
+    gtk_label_set_xalign(GTK_LABEL(window_size_label), 0.0f);
+    GtkWidget* window_size_reset_button = gtk_button_new_with_label("Reset to default");
+    gtk_widget_set_halign(window_size_reset_button, GTK_ALIGN_START);
+    gtk_widget_set_tooltip_text(
+        window_size_reset_button,
+        "Restores the default 900 px width and 12-row playlist height.");
+    gtk_grid_attach(GTK_GRID(window_size_row), window_size_label, 0, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(window_size_row), window_size_reset_button, 1, 0, 1, 1);
+    g_signal_connect(window_size_reset_button, "clicked", G_CALLBACK(+[](
+        GtkButton*, gpointer user_data) {
+        auto* self = static_cast<GtkPlayerWindow*>(user_data);
+        if (self != nullptr) {
+            self->reset_window_size_to_default();
         }
-    }), playlist_field_width_row);
-
-    GtkWidget* playlist_rows_row = gtk_grid_new();
-    gtk_grid_set_column_spacing(GTK_GRID(playlist_rows_row), 8);
-    GtkWidget* playlist_rows_label = gtk_label_new("Playlist rows at startup:");
-    gtk_label_set_xalign(GTK_LABEL(playlist_rows_label), 0.0f);
-    GtkWidget* playlist_rows_spin = gtk_spin_button_new_with_range(
-        kMinPlaylistRows,
-        kMaxPlaylistRows,
-        1.0);
-    gtk_spin_button_set_numeric(GTK_SPIN_BUTTON(playlist_rows_spin), TRUE);
-    gtk_spin_button_set_value(GTK_SPIN_BUTTON(playlist_rows_spin),
-                              static_cast<double>(playlist_rows_at_startup_));
-    gtk_entry_set_width_chars(GTK_ENTRY(playlist_rows_spin), 3);
-    gtk_widget_set_halign(playlist_rows_spin, GTK_ALIGN_START);
-    gtk_widget_set_tooltip_text(
-        playlist_rows_row,
-        "Sets the initial playlist height from 10 to 20 rows. Applied on the next start.");
-    gtk_grid_attach(GTK_GRID(playlist_rows_row), playlist_rows_label, 0, 0, 1, 1);
-    gtk_grid_attach(GTK_GRID(playlist_rows_row), playlist_rows_spin, 1, 0, 1, 1);
+    }), this);
     GtkWidget* restore_sources_check = gtk_check_button_new_with_label("Restore last opened sources on startup");
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(restore_sources_check), restore_last_sources_enabled_ ? TRUE : FALSE);
     GtkWidget* restore_active_track_check =
@@ -9566,15 +9960,15 @@ void GtkPlayerWindow::open_settings_dialog() {
     gtk_grid_attach(GTK_GRID(grid), alsa24_row, 0, 3, 2, 1);
     gtk_grid_attach(GTK_GRID(grid), rt_row, 0, 4, 2, 1);
     gtk_grid_attach(GTK_GRID(grid), rt_status, 0, 5, 2, 1);
-    gtk_grid_attach(GTK_GRID(grid), ui_sep, 0, 6, 2, 1);
-    gtk_grid_attach(GTK_GRID(grid), ui_title, 0, 7, 2, 1);
-    gtk_grid_attach(GTK_GRID(grid), level_meter_check, 0, 8, 2, 1);
-    gtk_grid_attach(GTK_GRID(grid), clip_detect_check, 0, 9, 2, 1);
-    gtk_grid_attach(GTK_GRID(grid), progress_blink_check, 0, 10, 2, 1);
-    gtk_grid_attach(GTK_GRID(grid), playlist_search_check, 0, 11, 2, 1);
-    gtk_grid_attach(GTK_GRID(grid), playlist_field_width_check, 0, 12, 2, 1);
-    gtk_grid_attach(GTK_GRID(grid), playlist_field_width_row, 0, 13, 2, 1);
-    gtk_grid_attach(GTK_GRID(grid), playlist_rows_row, 0, 14, 2, 1);
+    gtk_grid_attach(GTK_GRID(grid), rt_permission_row, 0, 6, 2, 1);
+    gtk_grid_attach(GTK_GRID(grid), ui_sep, 0, 7, 2, 1);
+    gtk_grid_attach(GTK_GRID(grid), ui_title, 0, 8, 2, 1);
+    gtk_grid_attach(GTK_GRID(grid), level_meter_check, 0, 9, 2, 1);
+    gtk_grid_attach(GTK_GRID(grid), clip_detect_check, 0, 10, 2, 1);
+    gtk_grid_attach(GTK_GRID(grid), progress_blink_check, 0, 11, 2, 1);
+    gtk_grid_attach(GTK_GRID(grid), playlist_search_check, 0, 12, 2, 1);
+    gtk_grid_attach(GTK_GRID(grid), playlist_column_widths_check, 0, 13, 2, 1);
+    gtk_grid_attach(GTK_GRID(grid), window_size_row, 0, 14, 2, 1);
     gtk_grid_attach(GTK_GRID(grid), restore_sources_check, 0, 15, 2, 1);
     gtk_grid_attach(GTK_GRID(grid), restore_active_track_check, 0, 16, 2, 1);
     gtk_grid_attach(GTK_GRID(grid), log_sep, 0, 17, 2, 1);
@@ -9615,28 +10009,34 @@ void GtkPlayerWindow::open_settings_dialog() {
         gtk_widget_destroy(chooser);
     }), this);
 
-    g_object_set_data(G_OBJECT(rt_grant_button), "rt-status-label", rt_status);
+    g_object_set_data(G_OBJECT(rt_grant_button), "rt-permission-status", rt_permission_status);
+    g_object_set_data(G_OBJECT(rt_grant_button), "rt-grant-button", rt_grant_button);
+    g_object_set_data(G_OBJECT(rt_grant_button), "rt-revoke-button", rt_revoke_button);
     g_signal_connect(rt_grant_button, "clicked", G_CALLBACK(+[](GtkButton* button, gpointer user_data) {
         auto* self = static_cast<GtkPlayerWindow*>(user_data);
         if (self == nullptr) return;
-        const std::string result = apply_persistent_rt_permission(true);
-        GtkWidget* status_label = GTK_WIDGET(g_object_get_data(G_OBJECT(button), "rt-status-label"));
-        if (status_label != nullptr) {
-            set_realtime_status_label(status_label, self->engine_.refresh_realtime_priority_status() + "\n" + persistent_rt_permission_status() + "\n" + result);
-        }
-        show_runtime_message(GTK_WINDOW(self->window_), "Realtime permission", result, result.find("failed") == std::string::npos ? GTK_MESSAGE_INFO : GTK_MESSAGE_WARNING);
+        const std::string result = apply_direct_rt_permission(true);
+        GtkWidget* status_label = GTK_WIDGET(g_object_get_data(G_OBJECT(button), "rt-permission-status"));
+        GtkWidget* grant_button = GTK_WIDGET(g_object_get_data(G_OBJECT(button), "rt-grant-button"));
+        GtkWidget* revoke_button = GTK_WIDGET(g_object_get_data(G_OBJECT(button), "rt-revoke-button"));
+        update_direct_rt_permission_controls(status_label, grant_button, revoke_button);
+        show_runtime_message(GTK_WINDOW(self->window_), "Direct RT permission", result,
+                             result.find("failed") == std::string::npos ? GTK_MESSAGE_INFO : GTK_MESSAGE_WARNING);
     }), this);
 
-    g_object_set_data(G_OBJECT(rt_revoke_button), "rt-status-label", rt_status);
+    g_object_set_data(G_OBJECT(rt_revoke_button), "rt-permission-status", rt_permission_status);
+    g_object_set_data(G_OBJECT(rt_revoke_button), "rt-grant-button", rt_grant_button);
+    g_object_set_data(G_OBJECT(rt_revoke_button), "rt-revoke-button", rt_revoke_button);
     g_signal_connect(rt_revoke_button, "clicked", G_CALLBACK(+[](GtkButton* button, gpointer user_data) {
         auto* self = static_cast<GtkPlayerWindow*>(user_data);
         if (self == nullptr) return;
-        const std::string result = apply_persistent_rt_permission(false);
-        GtkWidget* status_label = GTK_WIDGET(g_object_get_data(G_OBJECT(button), "rt-status-label"));
-        if (status_label != nullptr) {
-            set_realtime_status_label(status_label, self->engine_.refresh_realtime_priority_status() + "\n" + persistent_rt_permission_status() + "\n" + result);
-        }
-        show_runtime_message(GTK_WINDOW(self->window_), "Realtime permission", result, result.find("failed") == std::string::npos ? GTK_MESSAGE_INFO : GTK_MESSAGE_WARNING);
+        const std::string result = apply_direct_rt_permission(false);
+        GtkWidget* status_label = GTK_WIDGET(g_object_get_data(G_OBJECT(button), "rt-permission-status"));
+        GtkWidget* grant_button = GTK_WIDGET(g_object_get_data(G_OBJECT(button), "rt-grant-button"));
+        GtkWidget* revoke_button = GTK_WIDGET(g_object_get_data(G_OBJECT(button), "rt-revoke-button"));
+        update_direct_rt_permission_controls(status_label, grant_button, revoke_button);
+        show_runtime_message(GTK_WINDOW(self->window_), "Direct RT permission", result,
+                             result.find("failed") == std::string::npos ? GTK_MESSAGE_INFO : GTK_MESSAGE_WARNING);
     }), this);
 
     gtk_widget_show_all(dialog);
@@ -9670,23 +10070,22 @@ void GtkPlayerWindow::open_settings_dialog() {
             playlist_search_enabled_ = playlist_search_requested;
             apply_playlist_search_ui_state();
         }
-        const bool playlist_field_width_limit_requested =
-            gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(playlist_field_width_check)) != 0;
-        const int playlist_field_width_chars_requested = std::max(
-            kMinPlaylistFieldWidthChars,
-            std::min(kMaxPlaylistFieldWidthChars,
-                     gtk_spin_button_get_value_as_int(
-                         GTK_SPIN_BUTTON(playlist_field_width_spin))));
-        if (playlist_field_width_limit_requested != playlist_field_width_limit_enabled_ ||
-            playlist_field_width_chars_requested != playlist_field_width_chars_) {
-            playlist_field_width_limit_enabled_ = playlist_field_width_limit_requested;
-            playlist_field_width_chars_ = playlist_field_width_chars_requested;
-            apply_playlist_field_width_limit(true);
+        const bool remember_playlist_column_widths_requested =
+            gtk_toggle_button_get_active(
+                GTK_TOGGLE_BUTTON(playlist_column_widths_check)) != 0;
+        if (remember_playlist_column_widths_requested !=
+            playlist_column_widths_remember_enabled_) {
+            const bool have_remembered_playlist_column_widths =
+                std::any_of(runtime_playlist_column_widths_.begin(),
+                            runtime_playlist_column_widths_.end(),
+                            [](int width) { return width > 0; });
+            const bool capture_current_widths =
+                remember_playlist_column_widths_requested &&
+                !have_remembered_playlist_column_widths;
+            playlist_column_widths_remember_enabled_ =
+                remember_playlist_column_widths_requested;
+            apply_playlist_column_width_memory(capture_current_widths);
         }
-        playlist_rows_at_startup_ = std::max(
-            kMinPlaylistRows,
-            std::min(kMaxPlaylistRows,
-                     gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(playlist_rows_spin))));
         const bool restore_sources_requested =
             gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(restore_sources_check)) != 0;
         const bool restore_active_track_requested =
@@ -9721,6 +10120,8 @@ void GtkPlayerWindow::open_settings_dialog() {
         log_errors_only_ = gtk_combo_box_get_active(GTK_COMBO_BOX(log_mode_combo)) == 1;
         log_path_ = gtk_entry_get_text(GTK_ENTRY(log_path_entry));
         Logger::instance().configure(logging_enabled_, log_path_, log_errors_only_);
+        request_window_geometry_checkpoint();
+        request_playlist_column_widths_checkpoint();
         save_preferences();
         refresh_device_list();
             refresh_display();
@@ -9743,6 +10144,7 @@ void GtkPlayerWindow::open_about_dialog() {
     GtkWidget* dialog = gtk_dialog_new_with_buttons("About PCM Transport",
                                                     GTK_WINDOW(window_),
                                                     GTK_DIALOG_MODAL,
+                                                    NULL,
                                                     NULL);
     const PcmDialogLayout layout = create_pcm_dialog_layout(
         dialog, PcmDialogLayoutMode::Compact);
@@ -9768,14 +10170,14 @@ void GtkPlayerWindow::open_about_dialog() {
     }
 
     GtkWidget* title = gtk_label_new(nullptr);
-    gtk_label_set_markup(GTK_LABEL(title), "<b>PCM Transport 0.9.114</b>");
+    gtk_label_set_markup(GTK_LABEL(title), "<b>PCM Transport 0.9.115</b>");
     gtk_label_set_xalign(GTK_LABEL(title), 0.5f);
     GtkWidget* subtitle = gtk_label_new("Digital Audio Player");
     gtk_label_set_xalign(GTK_LABEL(subtitle), 0.5f);
 
     GtkWidget* author = gtk_label_new(nullptr);
     gtk_label_set_markup(GTK_LABEL(author),
-                         "Author:\n<a href=\"https://github.com/andreyberestov\">Andrey Berestov</a>\n"
+                         "Author and Maintainer:\n<a href=\"https://github.com/andreyberestov\">Andrey Berestov</a>\n"
                          "andrey.berestov@gmail.com");
     gtk_label_set_xalign(GTK_LABEL(author), 0.5f);
     gtk_label_set_justify(GTK_LABEL(author), GTK_JUSTIFY_CENTER);
@@ -9801,12 +10203,15 @@ void GtkPlayerWindow::open_about_dialog() {
     gtk_label_set_max_width_chars(GTK_LABEL(contributors), 64);
 
     GtkWidget* details = gtk_label_new(
-        "License: GNU GPL v3\n"
-        "Technologies: C++17, GTK3, Cairo, ALSA, libFLAC, FFmpeg libraries,\n"
-        "FFmpeg resampling (SoXr when available), CUE parsing, MPRIS");
+        "License: GNU GPL v3.0 only\n"
+        "Third-party components are distributed under their respective licenses; "
+        "see THIRD_PARTY_NOTICES.md.\n"
+        "Built with: C++17, GTK 3, Cairo, ALSA, libFLAC, FFmpeg libraries");
     gtk_label_set_xalign(GTK_LABEL(details), 0.5f);
     gtk_label_set_justify(GTK_LABEL(details), GTK_JUSTIFY_CENTER);
     gtk_label_set_line_wrap(GTK_LABEL(details), TRUE);
+    gtk_label_set_line_wrap_mode(GTK_LABEL(details), PANGO_WRAP_WORD_CHAR);
+    gtk_label_set_max_width_chars(GTK_LABEL(details), 64);
 
     GtkWidget* runtime_environment = gtk_label_new(nullptr);
     set_runtime_environment_label(runtime_environment, "checking...");
@@ -9842,6 +10247,7 @@ void GtkPlayerWindow::open_about_dialog() {
             GtkWidget* msg = gtk_dialog_new_with_buttons("Donate",
                                                          GTK_WINDOW(dialog),
                                                          GTK_DIALOG_MODAL,
+                                                         NULL,
                                                          NULL);
             const PcmDialogLayout message_layout = create_pcm_dialog_layout(
                 msg, PcmDialogLayoutMode::Compact);
@@ -9868,16 +10274,17 @@ void GtkPlayerWindow::open_about_dialog() {
             continue;
         }
         if (response == RESPONSE_LICENSE) {
-            GtkWidget* msg = gtk_dialog_new_with_buttons("GNU GPL v3",
+            GtkWidget* msg = gtk_dialog_new_with_buttons("GNU GPL v3.0 only",
                                                          GTK_WINDOW(dialog),
                                                          GTK_DIALOG_MODAL,
+                                                         NULL,
                                                          NULL);
             const PcmDialogLayout message_layout = create_pcm_dialog_layout(
                 msg, PcmDialogLayoutMode::Expandable);
+            gtk_window_set_default_size(GTK_WINDOW(msg), 760, 480);
             add_pcm_dialog_button(msg, message_layout.footer, "_Close", GTK_RESPONSE_CLOSE);
             GtkWidget* area = message_layout.content;
             GtkWidget* scroll = gtk_scrolled_window_new(nullptr, nullptr);
-            gtk_widget_set_size_request(scroll, 760, 420);
             gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
             GtkWidget* view = gtk_text_view_new();
             gtk_text_view_set_editable(GTK_TEXT_VIEW(view), FALSE);
@@ -9927,8 +10334,29 @@ void GtkPlayerWindow::stop_bitperfect_test_worker() {
     if (bitperfect_test_cancel_ != nullptr) {
         bitperfect_test_cancel_->store(true, std::memory_order_relaxed);
     }
+
+    GSubprocess* active_subprocess = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(bitperfect_subprocess_mutex_);
+        if (bitperfect_subprocess_ != nullptr) {
+            active_subprocess = G_SUBPROCESS(g_object_ref(bitperfect_subprocess_));
+        }
+    }
+    if (active_subprocess != nullptr) {
+        g_subprocess_force_exit(active_subprocess);
+        g_object_unref(active_subprocess);
+    }
+
     if (bitperfect_test_worker_.joinable()) {
         bitperfect_test_worker_.join();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(bitperfect_subprocess_mutex_);
+        if (bitperfect_subprocess_ != nullptr) {
+            g_object_unref(bitperfect_subprocess_);
+            bitperfect_subprocess_ = nullptr;
+        }
     }
     bitperfect_test_cancel_.reset();
 }
@@ -9938,6 +10366,7 @@ void GtkPlayerWindow::open_bitperfect_test_dialog(GtkWidget* parent_dialog, int 
         GtkWidget* ask = gtk_dialog_new_with_buttons("FLAC bit-perfect test",
                                                      GTK_WINDOW(parent_dialog),
                                                      GTK_DIALOG_MODAL,
+                                                     NULL,
                                                      NULL);
         const PcmDialogLayout question_layout = create_pcm_dialog_layout(
             ask, PcmDialogLayoutMode::Compact);
@@ -9956,9 +10385,11 @@ void GtkPlayerWindow::open_bitperfect_test_dialog(GtkWidget* parent_dialog, int 
     GtkWidget* dialog = gtk_dialog_new_with_buttons("FLAC bit-perfect test",
                                                     GTK_WINDOW(parent_dialog),
                                                     GTK_DIALOG_MODAL,
+                                                    NULL,
                                                     NULL);
     const PcmDialogLayout layout = create_pcm_dialog_layout(
         dialog, PcmDialogLayoutMode::Expandable);
+    gtk_window_set_default_size(GTK_WINDOW(dialog), 760, 520);
     GtkWidget* close_button = add_pcm_dialog_button(dialog,
                                                     layout.footer,
                                                     "_Close",
@@ -9968,7 +10399,6 @@ void GtkPlayerWindow::open_bitperfect_test_dialog(GtkWidget* parent_dialog, int 
     GtkWidget* area = layout.content;
 
     GtkWidget* box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
-    gtk_widget_set_size_request(box, 760, 420);
     gtk_box_pack_start(GTK_BOX(area), box, TRUE, TRUE, 0);
 
     GtkWidget* title = gtk_label_new(nullptr);
@@ -10016,6 +10446,7 @@ void GtkPlayerWindow::open_bitperfect_test_dialog(GtkWidget* parent_dialog, int 
     bitperfect_test_cancel_ = std::make_shared<std::atomic<bool>>(false);
     const std::shared_ptr<std::atomic<bool>> cancel_requested = bitperfect_test_cancel_;
     bitperfect_test_worker_ = std::thread([
+        this,
         duration_seconds,
         soft_volume,
         bass_db,
@@ -10034,22 +10465,98 @@ void GtkPlayerWindow::open_bitperfect_test_dialog(GtkWidget* parent_dialog, int 
         close_button,
         cancel_requested]() {
         std::string tmp_dir;
-        auto cleanup = [&]() {
-            if (!tmp_dir.empty()) {
-                const std::string cmd = std::string("rm -rf -- ") + shell_quote(tmp_dir);
-                std::system(cmd.c_str());
-            }
-        };
+        std::string source_wav;
+        std::string test_flac;
+        std::string reference_wav;
         const auto cancelled = [&cancel_requested]() {
             return cancel_requested != nullptr &&
                    cancel_requested->load(std::memory_order_relaxed);
+        };
+        const auto cleanup = [&]() {
+            if (!reference_wav.empty()) {
+                std::remove(reference_wav.c_str());
+            }
+            if (!test_flac.empty()) {
+                std::remove(test_flac.c_str());
+            }
+            if (!source_wav.empty()) {
+                std::remove(source_wav.c_str());
+            }
+            if (!tmp_dir.empty()) {
+                rmdir(tmp_dir.c_str());
+            }
+        };
+        const auto run_flac = [this, &cancelled](const std::vector<std::string>& args,
+                                                  const char* failure_message) {
+            std::vector<const gchar*> argv;
+            argv.reserve(args.size() + 1);
+            for (const std::string& arg : args) {
+                argv.push_back(arg.c_str());
+            }
+            argv.push_back(nullptr);
+
+            GError* spawn_error = nullptr;
+            GSubprocess* process = g_subprocess_newv(argv.data(),
+                                                     G_SUBPROCESS_FLAGS_NONE,
+                                                     &spawn_error);
+            if (process == nullptr) {
+                const std::string message = spawn_error != nullptr && spawn_error->message != nullptr
+                    ? spawn_error->message
+                    : "spawn failed";
+                if (spawn_error != nullptr) {
+                    g_error_free(spawn_error);
+                }
+                throw std::runtime_error(std::string(failure_message) + ": " + message);
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(bitperfect_subprocess_mutex_);
+                if (bitperfect_subprocess_ != nullptr) {
+                    g_object_unref(process);
+                    throw std::runtime_error("FLAC diagnostic subprocess state is already active");
+                }
+                bitperfect_subprocess_ = G_SUBPROCESS(g_object_ref(process));
+            }
+
+            if (cancelled()) {
+                g_subprocess_force_exit(process);
+            }
+
+            GError* wait_error = nullptr;
+            const gboolean ok = g_subprocess_wait_check(process, nullptr, &wait_error);
+            {
+                std::lock_guard<std::mutex> lock(bitperfect_subprocess_mutex_);
+                if (bitperfect_subprocess_ == process) {
+                    g_object_unref(bitperfect_subprocess_);
+                    bitperfect_subprocess_ = nullptr;
+                }
+            }
+            g_object_unref(process);
+
+            if (ok) {
+                if (wait_error != nullptr) {
+                    g_error_free(wait_error);
+                }
+                return true;
+            }
+
+            const std::string message = wait_error != nullptr && wait_error->message != nullptr
+                ? wait_error->message
+                : "command failed";
+            if (wait_error != nullptr) {
+                g_error_free(wait_error);
+            }
+            if (cancelled()) {
+                return false;
+            }
+            throw std::runtime_error(std::string(failure_message) + ": " + message);
         };
         try {
             if (cancelled()) {
                 return;
             }
             post_diagnostics_update(text_view, progress, close_button,
-                "PCM Transport FLAC bit-perfect test\nVersion: 0.9.114\nMode: current player processing path before ALSA\nFFmpeg libraries: not used\n", 0.02, false);
+                "PCM Transport FLAC bit-perfect test\nVersion: 0.9.115\nMode: current player processing path before ALSA\nFFmpeg libraries: not used\n", 0.02, false);
             std::ostringstream ctx;
             ctx << "Duration: " << duration_seconds << " sec\n"
                 << "Generated signal: deterministic 16-bit / 44.1 kHz / stereo stress pattern\n"
@@ -10068,9 +10575,9 @@ void GtkPlayerWindow::open_bitperfect_test_dialog(GtkWidget* parent_dialog, int 
             char* made = g_mkdtemp(tmpl);
             if (made == nullptr) throw std::runtime_error(std::string("Cannot create temp directory: ") + std::strerror(errno));
             tmp_dir = made;
-            const std::string source_wav = tmp_dir + "/source.wav";
-            const std::string test_flac = tmp_dir + "/source.flac";
-            const std::string reference_wav = tmp_dir + "/reference.wav";
+            source_wav = tmp_dir + "/source.wav";
+            test_flac = tmp_dir + "/source.flac";
+            reference_wav = tmp_dir + "/reference.wav";
 
             post_diagnostics_update(text_view, progress, close_button, "Generating deterministic WAV...\n", 0.12, false);
             if (!write_test_wav(source_wav, duration_seconds, cancel_requested.get()) ||
@@ -10080,20 +10587,29 @@ void GtkPlayerWindow::open_bitperfect_test_dialog(GtkWidget* parent_dialog, int 
             }
 
             gchar* flac_cli = g_find_program_in_path("flac");
-            if (flac_cli == nullptr) throw std::runtime_error("External flac CLI was not found in PATH");
+            if (flac_cli == nullptr) {
+                throw std::runtime_error("External flac CLI was not found in PATH");
+            }
+            const std::string flac_cli_path = flac_cli;
             g_free(flac_cli);
 
             post_diagnostics_update(text_view, progress, close_button, "Encoding WAV to FLAC using flac CLI...\n", 0.25, false);
-            std::string cmd = "flac -f -s " + shell_quote(source_wav) + " -o " + shell_quote(test_flac);
-            if (std::system(cmd.c_str()) != 0) throw std::runtime_error("flac CLI encode failed");
+            if (!run_flac({flac_cli_path, "-f", "-s", "-o", test_flac, source_wav},
+                          "flac CLI encode failed")) {
+                cleanup();
+                return;
+            }
             if (cancelled()) {
                 cleanup();
                 return;
             }
 
-            post_diagnostics_update(text_view, progress, close_button, "Decoding reference using flac -d -c...\n", 0.42, false);
-            cmd = "flac -d -c -s " + shell_quote(test_flac) + " > " + shell_quote(reference_wav);
-            if (std::system(cmd.c_str()) != 0) throw std::runtime_error("flac CLI reference decode failed");
+            post_diagnostics_update(text_view, progress, close_button, "Decoding reference using flac CLI...\n", 0.42, false);
+            if (!run_flac({flac_cli_path, "-d", "-f", "-s", "-o", reference_wav, test_flac},
+                          "flac CLI reference decode failed")) {
+                cleanup();
+                return;
+            }
             if (cancelled()) {
                 cleanup();
                 return;
@@ -10157,6 +10673,7 @@ void GtkPlayerWindow::open_eq_dialog() {
     GtkWidget* dialog = gtk_dialog_new_with_buttons("DSP Studio",
                                                     GTK_WINDOW(window_),
                                                     GTK_DIALOG_MODAL,
+                                                    NULL,
                                                     NULL);
     const PcmDialogLayout layout = create_pcm_dialog_layout(
         dialog, PcmDialogLayoutMode::Expandable);
@@ -11237,7 +11754,7 @@ void GtkPlayerWindow::open_alsamixer_for_current_device() {
     const std::string mixer_cmd = card >= 0 ? ("alsamixer -c " + std::to_string(card)) : std::string("alsamixer");
 
     GError* error = nullptr;
-    std::string command = "xfce4-terminal --command=" + shell_escape_cmd(mixer_cmd);
+    std::string command = "xfce4-terminal --command=" + shell_quote_argument(mixer_cmd);
     if (!g_spawn_command_line_async(command.c_str(), &error)) {
         if (error != nullptr) {
             g_error_free(error);
@@ -11502,6 +12019,15 @@ void GtkPlayerWindow::update_playlist_sort_headers() {
                 label,
                 available ? nullptr : "Sorting is unavailable while search is active");
         }
+    }
+
+    // The sort indicator is part of the GTK-owned header button and can change
+    // its themed minimum width. Keep the track column above that minimum so a
+    // narrow user size remains valid when the indicator appears or disappears.
+    if (playlist_track_column_ != nullptr) {
+        gtk_tree_view_column_set_min_width(
+            playlist_track_column_,
+            playlist_column_header_min_width(playlist_track_column_));
     }
 }
 
@@ -11801,308 +12327,196 @@ void GtkPlayerWindow::rebuild_playlist_view(bool reset_column_widths) {
         search_controller_->is_filter_active()) {
         sync_playlist_selection_to_filter();
     }
-    if (playlist_field_width_limit_enabled_) {
-        apply_playlist_field_width_limit(reset_column_widths);
+    if (playlist_column_widths_remember_enabled_) {
+        apply_playlist_column_width_memory(false);
     } else if (reset_column_widths) {
         reset_playlist_column_widths();
     }
 }
 
-void GtkPlayerWindow::sync_playlist_field_renderer_binding() {
-    const bool use_cell_data = playlist_field_width_limit_enabled_;
-    if (playlist_field_cell_data_active_ == use_cell_data) {
-        return;
-    }
-
-    const std::array<GtkCellRenderer*, 4> renderers = {{
-        playlist_artist_renderer_,
-        playlist_title_renderer_,
-        playlist_album_renderer_,
-        playlist_source_renderer_
-    }};
-    const std::array<GtkTreeViewColumn*, 4> columns = {{
+void GtkPlayerWindow::capture_current_playlist_column_widths() {
+    const std::array<GtkTreeViewColumn*, 5> columns = {{
+        playlist_track_column_,
         playlist_artist_column_,
         playlist_title_column_,
         playlist_album_column_,
         playlist_source_column_
-    }};
-    const std::array<int, 4> model_columns = {{
-        COL_ARTIST,
-        COL_TITLE,
-        COL_ALBUM,
-        COL_SOURCE
     }};
 
     for (std::size_t index = 0; index < columns.size(); ++index) {
         GtkTreeViewColumn* column = columns[index];
-        GtkCellRenderer* renderer = renderers[index];
-        if (column == nullptr || renderer == nullptr) {
+        if (column == nullptr) {
             continue;
         }
 
-        // The normal model attribute and the limited presentation callback are
-        // two alternative renderer bindings. Keep them mutually exclusive so
-        // changing the setting on an already realized TreeView takes effect
-        // immediately without rebuilding the playlist model.
-        gtk_tree_view_column_set_cell_data_func(column, renderer, nullptr, nullptr, nullptr);
-        gtk_tree_view_column_clear_attributes(column, renderer);
-        if (use_cell_data) {
-            gtk_tree_view_column_set_cell_data_func(
-                column,
-                renderer,
-                GtkPlayerWindow::on_playlist_field_cell_data,
-                this,
-                nullptr);
-        } else {
-            gtk_tree_view_column_add_attribute(
-                column, renderer, "text", model_columns[index]);
+        int width = gtk_tree_view_column_get_width(column);
+        if (width <= 0) {
+            width = gtk_tree_view_column_get_fixed_width(column);
         }
-        gtk_tree_view_column_queue_resize(column);
+        if (width <= 0) {
+            continue;
+        }
+        if (column == playlist_track_column_) {
+            width = std::max(width, playlist_column_header_min_width(column));
+        }
+        runtime_playlist_column_widths_[index] = width;
     }
-
-    playlist_field_cell_data_active_ = use_cell_data;
+    update_playlist_column_widths_dirty_state();
 }
 
-void GtkPlayerWindow::apply_playlist_field_width_limit(bool reset_column_widths) {
-    const int user_limit_chars = std::max(
-        kMinPlaylistFieldWidthChars,
-        std::min(kMaxPlaylistFieldWidthChars, playlist_field_width_chars_));
+void GtkPlayerWindow::remember_resized_playlist_column(GtkTreeViewColumn* column) {
+    if (!playlist_column_widths_remember_enabled_ ||
+        playlist_column_widths_applying_ || column == nullptr) {
+        return;
+    }
 
-    const std::array<GtkCellRenderer*, 4> renderers = {{
-        playlist_artist_renderer_,
-        playlist_title_renderer_,
-        playlist_album_renderer_,
-        playlist_source_renderer_
-    }};
-    const std::array<GtkTreeViewColumn*, 4> columns = {{
+    const std::array<GtkTreeViewColumn*, 5> columns = {{
+        playlist_track_column_,
         playlist_artist_column_,
         playlist_title_column_,
         playlist_album_column_,
         playlist_source_column_
     }};
 
-    sync_playlist_field_renderer_binding();
+    std::size_t slot = columns.size();
+    for (std::size_t index = 0; index < columns.size(); ++index) {
+        if (columns[index] == column) {
+            slot = index;
+            break;
+        }
+    }
+    if (slot >= columns.size()) {
+        return;
+    }
 
-    const auto set_renderer_presentation = [](GtkCellRenderer* renderer,
-                                              PangoEllipsizeMode ellipsize) {
+    int width = gtk_tree_view_column_get_fixed_width(column);
+    if (width <= 0) {
+        width = gtk_tree_view_column_get_width(column);
+    }
+    if (width <= 0) {
+        return;
+    }
+    if (column == playlist_track_column_) {
+        width = std::max(width, playlist_column_header_min_width(column));
+    }
+
+    // User resizing updates GtkTreeViewColumn::fixed-width. Lock that real
+    // column to the new width and keep all columns independent from viewport
+    // expansion while the remember mode is active.
+    playlist_column_widths_applying_ = true;
+    gtk_tree_view_column_set_expand(column, FALSE);
+    gtk_tree_view_column_set_sizing(column, GTK_TREE_VIEW_COLUMN_FIXED);
+    gtk_tree_view_column_set_fixed_width(column, width);
+    playlist_column_widths_applying_ = false;
+
+    if (runtime_playlist_column_widths_[slot] == width) {
+        return;
+    }
+    runtime_playlist_column_widths_[slot] = width;
+    update_playlist_column_widths_dirty_state();
+}
+
+void GtkPlayerWindow::update_playlist_column_widths_dirty_state() {
+    playlist_column_widths_dirty_ =
+        runtime_playlist_column_widths_ != saved_playlist_column_widths_;
+}
+
+void GtkPlayerWindow::request_playlist_column_widths_checkpoint() {
+    playlist_column_widths_checkpoint_pending_ = true;
+}
+
+void GtkPlayerWindow::commit_playlist_column_widths_checkpoint() {
+    if (!playlist_column_widths_checkpoint_pending_) {
+        return;
+    }
+    playlist_column_widths_checkpoint_pending_ = false;
+    if (!playlist_column_widths_dirty_) {
+        return;
+    }
+
+    saved_playlist_column_widths_ = runtime_playlist_column_widths_;
+    playlist_column_widths_dirty_ = false;
+}
+
+void GtkPlayerWindow::apply_playlist_column_width_memory(bool capture_current_widths) {
+    const std::array<GtkCellRenderer*, 5> renderers = {{
+        playlist_track_renderer_,
+        playlist_artist_renderer_,
+        playlist_title_renderer_,
+        playlist_album_renderer_,
+        playlist_source_renderer_
+    }};
+    const std::array<GtkTreeViewColumn*, 5> columns = {{
+        playlist_track_column_,
+        playlist_artist_column_,
+        playlist_title_column_,
+        playlist_album_column_,
+        playlist_source_column_
+    }};
+
+    if (playlist_track_column_ != nullptr) {
+        gtk_tree_view_column_set_min_width(
+            playlist_track_column_,
+            playlist_column_header_min_width(playlist_track_column_));
+    }
+
+    if (!playlist_column_widths_remember_enabled_) {
+        for (GtkCellRenderer* renderer : renderers) {
+            if (renderer != nullptr) {
+                g_object_set(renderer,
+                             "ellipsize", PANGO_ELLIPSIZE_NONE,
+                             nullptr);
+            }
+        }
+        reset_playlist_column_widths();
+        return;
+    }
+
+    if (capture_current_widths) {
+        capture_current_playlist_column_widths();
+    }
+
+    playlist_column_widths_applying_ = true;
+    for (GtkCellRenderer* renderer : renderers) {
         if (renderer != nullptr) {
             g_object_set(renderer,
-                         "width-chars", -1,
-                         "max-width-chars", -1,
-                         "ellipsize", ellipsize,
+                         "ellipsize", PANGO_ELLIPSIZE_END,
                          nullptr);
         }
-    };
-
-    if (!playlist_field_width_limit_enabled_) {
-        playlist_field_width_initial_caps_.fill(-1);
-        for (GtkCellRenderer* renderer : renderers) {
-            set_renderer_presentation(renderer, PANGO_ELLIPSIZE_NONE);
-        }
-        if (playlist_field_width_spacer_column_ != nullptr) {
-            gtk_tree_view_column_set_visible(playlist_field_width_spacer_column_, FALSE);
-            gtk_tree_view_column_set_expand(playlist_field_width_spacer_column_, FALSE);
-        }
-        if (reset_column_widths) {
-            reset_playlist_column_widths();
-        }
-        return;
     }
 
-    // Limiting is a presentation rule only. Full strings stay in the model for
-    // search, sorting, metadata, MPRIS and playback. The cell-data function
-    // enables ellipsis only for an actually limited column or after an explicit
-    // user resize; fields already within the configured limit therefore retain
-    // the same natural GTK sizing as the normal layout.
-    for (GtkCellRenderer* renderer : renderers) {
-        set_renderer_presentation(renderer, PANGO_ELLIPSIZE_NONE);
-    }
-
-    std::array<int, 4> longest_chars = {{6, 5, 5, 6}}; // Header text lengths.
-    const auto display_chars = [](const std::string& value) {
-        const std::string display = safe_utf8_for_display(value);
-        const glong length = g_utf8_strlen(display.c_str(), -1);
-        return length > 0
-            ? static_cast<int>(std::min<glong>(length, std::numeric_limits<int>::max()))
-            : 0;
-    };
-    for (const PlaylistEntry& entry : playlist_) {
-        longest_chars[0] = std::max(longest_chars[0], display_chars(entry.performer));
-        int title_chars = display_chars(entry.title);
-        if (entry.metadata_state == MetadataState::Failed) {
-            title_chars += 14; // " [unavailable]"
-        }
-        longest_chars[1] = std::max(longest_chars[1], title_chars);
-        longest_chars[2] = std::max(longest_chars[2], display_chars(entry.album));
-        longest_chars[3] = std::max(longest_chars[3], display_chars(entry.source_label));
-    }
-
-    std::array<bool, 4> limited = {{false, false, false, false}};
-    bool any_limited = false;
-    for (std::size_t index = 0; index < limited.size(); ++index) {
-        limited[index] = longest_chars[index] > user_limit_chars;
-        any_limited = any_limited || limited[index];
-    }
-
-    const bool use_spacer = any_limited && playlist_field_width_spacer_column_ != nullptr;
-    if (playlist_field_width_spacer_column_ != nullptr) {
-        if (use_spacer) {
-            // A hidden TreeView column can report a zero preferred width for
-            // its GTK-owned header button. Restore normal sizing before making
-            // the spacer visible, then measure the realized theme geometry and
-            // only afterwards lock the spacer to a safe minimum width. This
-            // avoids a transient 6 px fixed allocation during live OFF -> ON.
-            gtk_tree_view_column_set_expand(playlist_field_width_spacer_column_, FALSE);
-            gtk_tree_view_column_set_sizing(
-                playlist_field_width_spacer_column_, GTK_TREE_VIEW_COLUMN_GROW_ONLY);
-            gtk_tree_view_column_set_fixed_width(playlist_field_width_spacer_column_, -1);
-            gtk_tree_view_column_set_min_width(
-                playlist_field_width_spacer_column_, kPlaylistFieldWidthSpacerMinPixels);
-            gtk_tree_view_column_set_visible(playlist_field_width_spacer_column_, TRUE);
-
-            const int spacer_min_width = playlist_field_width_spacer_min_width(
-                playlist_field_width_spacer_column_);
-            gtk_tree_view_column_set_sizing(
-                playlist_field_width_spacer_column_, GTK_TREE_VIEW_COLUMN_FIXED);
-            gtk_tree_view_column_set_fixed_width(
-                playlist_field_width_spacer_column_, spacer_min_width);
-            gtk_tree_view_column_set_min_width(
-                playlist_field_width_spacer_column_, spacer_min_width);
-            gtk_tree_view_column_set_expand(playlist_field_width_spacer_column_, TRUE);
-        } else {
-            gtk_tree_view_column_set_visible(playlist_field_width_spacer_column_, FALSE);
-            gtk_tree_view_column_set_expand(playlist_field_width_spacer_column_, FALSE);
-        }
-        gtk_tree_view_column_queue_resize(playlist_field_width_spacer_column_);
-    }
-
-    // Sorting rebuilds the same model values and must preserve any manual
-    // column widths. A new/opened playlist or settings change explicitly
-    // requests a reset and establishes the configured initial geometry again.
-    if (!reset_column_widths) {
-        if (playlist_view_ != nullptr) {
-            gtk_widget_queue_draw(playlist_view_);
-            gtk_widget_queue_resize(playlist_view_);
-        }
-        return;
-    }
-
-    std::array<int, 4> initial_pixel_widths = {{-1, -1, -1, -1}};
-    if (playlist_view_ != nullptr) {
-        // Only columns that actually exceed the configured character limit need
-        // a custom initial width. Fields already within the limit stay on normal
-        // GTK GROW_ONLY sizing, exactly like the limit-off path. For a limited
-        // column, measure the complete GtkTreeViewColumn cell layout rather than
-        // a standalone PangoLayout so renderer padding and column cell geometry
-        // are included by GTK itself.
-        const auto measure_column_text = [this](GtkTreeViewColumn* column,
-                                                GtkCellRenderer* renderer,
-                                                const std::string& value) {
-            if (column == nullptr || renderer == nullptr || playlist_view_ == nullptr) {
-                return -1;
-            }
-
-            g_object_set(renderer,
-                         "text", value.c_str(),
-                         "ellipsize", PANGO_ELLIPSIZE_NONE,
-                         nullptr);
-            int width = 0;
-            gtk_tree_view_column_cell_get_size(
-                column, nullptr, nullptr, nullptr, &width, nullptr);
-            return std::max(0, width);
-        };
-
-        const auto presentation_for = [user_limit_chars](const std::string& value) {
-            return playlist_field_limited_presentation(value, user_limit_chars);
-        };
-
-        for (const PlaylistEntry& entry : playlist_) {
-            if (limited[0]) {
-                initial_pixel_widths[0] = std::max(
-                    initial_pixel_widths[0],
-                    measure_column_text(
-                        columns[0], renderers[0], presentation_for(entry.performer)));
-            }
-
-            if (limited[1]) {
-                std::string title = entry.title;
-                if (entry.metadata_state == MetadataState::Failed) {
-                    title += " [unavailable]";
-                }
-                initial_pixel_widths[1] = std::max(
-                    initial_pixel_widths[1],
-                    measure_column_text(columns[1], renderers[1], presentation_for(title)));
-            }
-
-            if (limited[2]) {
-                initial_pixel_widths[2] = std::max(
-                    initial_pixel_widths[2],
-                    measure_column_text(
-                        columns[2], renderers[2], presentation_for(entry.album)));
-            }
-
-            if (limited[3]) {
-                initial_pixel_widths[3] = std::max(
-                    initial_pixel_widths[3],
-                    measure_column_text(
-                        columns[3], renderers[3], presentation_for(entry.source_label)));
-            }
-        }
-    }
-
-    playlist_field_width_initial_caps_.fill(-1);
-    for (std::size_t index = 0; index < renderers.size(); ++index) {
-        GtkCellRenderer* renderer = renderers[index];
+    for (std::size_t index = 0; index < columns.size(); ++index) {
         GtkTreeViewColumn* column = columns[index];
-        if (renderer == nullptr || column == nullptr) {
+        if (column == nullptr) {
             continue;
         }
 
-        if (!limited[index]) {
-            // No value in this field exceeds the configured character limit.
-            // Leave sizing to GTK exactly as in the normal layout; the cell-data
-            // function will only enable ellipsis if the user later resizes the
-            // column explicitly (GTK records that action in fixed-width).
-            gtk_tree_view_column_set_sizing(column, GTK_TREE_VIEW_COLUMN_GROW_ONLY);
-            gtk_tree_view_column_set_fixed_width(column, -1);
-            gtk_tree_view_column_set_max_width(column, -1);
-            gtk_tree_view_column_set_expand(
-                column, !use_spacer && column == playlist_expand_column_ ? TRUE : FALSE);
-            gtk_tree_view_column_queue_resize(column);
-            continue;
+        gtk_tree_view_column_set_expand(column, FALSE);
+
+        int width = runtime_playlist_column_widths_[index];
+        if (column == playlist_track_column_ && width > 0) {
+            const int clamped_width =
+                std::max(width, playlist_column_header_min_width(column));
+            if (clamped_width != width) {
+                width = clamped_width;
+                runtime_playlist_column_widths_[index] = width;
+            }
         }
 
-        int requested_width = initial_pixel_widths[index];
-
-        // Preserve the same header padding and theme geometry as the normal
-        // TreeView path. The header button is a GTK-owned widget, so its natural
-        // width already includes the current theme's padding and sort-button
-        // decoration; no guessed pixel constant is required.
-        GtkWidget* header_button = gtk_tree_view_column_get_button(column);
-        if (header_button != nullptr) {
-            int header_minimum = 0;
-            int header_natural = 0;
-            gtk_widget_get_preferred_width(header_button, &header_minimum, &header_natural);
-            requested_width = std::max(requested_width, header_natural);
-        }
-
-        if (requested_width > 0) {
+        if (width > 0) {
             gtk_tree_view_column_set_sizing(column, GTK_TREE_VIEW_COLUMN_FIXED);
-            gtk_tree_view_column_set_fixed_width(column, requested_width);
-            gtk_tree_view_column_set_max_width(column, -1);
-            gtk_tree_view_column_set_expand(column, FALSE);
-            playlist_field_width_initial_caps_[index] = requested_width;
+            gtk_tree_view_column_set_fixed_width(column, width);
         } else {
-            // If GTK cannot measure the limited cell layout, preserve normal
-            // sizing rather than inventing a pixel width or truncating content.
+            // Missing or invalid persisted geometry falls back conservatively to
+            // GTK sizing for that column until the user resizes it. No content
+            // scan or synthetic pixel width is introduced.
             gtk_tree_view_column_set_sizing(column, GTK_TREE_VIEW_COLUMN_GROW_ONLY);
             gtk_tree_view_column_set_fixed_width(column, -1);
-            gtk_tree_view_column_set_max_width(column, -1);
-            gtk_tree_view_column_set_expand(
-                column, !use_spacer && column == playlist_expand_column_ ? TRUE : FALSE);
         }
         gtk_tree_view_column_queue_resize(column);
     }
+    playlist_column_widths_applying_ = false;
+    update_playlist_column_widths_dirty_state();
 
     if (playlist_scrolled_ != nullptr) {
         GtkAdjustment* adjustment =
@@ -12122,25 +12536,18 @@ void GtkPlayerWindow::reset_playlist_column_widths() {
         return;
     }
 
-    playlist_field_width_initial_caps_.fill(-1);
-
-    if (playlist_field_width_spacer_column_ != nullptr) {
-        gtk_tree_view_column_set_visible(playlist_field_width_spacer_column_, FALSE);
-        gtk_tree_view_column_set_expand(playlist_field_width_spacer_column_, FALSE);
-        gtk_tree_view_column_set_sizing(
-            playlist_field_width_spacer_column_, GTK_TREE_VIEW_COLUMN_GROW_ONLY);
-        gtk_tree_view_column_set_fixed_width(playlist_field_width_spacer_column_, -1);
-    }
-
+    playlist_column_widths_applying_ = true;
     GList* columns = gtk_tree_view_get_columns(GTK_TREE_VIEW(playlist_view_));
     for (GList* node = columns; node != nullptr; node = node->next) {
         GtkTreeViewColumn* column = GTK_TREE_VIEW_COLUMN(node->data);
         gtk_tree_view_column_set_sizing(column, GTK_TREE_VIEW_COLUMN_GROW_ONLY);
         gtk_tree_view_column_set_fixed_width(column, -1);
-        gtk_tree_view_column_set_expand(column, column == playlist_expand_column_ ? TRUE : FALSE);
+        gtk_tree_view_column_set_expand(
+            column, column == playlist_expand_column_ ? TRUE : FALSE);
         gtk_tree_view_column_queue_resize(column);
     }
     g_list_free(columns);
+    playlist_column_widths_applying_ = false;
 
     if (playlist_scrolled_ != nullptr) {
         GtkAdjustment* adjustment =
@@ -12847,6 +13254,9 @@ void GtkPlayerWindow::load_preferences() {
     runtime_last_active_track_ = LastActiveTrackLocator{};
     bool have_last_active_track_start_sample = false;
     bool have_last_active_track_cue_flag = false;
+    bool have_window_width = false;
+    bool have_window_height = false;
+    bool have_explicit_user_window_geometry = false;
     bool have_dsd_pcm_rules = false;
     std::string line;
     while (std::getline(parsed_preferences, line)) {
@@ -12858,11 +13268,25 @@ void GtkPlayerWindow::load_preferences() {
         const std::string value = line.substr(eq + 1);
         if (key == "last_open_directory") {
             last_open_directory_ = value;
-        } else if (key == "playlist_rows_at_startup") {
-            try { playlist_rows_at_startup_ = std::stoi(value); } catch (...) {}
-            playlist_rows_at_startup_ = std::max(
-                kMinPlaylistRows,
-                std::min(kMaxPlaylistRows, playlist_rows_at_startup_));
+        } else if (key == "window_geometry_user_defined") {
+            have_explicit_user_window_geometry =
+                (value == "1" || value == "true" || value == "yes");
+        } else if (key == "window_width") {
+            try {
+                const int width = std::stoi(value);
+                if (width > 0) {
+                    saved_window_width_ = width;
+                    have_window_width = true;
+                }
+            } catch (...) {}
+        } else if (key == "window_height") {
+            try {
+                const int height = std::stoi(value);
+                if (height > 0) {
+                    saved_window_height_ = height;
+                    have_window_height = true;
+                }
+            } catch (...) {}
         } else if (key == "restore_last_sources_enabled") {
             restore_last_sources_enabled_ = (value == "1" || value == "true" || value == "yes");
         } else if (key == "last_opened_source_b64") {
@@ -12920,18 +13344,34 @@ void GtkPlayerWindow::load_preferences() {
             progress_blink_enabled_ = (value == "1" || value == "true" || value == "yes");
         } else if (key == "playlist_search_enabled") {
             playlist_search_enabled_ = (value == "1" || value == "true" || value == "yes");
-        } else if (key == "playlist_field_width_limit_enabled") {
-            playlist_field_width_limit_enabled_ =
+        } else if (key == "playlist_remember_column_widths_enabled") {
+            playlist_column_widths_remember_enabled_ =
                 (value == "1" || value == "true" || value == "yes");
-        } else if (key == "playlist_field_width_chars") {
+        } else if (key == "playlist_column_width_track") {
             try {
-                playlist_field_width_chars_ = std::stoi(value);
-            } catch (...) {
-                playlist_field_width_chars_ = kDefaultPlaylistFieldWidthChars;
-            }
-            playlist_field_width_chars_ = std::max(
-                kMinPlaylistFieldWidthChars,
-                std::min(kMaxPlaylistFieldWidthChars, playlist_field_width_chars_));
+                const int width = std::stoi(value);
+                if (width > 0) saved_playlist_column_widths_[0] = width;
+            } catch (...) {}
+        } else if (key == "playlist_column_width_artist") {
+            try {
+                const int width = std::stoi(value);
+                if (width > 0) saved_playlist_column_widths_[1] = width;
+            } catch (...) {}
+        } else if (key == "playlist_column_width_title") {
+            try {
+                const int width = std::stoi(value);
+                if (width > 0) saved_playlist_column_widths_[2] = width;
+            } catch (...) {}
+        } else if (key == "playlist_column_width_album") {
+            try {
+                const int width = std::stoi(value);
+                if (width > 0) saved_playlist_column_widths_[3] = width;
+            } catch (...) {}
+        } else if (key == "playlist_column_width_source") {
+            try {
+                const int width = std::stoi(value);
+                if (width > 0) saved_playlist_column_widths_[4] = width;
+            } catch (...) {}
         } else if (key == "level_meter_enabled") {
             level_meter_enabled_ = (value == "1" || value == "true" || value == "yes");
         } else if (key == "clip_detection_enabled") {
@@ -12980,6 +13420,22 @@ void GtkPlayerWindow::load_preferences() {
             realtime_audio_priority_enabled_ = (value == "1" || value == "true" || value == "yes");
         }
     }
+    const bool complete_window_size = have_window_width && have_window_height;
+    saved_window_size_valid_ =
+        complete_window_size && have_explicit_user_window_geometry;
+    if (!saved_window_size_valid_) {
+        saved_window_width_ = 0;
+        saved_window_height_ = 0;
+    }
+    runtime_normal_window_width_ = saved_window_width_;
+    runtime_normal_window_height_ = saved_window_height_;
+    runtime_normal_window_size_valid_ = saved_window_size_valid_;
+    runtime_window_size_user_defined_ = saved_window_size_valid_;
+    window_geometry_dirty_ = false;
+    runtime_playlist_column_widths_ = saved_playlist_column_widths_;
+    playlist_column_widths_dirty_ = false;
+    playlist_column_widths_checkpoint_pending_ = false;
+
     if (!restore_last_sources_enabled_) {
         restore_last_active_track_enabled_ = false;
         last_opened_sources_.clear();
@@ -13031,7 +13487,11 @@ void GtkPlayerWindow::load_preferences() {
 std::string GtkPlayerWindow::serialize_preferences() const {
     std::ostringstream out;
     out << "last_open_directory=" << saved_last_open_directory_ << '\n';
-    out << "playlist_rows_at_startup=" << playlist_rows_at_startup_ << '\n';
+    if (saved_window_size_valid_) {
+        out << "window_geometry_user_defined=1\n";
+        out << "window_width=" << saved_window_width_ << '\n';
+        out << "window_height=" << saved_window_height_ << '\n';
+    }
     out << "restore_last_sources_enabled=" << (restore_last_sources_enabled_ ? 1 : 0) << '\n';
     out << "restore_last_active_track_enabled="
         << (restore_last_sources_enabled_ && restore_last_active_track_enabled_ ? 1 : 0)
@@ -13065,9 +13525,13 @@ std::string GtkPlayerWindow::serialize_preferences() const {
     out << "deep_bass_amount=" << deep_bass_amount_ << '\n';
     out << "progress_blink_enabled=" << (progress_blink_enabled_ ? 1 : 0) << '\n';
     out << "playlist_search_enabled=" << (playlist_search_enabled_ ? 1 : 0) << '\n';
-    out << "playlist_field_width_limit_enabled="
-        << (playlist_field_width_limit_enabled_ ? 1 : 0) << '\n';
-    out << "playlist_field_width_chars=" << playlist_field_width_chars_ << '\n';
+    out << "playlist_remember_column_widths_enabled="
+        << (playlist_column_widths_remember_enabled_ ? 1 : 0) << '\n';
+    out << "playlist_column_width_track=" << saved_playlist_column_widths_[0] << '\n';
+    out << "playlist_column_width_artist=" << saved_playlist_column_widths_[1] << '\n';
+    out << "playlist_column_width_title=" << saved_playlist_column_widths_[2] << '\n';
+    out << "playlist_column_width_album=" << saved_playlist_column_widths_[3] << '\n';
+    out << "playlist_column_width_source=" << saved_playlist_column_widths_[4] << '\n';
     out << "level_meter_enabled=" << (level_meter_enabled_ ? 1 : 0) << '\n';
     out << "clip_detection_enabled=" << (clip_detection_enabled_ ? 1 : 0) << '\n';
     out << "resample_rules=" << serialize_resample_rules(resample_rules_) << '\n';
@@ -13153,7 +13617,13 @@ void GtkPlayerWindow::save_preferences_now() {
         preferences_save_deferred_for_continuous_ = true;
         return;
     }
+    if (window_geometry_checkpoint_pending_ &&
+        playlist_search_window_resize_pending_ && !ui_closing_) {
+        return;
+    }
 
+    commit_window_geometry_checkpoint();
+    commit_playlist_column_widths_checkpoint();
     commit_recovery_checkpoint();
 
     const char* home = std::getenv("HOME");

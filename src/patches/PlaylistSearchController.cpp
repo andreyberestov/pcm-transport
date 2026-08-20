@@ -5,13 +5,12 @@
 
 #include <cstring>
 #include <string>
+#include <utility>
 
 #include <gtk/gtk.h>
 
 namespace pcmtp {
 namespace {
-
-constexpr guint kRefilterDebounceMs = 50;
 
 std::string utf8_casefold_copy(const std::string& text) {
     gchar* folded = g_utf8_casefold(text.c_str(), -1);
@@ -56,11 +55,20 @@ void PlaylistSearchController::install_in_panel(GtkBox* playlist_panel) {
     }
 
     search_changed_handler_id_ =
-        g_signal_connect(search_entry_, "changed", G_CALLBACK(PlaylistSearchController::on_search_changed), this);
-    search_key_press_handler_id_ = g_signal_connect(search_entry_,
-                                                    "key-press-event",
-                                                    G_CALLBACK(PlaylistSearchController::on_search_entry_key_press),
-                                                    this);
+        g_signal_connect(search_entry_,
+                         "search-changed",
+                         G_CALLBACK(PlaylistSearchController::on_search_changed),
+                         this);
+    search_activate_handler_id_ =
+        g_signal_connect(search_entry_,
+                         "activate",
+                         G_CALLBACK(PlaylistSearchController::on_search_entry_activate),
+                         this);
+    search_stop_handler_id_ =
+        g_signal_connect(search_entry_,
+                         "stop-search",
+                         G_CALLBACK(PlaylistSearchController::on_stop_search),
+                         this);
 }
 
 int PlaylistSearchController::search_entry_natural_height() const {
@@ -80,13 +88,6 @@ void PlaylistSearchController::set_search_entry_visible(bool visible) {
     gtk_widget_set_visible(search_entry_, visible ? TRUE : FALSE);
 }
 
-void PlaylistSearchController::cancel_pending_refilter() {
-    if (refilter_timeout_id_ != 0) {
-        g_source_remove(refilter_timeout_id_);
-        refilter_timeout_id_ = 0;
-    }
-}
-
 void PlaylistSearchController::set_search_text(const std::string& text) {
     if (search_entry_ == nullptr) {
         return;
@@ -100,14 +101,32 @@ void PlaylistSearchController::set_search_text(const std::string& text) {
     }
 }
 
-void PlaylistSearchController::update_filter_text(const std::string& text) {
-    const bool was_active = !filter_text_.empty();
+bool PlaylistSearchController::update_filter_text(const std::string& text) {
     std::string folded = utf8_casefold_copy(text);
+    if (folded == filter_text_) {
+        return false;
+    }
+
+    const bool was_active = !filter_text_.empty();
     const bool is_active = !folded.empty();
     if (!was_active && is_active) {
         delegate_.on_search_filter_started();
     }
-    filter_text_ = folded;
+    filter_text_ = std::move(folded);
+    return true;
+}
+
+void PlaylistSearchController::apply_search_text(const std::string& text) {
+    if (invalidated_ || !update_filter_text(text)) {
+        return;
+    }
+
+    refilter();
+    if (filter_text_.empty()) {
+        delegate_.on_search_filter_cleared();
+    } else {
+        delegate_.on_search_filtered();
+    }
 }
 
 void PlaylistSearchController::cancel_search() {
@@ -115,10 +134,9 @@ void PlaylistSearchController::cancel_search() {
         return;
     }
 
-    const bool needs_refilter = refilter_timeout_id_ != 0 || !filter_text_.empty();
-    cancel_pending_refilter();
-    filter_text_.clear();
+    const bool needs_refilter = !filter_text_.empty();
     set_search_text("");
+    filter_text_.clear();
     if (needs_refilter) {
         refilter();
         delegate_.on_search_filter_cleared();
@@ -137,115 +155,42 @@ void PlaylistSearchController::refilter() {
 }
 
 void PlaylistSearchController::flush_pending_refilter() {
-    if (invalidated_ || refilter_timeout_id_ == 0) {
+    if (invalidated_ || search_entry_ == nullptr) {
         return;
     }
-    cancel_pending_refilter();
-    refilter();
-    if (filter_text_.empty()) {
-        delegate_.on_search_filter_cleared();
-    } else {
-        delegate_.on_search_filtered();
-    }
-}
 
-void PlaylistSearchController::schedule_refilter() {
-    if (invalidated_) {
-        return;
-    }
-    cancel_pending_refilter();
-    refilter_timeout_id_ = g_timeout_add(kRefilterDebounceMs, PlaylistSearchController::on_refilter_timeout, this);
-}
-
-gboolean PlaylistSearchController::on_refilter_timeout(gpointer user_data) {
-    auto* self = static_cast<PlaylistSearchController*>(user_data);
-    if (self == nullptr || self->invalidated_) {
-        return G_SOURCE_REMOVE;
-    }
-    self->refilter_timeout_id_ = 0;
-    self->refilter();
-    if (self->filter_text_.empty()) {
-        self->delegate_.on_search_filter_cleared();
-    } else {
-        self->delegate_.on_search_filtered();
-    }
-    return G_SOURCE_REMOVE;
+    const gchar* text = gtk_entry_get_text(GTK_ENTRY(search_entry_));
+    apply_search_text(text != nullptr ? text : std::string());
 }
 
 gboolean PlaylistSearchController::on_playlist_key_press(GtkWidget* widget, GdkEventKey* event) {
-    if (event == nullptr || invalidated_ || delegate_.ui_closing()) {
+    if (event == nullptr || invalidated_ || delegate_.ui_closing() || search_entry_ == nullptr) {
         return FALSE;
     }
-    if (search_entry_ != nullptr && gtk_widget_is_focus(search_entry_)) {
-        return FALSE;
-    }
-
-    if (event->keyval == GDK_KEY_Escape) {
-        if (!filter_text_.empty()) {
-            cancel_search();
-            return TRUE;
-        }
+    if (gtk_widget_is_focus(search_entry_)) {
         return FALSE;
     }
 
-    if (event->keyval == GDK_KEY_Return || event->keyval == GDK_KEY_ISO_Enter || event->keyval == GDK_KEY_KP_Enter) {
+    // Track activation is an application command rather than search text
+    // handling. Keep the established behavior for Enter while the playlist
+    // has focus; GtkEntry::activate handles Enter when the entry has focus.
+    if (event->keyval == GDK_KEY_Return ||
+        event->keyval == GDK_KEY_ISO_Enter ||
+        event->keyval == GDK_KEY_KP_Enter) {
         delegate_.activate_filtered_playlist_selection();
         return TRUE;
     }
 
-    if (event->keyval == GDK_KEY_BackSpace) {
+    const bool had_search_text =
+        gtk_entry_get_text_length(GTK_ENTRY(search_entry_)) > 0;
+    const gboolean handled = gtk_search_entry_handle_event(
+        GTK_SEARCH_ENTRY(search_entry_),
+        reinterpret_cast<GdkEvent*>(event));
+    if (handled) {
         focus_search_entry();
-        if (search_entry_ == nullptr) {
-            return FALSE;
-        }
-        const gchar* text = gtk_entry_get_text(GTK_ENTRY(search_entry_));
-        if (text == nullptr || *text == '\0') {
-            return TRUE;
-        }
-        const char* end = text + std::strlen(text);
-        const char* prev = g_utf8_find_prev_char(text, end);
-        std::string next;
-        if (prev != nullptr) {
-            next.assign(text, static_cast<std::size_t>(prev - text));
-        }
-        set_search_text(next);
-        update_filter_text(next);
-        schedule_refilter();
         return TRUE;
     }
-
-    if ((event->state & (GDK_CONTROL_MASK | GDK_MOD1_MASK | GDK_SUPER_MASK)) != 0) {
-        return FALSE;
-    }
-
-    guint32 unicode = gdk_keyval_to_unicode(event->keyval);
-    if (unicode == 0 || !g_unichar_isprint(unicode)) {
-        return FALSE;
-    }
-
-    char buffer[8];
-    const gint written = g_unichar_to_utf8(unicode, buffer);
-    if (written <= 0) {
-        return FALSE;
-    }
-    buffer[written] = '\0';
-    focus_search_entry();
-    append_to_search_entry(buffer);
-    (void)widget;
-    return TRUE;
-}
-
-gboolean PlaylistSearchController::on_search_entry_key_press(GtkWidget* widget, GdkEventKey* event, gpointer user_data) {
-    auto* self = static_cast<PlaylistSearchController*>(user_data);
-    if (self == nullptr || event == nullptr || self->invalidated_) {
-        return FALSE;
-    }
-    if (event->keyval == GDK_KEY_Escape) {
-        self->cancel_search();
-        return TRUE;
-    }
-    if (event->keyval == GDK_KEY_Return || event->keyval == GDK_KEY_ISO_Enter || event->keyval == GDK_KEY_KP_Enter) {
-        self->delegate_.activate_filtered_playlist_selection();
+    if (event->keyval == GDK_KEY_Escape && had_search_text) {
         return TRUE;
     }
     (void)widget;
@@ -258,15 +203,18 @@ void PlaylistSearchController::invalidate() {
     }
 
     invalidated_ = true;
-    cancel_pending_refilter();
     if (search_entry_ != nullptr) {
         if (search_changed_handler_id_ != 0) {
             g_signal_handler_disconnect(search_entry_, search_changed_handler_id_);
             search_changed_handler_id_ = 0;
         }
-        if (search_key_press_handler_id_ != 0) {
-            g_signal_handler_disconnect(search_entry_, search_key_press_handler_id_);
-            search_key_press_handler_id_ = 0;
+        if (search_activate_handler_id_ != 0) {
+            g_signal_handler_disconnect(search_entry_, search_activate_handler_id_);
+            search_activate_handler_id_ = 0;
+        }
+        if (search_stop_handler_id_ != 0) {
+            g_signal_handler_disconnect(search_entry_, search_stop_handler_id_);
+            search_stop_handler_id_ = 0;
         }
     }
 }
@@ -287,17 +235,34 @@ void PlaylistSearchController::shutdown() {
     }
 }
 
-void PlaylistSearchController::on_search_changed(GtkEditable* editable, gpointer user_data) {
+void PlaylistSearchController::on_search_changed(GtkSearchEntry* entry, gpointer user_data) {
+    auto* self = static_cast<PlaylistSearchController*>(user_data);
+    if (self == nullptr || self->invalidated_ || entry == nullptr) {
+        return;
+    }
+    const gchar* text = gtk_entry_get_text(GTK_ENTRY(entry));
+    self->apply_search_text(text != nullptr ? text : std::string());
+}
+
+void PlaylistSearchController::on_search_entry_activate(GtkEntry*, gpointer user_data) {
+    auto* self = static_cast<PlaylistSearchController*>(user_data);
+    if (self == nullptr || self->invalidated_ || self->delegate_.ui_closing()) {
+        return;
+    }
+    self->delegate_.activate_filtered_playlist_selection();
+}
+
+void PlaylistSearchController::on_stop_search(GtkSearchEntry*, gpointer user_data) {
     auto* self = static_cast<PlaylistSearchController*>(user_data);
     if (self == nullptr || self->invalidated_) {
         return;
     }
-    const gchar* text = gtk_entry_get_text(GTK_ENTRY(editable));
-    self->update_filter_text(text != nullptr ? text : std::string());
-    self->schedule_refilter();
+    self->cancel_search();
 }
 
-gboolean PlaylistSearchController::on_filter_visible(GtkTreeModel* model, GtkTreeIter* iter, gpointer user_data) {
+gboolean PlaylistSearchController::on_filter_visible(GtkTreeModel* model,
+                                                      GtkTreeIter* iter,
+                                                      gpointer user_data) {
     auto* self = static_cast<PlaylistSearchController*>(user_data);
     if (self == nullptr || self->invalidated_ || self->filter_text_.empty()) {
         return TRUE;
@@ -320,19 +285,6 @@ void PlaylistSearchController::focus_search_entry() {
         return;
     }
     gtk_widget_grab_focus(search_entry_);
-}
-
-void PlaylistSearchController::append_to_search_entry(const char* text) {
-    if (search_entry_ == nullptr || text == nullptr || *text == '\0') {
-        return;
-    }
-    const gchar* current = gtk_entry_get_text(GTK_ENTRY(search_entry_));
-    std::string next = current != nullptr ? current : std::string();
-    next.append(text);
-    set_search_text(next);
-    update_filter_text(next);
-    schedule_refilter();
-    gtk_editable_set_position(GTK_EDITABLE(search_entry_), -1);
 }
 
 } // namespace pcmtp

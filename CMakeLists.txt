@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(pcm_transport VERSION 0.9.115 LANGUAGES C CXX)
+project(pcm_transport VERSION 0.9.116 LANGUAGES C CXX)
 
 include(GNUInstallDirs)
 
@@ -51,6 +51,15 @@ add_custom_command(
 )
 
 set_source_files_properties(${PCM_TRANSPORT_RESOURCE_SOURCE} PROPERTIES GENERATED TRUE)
+
+# glib-compile-resources emits large string literals for embedded binary data.
+# Suppress the ISO C99 guaranteed-length warning only for that generated source.
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    set_property(
+        SOURCE ${PCM_TRANSPORT_RESOURCE_SOURCE}
+        APPEND_STRING PROPERTY COMPILE_FLAGS " -Wno-overlength-strings"
+    )
+endif()
 
 set(PCM_TRANSPORT_PATCH_SOURCES
     src/patches/PlaylistSearchController.cpp

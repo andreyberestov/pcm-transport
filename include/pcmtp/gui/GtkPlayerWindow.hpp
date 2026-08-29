@@ -57,11 +57,6 @@ public:
         std::uint32_t to_rate = 0;
     };
 
-    struct BitDepthRule {
-        std::uint16_t from_bits = 0;
-        std::uint16_t to_bits = 0;
-    };
-
     struct DsdPcmRule {
         std::uint32_t dsd_sample_rate = 0;
         // Zero preserves FFmpeg's native DSD/8 PCM output rate.
@@ -122,7 +117,6 @@ private:
         bool lossless_source = false;
         bool resampled = false;
         std::uint32_t resampled_from_rate = 0;
-        bool bitdepth_converted = false;
         bool processed_by_ffmpeg = false;
         std::string codec_name;
         bool dsd_source = false;
@@ -184,9 +178,16 @@ private:
     };
 
     enum class PlaylistScrollPolicy {
+        NoExplicitScroll,
         PreserveViewport,
         EnsureVisible,
         Center
+    };
+
+    struct PlaylistViewportAnchor {
+        bool valid = false;
+        std::uint64_t entry_id = 0;
+        float row_align = 0.5f;
     };
 
     enum class PlaylistSortKey {
@@ -272,14 +273,9 @@ private:
     static void on_run_bitperfect_test_clicked(GtkButton* button, gpointer user_data);
     static gboolean on_progress_deadline(gpointer user_data);
     static gboolean on_meter_tick(gpointer user_data);
-    static gboolean on_playlist_vertical_position_restore_idle(gpointer user_data);
-    static void on_playlist_scrolled_size_allocate(GtkWidget* widget,
-                                                   GtkAllocation* allocation,
-                                                   gpointer user_data);
     static void on_playlist_column_fixed_width_notify(GObject* object,
                                                       GParamSpec* pspec,
                                                       gpointer user_data);
-    static gboolean on_playlist_search_window_resize_idle(gpointer user_data);
     static gboolean on_window_configure_event(GtkWidget* widget,
                                               GdkEventConfigure* event,
                                               gpointer user_data);
@@ -386,14 +382,16 @@ private:
         bool record_last_sources,
         const std::string& play_after_load_path,
         bool restore_saved_sources);
-    void finalize_loaded_playlist(bool rebuild_view = true);
+    void finalize_loaded_playlist(
+        bool rebuild_view = true,
+        PlaylistScrollPolicy scroll_policy = PlaylistScrollPolicy::EnsureVisible);
     void schedule_last_sources_restore();
     void remember_last_active_track(std::size_t index);
     void cancel_pending_last_active_track_restore();
+    void cancel_pending_last_active_track_restore_for_user_action();
     void prepare_last_active_track_restore(bool restore_saved_sources,
                                            bool replace_playlist);
-    void resolve_pending_last_active_track_restore();
-    void apply_last_active_track_restore_centering();
+    bool resolve_pending_last_active_track_restore();
     void commit_recovery_checkpoint();
     bool last_active_track_locator_matches(const PlaylistEntry& entry) const;
     void start_current_track(bool restart_if_paused = true);
@@ -471,8 +469,6 @@ private:
                                               bool truncate_active_chain);
     void begin_playlist_selection_sync();
     void end_playlist_selection_sync();
-    void rebuild_playlist_search_cache();
-    void clear_playlist_search_cache();
     void update_playlist_row(std::size_t index);
     bool select_playlist_row(std::size_t index,
                              PlaylistScrollPolicy scroll_policy = PlaylistScrollPolicy::EnsureVisible);
@@ -488,25 +484,23 @@ private:
     void begin_playlist_filter_session();
     void mark_playlist_filter_playback_committed(std::size_t index);
     void finish_playlist_filter_session();
-    bool capture_playlist_vertical_position(double* value) const;
-    void restore_playlist_vertical_position(double value);
-    void cancel_playlist_vertical_position_restore();
-    void select_first_filter_candidate();
+    bool capture_playlist_viewport_anchor(PlaylistViewportAnchor* anchor) const;
+    bool restore_playlist_viewport_anchor(const PlaylistViewportAnchor& anchor);
+    void restore_playlist_filter_view_state(const PlaylistViewportAnchor& anchor);
+    bool ensure_playlist_row_visible(std::size_t index);
+    void select_first_filter_candidate(PlaylistScrollPolicy scroll_policy = PlaylistScrollPolicy::PreserveViewport);
     void update_playlist_selection_from_ui();
     void update_selected_playlist_index_from_ui();
     void sync_playlist_cursor_to_selection();
-    void sync_playlist_selection_to_filter();
+    bool sync_playlist_selection_to_filter(PlaylistScrollPolicy scroll_policy = PlaylistScrollPolicy::PreserveViewport);
     void activate_filtered_playlist_selection();
+    void begin_playlist_filter_mpris_transaction();
+    void end_playlist_filter_mpris_transaction();
     void play_filtered_track_index(std::size_t index);
     void apply_playlist_search_handler_connections();
     void apply_playlist_search_ui_state();
-    void adjust_playlist_search_window_height(bool enabled,
-                                              int preserved_viewport_height = 0);
-    void account_playlist_search_window_resize_height(int window_height);
-    void cancel_playlist_search_window_resize();
-    void complete_playlist_search_window_resize();
+    void adjust_playlist_search_window_height(bool enabled);
     void queue_playlist_layout_reflow();
-    void schedule_playlist_search_window_resize();
     bool main_window_has_normal_size_state() const;
     void remember_normal_window_size(int width, int height);
     void update_window_geometry_dirty_state();
@@ -547,7 +541,6 @@ private:
     std::uint64_t current_track_position_from_status(const PlaybackStatusSnapshot& status) const;
     std::uint64_t current_track_position_from_transport(const PlaybackTransportSnapshot& transport) const;
     std::uint32_t target_sample_rate_for(std::uint32_t source_rate) const;
-    std::uint16_t target_bits_for(std::uint16_t source_bits) const;
     std::uint32_t dsd_target_sample_rate_for(std::uint32_t dsd_sample_rate,
                                              std::uint32_t ffmpeg_pcm_rate) const;
     std::uint32_t output_sample_rate_for_entry(const PlaylistEntry& entry) const;
@@ -561,23 +554,26 @@ private:
         std::uint64_t decoder_total_samples,
         const PlaylistEntry& entry) const;
     const ActiveTrackTransportState* active_track_transport_state() const;
-    std::uint16_t output_bits_for_entry(const PlaylistEntry& entry) const;
+    std::vector<std::uint16_t> output_precision_candidates_for_entry(
+        const PlaylistEntry& entry) const;
+    std::string output_precision_setting_for_entry(
+        const PlaylistEntry& entry) const;
     void reset_dsd_pcm_defaults();
     void refresh_entry_processing_metadata(PlaylistEntry& entry);
     void refresh_playlist_processing_metadata();
     void update_clip_indicator(bool clip_detected, std::uint32_t clipped_samples);
     int effective_pre_eq_headroom_tenths_db() const;
     int compute_auto_pre_eq_headroom_tenths_db() const;
-    void apply_auto_pre_eq_headroom(bool save_preferences_after = true);
+    void apply_soft_eq_with_auto_headroom();
+    void apply_soft_eq_profile_with_auto_headroom();
     void draw_tone_response_graph(cairo_t* cr, int width, int height) const;
     std::uint32_t current_tone_control_sample_rate() const;
     std::string processing_rules_report_for_entry(
         const PlaylistEntry& entry,
         const AudioFormat& active_output_format) const;
-    std::string processing_path_for_entry(
-        const PlaylistEntry& entry,
-        const AudioFormat& active_output_format) const;
-    std::string current_transport_processing_report() const;
+    std::string processing_path_for_entry(const PlaylistEntry& entry) const;
+    std::string current_decoder_processing_report() const;
+    std::string current_transport_report() const;
     void refresh_active_alsa_output_diagnostics();
     void refresh_stereo_tonal_dsp_controls(bool playing,
                                            std::uint16_t channels);
@@ -598,11 +594,13 @@ private:
     std::string current_mpris_track_id() const;
     MprisPlayerState build_mpris_state() const;
     void mpris_play();
-    bool mpris_advance_track(int direction);
+    bool mpris_advance_track(int direction, bool cancel_restore = true);
     bool mpris_open_uri(const std::string& uri);
     bool validate_mpris_file_uri(const std::string& uri, std::string* local_path) const;
     std::int64_t mpris_seek(std::int64_t offset_usec);
-    std::int64_t mpris_set_position(std::int64_t position_usec, const std::string& track_id);
+    std::int64_t mpris_set_position(std::int64_t position_usec,
+                                    const std::string& track_id,
+                                    bool cancel_restore = true);
     std::int64_t current_mpris_track_length_usec() const;
     std::int64_t current_mpris_track_position_usec() const;
     void mpris_set_volume(double volume);
@@ -692,6 +690,10 @@ private:
     std::array<GtkTreeViewColumn*, 5> playlist_sort_columns_{{nullptr, nullptr, nullptr, nullptr, nullptr}};
     std::array<GtkWidget*, 5> playlist_sort_header_labels_{{nullptr, nullptr, nullptr, nullptr, nullptr}};
     GtkWidget* diagnostics_active_output_value_ = nullptr;
+    GtkWidget* diagnostics_active_output_secondary_value_ = nullptr;
+    GtkWidget* diagnostics_transport_value_ = nullptr;
+    GtkWidget* diagnostics_page_ = nullptr;
+    bool diagnostics_page_active_ = false;
     std::vector<GtkWidget*> stereo_tonal_dsp_controls_;
     std::optional<bool> applied_stereo_tonal_dsp_controls_enabled_;
 
@@ -713,12 +715,11 @@ private:
     PlaylistSelectionMode playlist_filter_session_selection_mode_ =
         PlaylistSelectionMode::FollowTransport;
     std::size_t playlist_filter_session_selection_index_ = 0;
-    bool playlist_filter_session_scroll_valid_ = false;
-    double playlist_filter_session_scroll_value_ = 0.0;
+    PlaylistViewportAnchor playlist_filter_session_viewport_anchor_{};
     bool playlist_filter_session_playback_committed_ = false;
     std::size_t playlist_filter_session_committed_index_ = 0;
-    guint playlist_vertical_position_restore_idle_id_ = 0;
-    double playlist_vertical_position_restore_value_ = 0.0;
+    unsigned playlist_filter_mpris_transaction_depth_ = 0;
+    std::size_t playlist_filter_mpris_transaction_old_index_ = 0;
     std::string current_device_ = "default";
     std::vector<CardProfileInfo> cards_;
     bool logging_enabled_ = false;
@@ -728,19 +729,13 @@ private:
     int bass_db_ = 0;
     int treble_db_ = 0;
     int pre_eq_headroom_tenths_db_ = 0;
-    bool deep_bass_enabled_ = false;
-    int deep_bass_preset_ = 0;
-    int deep_bass_amount_ = 0;
     bool level_meter_enabled_ = true;
     bool clip_detection_enabled_ = true;
     int bass_shelf_hz_ = 110;
     int treble_shelf_hz_ = 10000;
     std::string resample_quality_ = "maximum";
-    std::string bitdepth_quality_ = "tpdf_hp";
     std::vector<ResampleRule> resample_rules_;
-    std::vector<BitDepthRule> bitdepth_rules_;
     std::vector<DsdPcmRule> dsd_pcm_rules_;
-    std::uint16_t dsd_pcm_output_bits_ = 24;
     bool repeat_enabled_ = false;
     bool random_enabled_ = false;
     std::string mpris_loop_status_ = "None";
@@ -817,8 +812,6 @@ private:
     LastActiveTrackLocator runtime_last_active_track_;
     bool pending_last_active_track_restore_ = false;
     std::uint64_t pending_last_active_track_restore_generation_ = 0;
-    bool last_active_track_restore_center_pending_ = false;
-    std::size_t last_active_track_restore_center_index_ = 0;
     guint restore_sources_idle_id_ = 0;
     guint preferences_save_timeout_id_ = 0;
     std::string persisted_preferences_snapshot_;
@@ -870,16 +863,7 @@ private:
     guint window_geometry_tracking_ready_idle_id_ = 0;
     guint window_geometry_restore_guard_idle_id_ = 0;
     bool playlist_search_window_height_adjusted_ = false;
-    int playlist_search_unrealized_height_delta_ = 0;
-    bool playlist_search_window_resize_pending_ = false;
-    bool playlist_search_window_resize_enabling_ = false;
-    int playlist_search_preserved_viewport_height_ = 0;
-    int playlist_search_window_resize_last_height_ = 0;
-    int playlist_search_window_resize_min_height_ = 0;
     int playlist_search_runtime_height_compensation_ = 0;
-    unsigned int playlist_search_window_resize_attempts_ = 0;
-    bool playlist_search_window_resize_waiting_for_window_event_ = false;
-    guint playlist_search_window_resize_idle_id_ = 0;
     bool playlist_selection_syncing_ = false;
     bool playlist_selection_handler_blocked_ = false;
     unsigned int playlist_selection_sync_depth_ = 0;
@@ -887,6 +871,11 @@ private:
     gulong playlist_key_press_handler_id_ = 0;
     gulong playlist_focus_in_handler_id_ = 0;
     std::string alsa_24bit_container_preference_ = "auto";
+    std::string output_precision_16bit_lossy_ = "auto";
+    std::string output_precision_24bit_ = "auto";
+    std::string output_precision_32bit_ = "auto";
+    std::string dsd_output_precision_ = "auto";
+    std::string quantization_16bit_ = "round";
     bool realtime_audio_priority_enabled_ = false;
     guint pending_seek_source_id_ = 0;
     bool pending_seek_valid_ = false;

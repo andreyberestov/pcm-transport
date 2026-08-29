@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.9.116
+
+- Reworked output precision around a single final PCM conversion boundary after resampling and DSP.
+- Added source-aware Auto 16/24/32 output precision policies, strict explicit modes, dedicated DSD output precision and configurable 24-bit ALSA containers.
+- Preserved native libFLAC decoding for bit-depth-only output changes and added exact PCM widening without intermediate quantization.
+- Added Round to nearest and signed LSB Truncate modes for final 16-bit conversion.
+- Removed Bit-Depth Rules, resampling dither controls and Deep Bass processing; libswresample dithering is explicitly disabled.
+- Hardened ALSA format negotiation so precision fallback does not mask device or runtime errors.
+- Improved mixed-precision gapless playback while preserving exact RangeLimitedDecoder transport boundaries.
+- Expanded runtime Decoder, Processing, ALSA and Transport diagnostics, including encoded bitrate and ALSA significant bits.
+- Added sample-accurate Bass/Treble transitions and reduced steady-state DSP and level-meter overhead.
+- Improved realtime scheduling transitions, verification and RTKit fallback handling.
+- Reworked Search selection and viewport preservation and removed redundant refresh work.
+- Improved startup active-track restoration and cancellation by GUI, media-key and MPRIS actions.
+- Hardened MPRIS, diagnostics and asynchronous UI callback lifetimes.
+- Refined settings and DSP Studio geometry, including compact Audio settings and bounded device-name presentation.
+- Unification of menus, Path, and tooltips
+
 ## 0.9.115
 
 - Replaced the configurable startup playlist row count with restoration of the last normal main-window size. The factory and reset size keeps a 12-row playlist, while user resizing is remembered across sessions.

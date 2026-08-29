@@ -121,6 +121,10 @@ void PlaylistSearchController::apply_search_text(const std::string& text) {
         return;
     }
 
+    // While the Search feature is enabled, GtkTreeView stays on the same
+    // GtkTreeModelFilter for both empty and non-empty queries.  An empty
+    // query simply makes every row visible.  Keeping one model avoids GTK
+    // selection/viewport invalidation on query clear.
     refilter();
     if (filter_text_.empty()) {
         delegate_.on_search_filter_cleared();
@@ -161,6 +165,14 @@ void PlaylistSearchController::flush_pending_refilter() {
 
     const gchar* text = gtk_entry_get_text(GTK_ENTRY(search_entry_));
     apply_search_text(text != nullptr ? text : std::string());
+}
+
+bool PlaylistSearchController::matches_active_filter(const char* folded) const {
+    if (invalidated_ || filter_text_.empty()) {
+        return true;
+    }
+    return folded != nullptr &&
+           std::strstr(folded, filter_text_.c_str()) != nullptr;
 }
 
 gboolean PlaylistSearchController::on_playlist_key_press(GtkWidget* widget, GdkEventKey* event) {
@@ -274,8 +286,7 @@ gboolean PlaylistSearchController::on_filter_visible(GtkTreeModel* model,
                        self->delegate_.col_search_folded(),
                        &folded,
                        -1);
-    const bool match = folded != nullptr &&
-                       std::strstr(folded, self->filter_text_.c_str()) != nullptr;
+    const bool match = self->matches_active_filter(folded);
     g_free(folded);
     return match ? TRUE : FALSE;
 }

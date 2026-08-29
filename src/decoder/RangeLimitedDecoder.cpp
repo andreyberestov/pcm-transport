@@ -70,6 +70,28 @@ TransportTruncationKind RangeLimitedDecoder::transport_truncation_kind() const n
 ResamplerRuntimeKind RangeLimitedDecoder::resampler_runtime_kind() const noexcept {
     return inner_->resampler_runtime_kind();
 }
+Pcm16QuantizationRuntimeKind
+RangeLimitedDecoder::pcm16_quantization_runtime_kind() const noexcept {
+    return inner_->pcm16_quantization_runtime_kind();
+}
+std::uint32_t RangeLimitedDecoder::pcm16_quantization_stage_count() const noexcept {
+    return inner_->pcm16_quantization_stage_count();
+}
+std::string RangeLimitedDecoder::decoded_codec_name() const {
+    return inner_->decoded_codec_name();
+}
+DecoderPcmSampleKind RangeLimitedDecoder::decoded_pcm_sample_kind() const noexcept {
+    return inner_->decoded_pcm_sample_kind();
+}
+std::uint16_t RangeLimitedDecoder::decoded_pcm_significant_bits() const noexcept {
+    return inner_->decoded_pcm_significant_bits();
+}
+std::uint64_t RangeLimitedDecoder::runtime_state_generation() const noexcept {
+    return inner_->runtime_state_generation();
+}
+DecoderRuntimeStateSnapshot RangeLimitedDecoder::runtime_state_snapshot() const {
+    return inner_->runtime_state_snapshot();
+}
 void RangeLimitedDecoder::request_abort() { inner_->request_abort(); }
 
 bool RangeLimitedDecoder::seek_to_sample(std::uint64_t sample_index) {

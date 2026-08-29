@@ -25,6 +25,34 @@ struct AudioFormat {
     }
 };
 
+enum class Pcm16QuantizationMode {
+    RoundToNearest,
+    Truncate
+};
+
+enum class Pcm16QuantizationRuntimeKind {
+    NotUsed,
+    RoundToNearest,
+    Truncate,
+    Ffmpeg
+};
+
+enum class DecoderPcmSampleKind {
+    Unknown,
+    U8,
+    U8Planar,
+    S16,
+    S16Planar,
+    S32,
+    S32Planar,
+    Float,
+    FloatPlanar,
+    Double,
+    DoublePlanar,
+    S64,
+    S64Planar
+};
+
 using PcmSample = std::int32_t;
 
 inline std::int64_t pcm_full_scale(std::uint16_t bits_per_sample) {

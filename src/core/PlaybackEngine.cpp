@@ -31,7 +31,6 @@ struct ShelfState {
     double z2 = 0.0;
 };
 
-using tone::DeepBassState;
 using tone::ShelfCoefficients;
 
 double process_sample(double input, const ShelfCoefficients& c, ShelfState& s) {
@@ -42,19 +41,348 @@ double process_sample(double input, const ShelfCoefficients& c, ShelfState& s) {
 }
 
 
+std::int64_t pcm_minimum_sample(std::uint16_t bits_per_sample) {
+    if (bits_per_sample >= 32) return std::numeric_limits<std::int32_t>::min();
+    if (bits_per_sample <= 1) return -1;
+    return -(1LL << (bits_per_sample - 1));
+}
+
 double clamp_sample_to_bits(double sample, std::uint16_t bits_per_sample) {
-    const double limit = static_cast<double>(pcm_full_scale(bits_per_sample));
-    if (limit <= 0.0) return sample;
-    if (sample > limit) return limit;
-    if (sample < -limit) return -limit;
+    const double maximum = static_cast<double>(pcm_full_scale(bits_per_sample));
+    const double minimum = static_cast<double>(pcm_minimum_sample(bits_per_sample));
+    if (maximum <= 0.0 || minimum >= 0.0) return sample;
+    if (sample > maximum) return maximum;
+    if (sample < minimum) return minimum;
     return sample;
 }
 
-bool sample_exceeds_full_scale(double sample, std::uint16_t bits_per_sample) {
-    const double limit = static_cast<double>(pcm_full_scale(bits_per_sample));
-    if (limit <= 0.0) return false;
-    return sample > limit || sample < -limit;
+PcmSample quantize_processed_sample(double sample,
+                                    std::uint16_t bits_per_sample,
+                                    Pcm16QuantizationMode pcm16_mode) {
+    const double clamped = clamp_sample_to_bits(sample, bits_per_sample);
+    if (bits_per_sample == 16 && pcm16_mode == Pcm16QuantizationMode::Truncate) {
+        // Dropping lower bits from signed two's-complement data is equivalent
+        // to flooring the value expressed in destination PCM code units.
+        return static_cast<PcmSample>(std::floor(clamped));
+    }
+    return static_cast<PcmSample>(std::llround(clamped));
 }
+
+PcmSample quantize_working_sample_to_bits(double sample,
+                                           std::uint16_t working_bits,
+                                           std::uint16_t output_bits,
+                                           Pcm16QuantizationMode pcm16_mode) {
+    if (working_bits < output_bits || output_bits < 16 || output_bits > 32 ||
+        working_bits > 32) {
+        throw std::runtime_error("Unsupported PCM precision conversion");
+    }
+    const unsigned shift = static_cast<unsigned>(working_bits - output_bits);
+    const double divisor = static_cast<double>(std::uint64_t{1} << shift);
+    double scaled = sample / divisor;
+    const double maximum = static_cast<double>(pcm_full_scale(output_bits));
+    const double minimum = static_cast<double>(pcm_minimum_sample(output_bits));
+    if (scaled > maximum) scaled = maximum;
+    if (scaled < minimum) scaled = minimum;
+    if (output_bits == 16 &&
+        pcm16_mode == Pcm16QuantizationMode::Truncate) {
+        // Hardware-style signed LSB truncation is arithmetic bit dropping,
+        // which is floor in destination PCM code units.
+        return static_cast<PcmSample>(std::floor(scaled));
+    }
+    return static_cast<PcmSample>(std::llround(scaled));
+}
+
+PcmSample narrow_exact_working_sample(PcmSample sample,
+                                      std::uint16_t working_bits,
+                                      std::uint16_t output_bits) {
+    if (working_bits <= output_bits || output_bits < 16 || working_bits > 32) {
+        throw std::runtime_error("Unsupported exact PCM precision conversion");
+    }
+    const unsigned shift = static_cast<unsigned>(working_bits - output_bits);
+    const std::int64_t divisor = std::int64_t{1} << shift;
+    const std::int64_t value = static_cast<std::int64_t>(sample);
+    if (value % divisor != 0) {
+        throw std::runtime_error(
+            "PCM working sample is not an exact widened destination value");
+    }
+    return static_cast<PcmSample>(value / divisor);
+}
+
+void widen_pcm_block_exact(PcmSample* samples,
+                           std::size_t count,
+                           std::uint16_t source_bits,
+                           std::uint16_t working_bits) {
+    if (source_bits >= working_bits || source_bits < 16 || working_bits > 32) {
+        if (source_bits == working_bits) return;
+        throw std::runtime_error("Unsupported exact PCM widening");
+    }
+    const unsigned shift = static_cast<unsigned>(working_bits - source_bits);
+    for (std::size_t i = 0; i < count; ++i) {
+        const std::int64_t value =
+            static_cast<std::int64_t>(samples[i]) * (std::int64_t{1} << shift);
+        if (value > std::numeric_limits<std::int32_t>::max() ||
+            value < std::numeric_limits<std::int32_t>::min()) {
+            throw std::runtime_error("Exact PCM widening overflow");
+        }
+        samples[i] = static_cast<PcmSample>(value);
+    }
+}
+
+double headroom_gain_from_tenths_db(int tenths_db) {
+    const double db = static_cast<double>(std::max(0, tenths_db)) / 10.0;
+    return std::pow(10.0, -db / 20.0);
+}
+
+struct ToneFilterTarget {
+    int bass_db = 0;
+    int treble_db = 0;
+    int bass_hz = 100;
+    int treble_hz = 10000;
+    int headroom_tenths_db = 0;
+};
+
+bool same_filter_target(const ToneFilterTarget& a, const ToneFilterTarget& b) {
+    return a.bass_db == b.bass_db &&
+           a.treble_db == b.treble_db &&
+           a.bass_hz == b.bass_hz &&
+           a.treble_hz == b.treble_hz;
+}
+
+bool same_tone_target(const ToneFilterTarget& a, const ToneFilterTarget& b) {
+    return same_filter_target(a, b) &&
+           a.headroom_tenths_db == b.headroom_tenths_db;
+}
+
+bool tone_filter_has_processing(const ToneFilterTarget& target) {
+    return target.bass_db != 0 || target.treble_db != 0;
+}
+
+bool tone_target_has_processing(const ToneFilterTarget& target) {
+    return tone_filter_has_processing(target) || target.headroom_tenths_db > 0;
+}
+
+struct ToneFilterPath {
+    ToneFilterTarget target{};
+    ShelfCoefficients low{};
+    ShelfCoefficients high{};
+    ShelfState low_l{};
+    ShelfState low_r{};
+    ShelfState high_l{};
+    ShelfState high_r{};
+};
+
+ToneFilterPath make_tone_filter_path(std::uint32_t sample_rate,
+                                     const ToneFilterTarget& target) {
+    ToneFilterPath path;
+    path.target = target;
+    path.low = tone::make_low_shelf(
+        sample_rate, static_cast<double>(target.bass_db),
+        static_cast<double>(target.bass_hz));
+    path.high = tone::make_high_shelf(
+        sample_rate, static_cast<double>(target.treble_db),
+        static_cast<double>(target.treble_hz));
+    return path;
+}
+
+double process_tone_filter_path(double input,
+                                bool left,
+                                double headroom_gain,
+                                ToneFilterPath& path) {
+    double sample = input * headroom_gain;
+    if (path.target.bass_db != 0) {
+        sample = process_sample(sample, path.low, left ? path.low_l : path.low_r);
+    }
+    if (path.target.treble_db != 0) {
+        sample = process_sample(sample, path.high, left ? path.high_l : path.high_r);
+    }
+    return sample;
+}
+
+void rescale_shelf_state(ShelfState& state, double factor) {
+    state.z1 *= factor;
+    state.z2 *= factor;
+}
+
+void rescale_tone_filter_path(ToneFilterPath& path, double factor) {
+    rescale_shelf_state(path.low_l, factor);
+    rescale_shelf_state(path.low_r, factor);
+    rescale_shelf_state(path.high_l, factor);
+    rescale_shelf_state(path.high_r, factor);
+}
+
+class ToneFilterCrossfade {
+public:
+    ToneFilterCrossfade(std::uint32_t sample_rate,
+                        const ToneFilterTarget& initial_target)
+        : sample_rate_(sample_rate),
+          transition_frames_(std::max<std::uint32_t>(
+              1U, static_cast<std::uint32_t>(std::lround(
+                  static_cast<double>(sample_rate) * 0.004)))),
+          active_(make_tone_filter_path(sample_rate, initial_target)) {
+        active_gain_ = cached_headroom_gain(initial_target.headroom_tenths_db);
+        active_gain_target_ = active_gain_;
+    }
+
+    void request(const ToneFilterTarget& target) {
+        if (!transitioning_) {
+            if (same_filter_target(target, active_.target)) {
+                active_.target.headroom_tenths_db = target.headroom_tenths_db;
+                request_active_gain(cached_headroom_gain(
+                    target.headroom_tenths_db));
+                return;
+            }
+            if (!tone_filter_has_processing(active_.target) &&
+                !tone_filter_has_processing(target)) {
+                const double requested_gain = cached_headroom_gain(
+                    target.headroom_tenths_db);
+                active_.target = target;
+                request_active_gain(requested_gain);
+                return;
+            }
+            start_transition(target);
+            return;
+        }
+
+        if (same_tone_target(target, incoming_.target)) {
+            pending_valid_ = false;
+            return;
+        }
+
+        const double requested_gain = cached_headroom_gain(
+            target.headroom_tenths_db);
+        if (requested_gain < active_gain_ - 1.0e-15) {
+            active_gain_ = requested_gain;
+            active_gain_target_ = requested_gain;
+            active_gain_step_ = 0.0;
+            active_gain_remaining_frames_ = 0;
+        }
+        if (requested_gain < incoming_gain_ - 1.0e-15) {
+            incoming_gain_ = requested_gain;
+        }
+
+        pending_target_ = target;
+        pending_valid_ = true;
+    }
+
+    double process(double input, bool left) {
+        const double active_output = process_tone_filter_path(
+            input, left, active_gain_, active_);
+        if (!transitioning_) return active_output;
+
+        const double incoming_output = process_tone_filter_path(
+            input, left, incoming_gain_, incoming_);
+        const double t = std::min(
+            1.0, static_cast<double>(transition_position_ + 1U) /
+                     static_cast<double>(transition_frames_));
+        return active_output * (1.0 - t) + incoming_output * t;
+    }
+
+    void advance_frame() {
+        if (transitioning_) {
+            ++transition_position_;
+            if (transition_position_ < transition_frames_) return;
+
+            active_ = incoming_;
+            active_gain_ = incoming_gain_;
+            active_gain_target_ = active_gain_;
+            active_gain_step_ = 0.0;
+            active_gain_remaining_frames_ = 0;
+            transitioning_ = false;
+            transition_position_ = 0;
+            if (pending_valid_) {
+                const ToneFilterTarget pending = pending_target_;
+                pending_valid_ = false;
+                request(pending);
+            }
+            return;
+        }
+
+        if (active_gain_remaining_frames_ == 0) return;
+        active_gain_ += active_gain_step_;
+        --active_gain_remaining_frames_;
+        if (active_gain_remaining_frames_ == 0) {
+            active_gain_ = active_gain_target_;
+        }
+    }
+
+    bool requires_processing() const {
+        if (tone_target_has_processing(active_.target) ||
+            std::fabs(active_gain_ - 1.0) > 1.0e-15 ||
+            active_gain_remaining_frames_ != 0) {
+            return true;
+        }
+        if (transitioning_ && tone_target_has_processing(incoming_.target)) {
+            return true;
+        }
+        return pending_valid_ && tone_target_has_processing(pending_target_);
+    }
+
+    void rescale_state(double factor) {
+        if (std::fabs(factor - 1.0) < 1.0e-15) {
+            return;
+        }
+        rescale_tone_filter_path(active_, factor);
+        if (transitioning_) {
+            rescale_tone_filter_path(incoming_, factor);
+        }
+    }
+
+private:
+    double cached_headroom_gain(int tenths_db) {
+        const int normalized_tenths_db = std::max(0, tenths_db);
+        if (!cached_headroom_gain_valid_ ||
+            normalized_tenths_db != cached_headroom_tenths_db_) {
+            cached_headroom_tenths_db_ = normalized_tenths_db;
+            cached_headroom_gain_ =
+                headroom_gain_from_tenths_db(normalized_tenths_db);
+            cached_headroom_gain_valid_ = true;
+        }
+        return cached_headroom_gain_;
+    }
+
+    void request_active_gain(double target_gain) {
+        if (target_gain < active_gain_ - 1.0e-15) {
+            active_gain_ = target_gain;
+            active_gain_target_ = target_gain;
+            active_gain_step_ = 0.0;
+            active_gain_remaining_frames_ = 0;
+            return;
+        }
+        if (std::fabs(target_gain - active_gain_target_) < 1.0e-15) return;
+        active_gain_target_ = target_gain;
+        active_gain_remaining_frames_ = transition_frames_;
+        active_gain_step_ =
+            (active_gain_target_ - active_gain_) /
+            static_cast<double>(active_gain_remaining_frames_);
+    }
+
+    void start_transition(const ToneFilterTarget& target) {
+        active_gain_target_ = active_gain_;
+        active_gain_step_ = 0.0;
+        active_gain_remaining_frames_ = 0;
+        incoming_ = make_tone_filter_path(sample_rate_, target);
+        incoming_gain_ = cached_headroom_gain(target.headroom_tenths_db);
+        transition_position_ = 0;
+        transitioning_ = true;
+    }
+
+    std::uint32_t sample_rate_ = 0;
+    std::uint32_t transition_frames_ = 1;
+    std::uint32_t transition_position_ = 0;
+    ToneFilterPath active_{};
+    ToneFilterPath incoming_{};
+    ToneFilterTarget pending_target_{};
+    int cached_headroom_tenths_db_ = 0;
+    double cached_headroom_gain_ = 1.0;
+    bool cached_headroom_gain_valid_ = false;
+    double active_gain_ = 1.0;
+    double active_gain_target_ = 1.0;
+    double active_gain_step_ = 0.0;
+    double incoming_gain_ = 1.0;
+    std::uint32_t active_gain_remaining_frames_ = 0;
+    bool transitioning_ = false;
+    bool pending_valid_ = false;
+};
 
 
 constexpr int kPreEqHeadroomMaxTenthsDb = 150;
@@ -122,8 +450,10 @@ PlaybackEngine::~PlaybackEngine() {
 void PlaybackEngine::start(std::unique_ptr<IAudioDecoder> decoder,
                            std::unique_ptr<IAudioBackend> backend,
                            const std::string& device_name,
+                           const std::vector<std::uint16_t>& output_precision_candidates,
                            std::uint64_t initial_samples_per_channel,
-                           std::vector<std::uint64_t> logical_segment_offsets) {
+                           std::vector<std::uint64_t> logical_segment_offsets,
+                           Pcm16QuantizationMode pcm16_quantization_mode) {
     stop();
     const std::uint64_t transport_generation =
         transport_generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
@@ -144,16 +474,28 @@ void PlaybackEngine::start(std::unique_ptr<IAudioDecoder> decoder,
         }
     }
 
-    const AudioFormat opened_format = decoder->format();
-    backend->open(device_name, opened_format);
+    const AudioFormat decoder_working_format = decoder->format();
+    if (decoder_working_format.sample_rate == 0 ||
+        decoder_working_format.channels == 0 ||
+        decoder_working_format.bits_per_sample < 16 ||
+        decoder_working_format.bits_per_sample > 32) {
+        throw std::invalid_argument(
+            "PlaybackEngine::start received an invalid working PCM format");
+    }
+    AudioFormat output_base_format = decoder_working_format;
+    const AudioFormat opened_format = backend->open_with_precision_candidates(
+        device_name, output_base_format, output_precision_candidates);
+    AudioFormat working_format = decoder_working_format;
+    working_format.bits_per_sample = std::max(
+        decoder_working_format.bits_per_sample, opened_format.bits_per_sample);
     const std::string opened_report = backend->active_output_report();
     const std::uint64_t total_samples_per_channel =
         decoder->total_samples_per_channel();
     const DecoderSegmentPosition segment = decoder->segment_position();
     const TransportTruncationKind transport_truncation_kind =
         decoder->transport_truncation_kind();
-    const ResamplerRuntimeKind initial_resampler_runtime_kind =
-        decoder->resampler_runtime_kind();
+    const DecoderRuntimeStateSnapshot initial_decoder_runtime_state =
+        decoder->runtime_state_snapshot();
 
     PlaybackStatusSnapshot initial_snapshot;
     initial_snapshot.playing = true;
@@ -183,16 +525,38 @@ void PlaybackEngine::start(std::unique_ptr<IAudioDecoder> decoder,
         meter_transport_active_.store(true, std::memory_order_release);
         initial_samples_per_channel_ = initial_samples_per_channel;
         logical_segment_offsets_ = std::move(logical_segment_offsets);
-        format_ = opened_format;
+        format_ = working_format;
+        output_format_ = opened_format;
+        pcm16_quantization_mode_ = pcm16_quantization_mode;
         resampler_runtime_kind_.store(
-            initial_resampler_runtime_kind, std::memory_order_release);
+            initial_decoder_runtime_state.resampler_runtime_kind,
+            std::memory_order_release);
+        pcm16_quantization_runtime_kind_.store(
+            initial_decoder_runtime_state.pcm16_quantization_runtime_kind,
+            std::memory_order_release);
+        pcm16_quantization_stage_count_.store(
+            initial_decoder_runtime_state.pcm16_quantization_stage_count,
+            std::memory_order_release);
+        decoded_pcm_sample_kind_.store(
+            initial_decoder_runtime_state.decoded_pcm_sample_kind,
+            std::memory_order_release);
+        decoded_pcm_significant_bits_.store(
+            initial_decoder_runtime_state.decoded_pcm_significant_bits,
+            std::memory_order_release);
+        encoded_bitrate_bps_.store(
+            initial_decoder_runtime_state.encoded_bitrate_bps,
+            std::memory_order_release);
         {
             std::lock_guard<std::mutex> runtime_lock(runtime_mutex_);
             last_active_output_report_ = std::move(runtime_output_report);
+            source_codec_name_ = initial_decoder_runtime_state.source_codec_name;
+            decoded_codec_name_ =
+                initial_decoder_runtime_state.decoder_implementation_name;
         }
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
             snapshot_ = std::move(initial_snapshot);
+            transport_working_format_ = working_format;
             last_error_.clear();
             publish_live_transport_position(initial_samples_per_channel, segment);
         }
@@ -211,17 +575,29 @@ void PlaybackEngine::start(std::unique_ptr<IAudioDecoder> decoder,
         backend_.reset();
         resampler_runtime_kind_.store(
             ResamplerRuntimeKind::NotUsed, std::memory_order_release);
+        pcm16_quantization_runtime_kind_.store(
+            Pcm16QuantizationRuntimeKind::NotUsed, std::memory_order_release);
+        pcm16_quantization_stage_count_.store(0, std::memory_order_release);
+        decoded_pcm_sample_kind_.store(
+            DecoderPcmSampleKind::Unknown, std::memory_order_release);
+        decoded_pcm_significant_bits_.store(0, std::memory_order_release);
+        encoded_bitrate_bps_.store(0, std::memory_order_release);
+        pcm16_quantization_mode_ = Pcm16QuantizationMode::RoundToNearest;
         device_name_.clear();
         format_ = AudioFormat{};
+        output_format_ = AudioFormat{};
         initial_samples_per_channel_ = 0;
         logical_segment_offsets_.clear();
         {
             std::lock_guard<std::mutex> runtime_lock(runtime_mutex_);
             last_active_output_report_.clear();
+            source_codec_name_.clear();
+            decoded_codec_name_.clear();
         }
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
             snapshot_ = PlaybackStatusSnapshot{};
+            transport_working_format_ = AudioFormat{};
             snapshot_.message = "Stopped";
             last_error_.clear();
             publish_live_transport_position(0, DecoderSegmentPosition{});
@@ -246,7 +622,10 @@ void PlaybackEngine::stop() {
     clear_pending_playback_events();
     {
         std::lock_guard<std::mutex> lock(runtime_mutex_);
-        realtime_priority_status_ = realtime_priority_enabled_.load(std::memory_order_relaxed)
+        realtime_priority_status_ = RealtimePriorityStatusSnapshot{};
+        realtime_priority_status_.enabled =
+            realtime_priority_enabled_.load(std::memory_order_relaxed);
+        realtime_priority_status_.text = realtime_priority_status_.enabled
             ? std::string("Realtime priority: inactive, playback stopped")
             : std::string("Realtime priority: disabled");
     }
@@ -257,17 +636,30 @@ void PlaybackEngine::stop() {
     backend_.reset();
     resampler_runtime_kind_.store(
         ResamplerRuntimeKind::NotUsed, std::memory_order_release);
+    pcm16_quantization_runtime_kind_.store(
+        Pcm16QuantizationRuntimeKind::NotUsed, std::memory_order_release);
+    pcm16_quantization_stage_count_.store(0, std::memory_order_release);
+    decoded_pcm_sample_kind_.store(
+        DecoderPcmSampleKind::Unknown, std::memory_order_release);
+    decoded_pcm_significant_bits_.store(0, std::memory_order_release);
+    encoded_bitrate_bps_.store(0, std::memory_order_release);
+    pcm16_quantization_mode_ = Pcm16QuantizationMode::RoundToNearest;
+    format_ = AudioFormat{};
+    output_format_ = AudioFormat{};
     logical_segment_offsets_.clear();
     level_meter_peak_units_.store(kNoMeterMeasurement, std::memory_order_relaxed);
     clipped_samples_pending_.store(0, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> runtime_lock(runtime_mutex_);
         last_active_output_report_.clear();
+        source_codec_name_.clear();
+        decoded_codec_name_.clear();
     }
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         snapshot_.playing = false;
         snapshot_.paused = false;
+        transport_working_format_ = AudioFormat{};
         snapshot_.active_output_report.clear();
         if (!snapshot_.finished) {
             snapshot_.current_samples_per_channel = 0;
@@ -325,13 +717,6 @@ void PlaybackEngine::set_soft_eq(int bass_db, int treble_db) { bass_db_.store(st
 void PlaybackEngine::set_pre_eq_headroom_tenths_db(int tenths_db) { pre_eq_headroom_tenths_db_.store(std::max(0, std::min(kPreEqHeadroomMaxTenthsDb, tenths_db)), std::memory_order_relaxed); }
 int PlaybackEngine::pre_eq_headroom_tenths_db() const { return pre_eq_headroom_tenths_db_.load(std::memory_order_relaxed); }
 void PlaybackEngine::set_soft_eq_profile(int bass_hz, int treble_hz) { bass_hz_.store(tone::clamp_bass_hz(bass_hz), std::memory_order_relaxed); treble_hz_.store(tone::clamp_treble_hz(treble_hz), std::memory_order_relaxed); }
-void PlaybackEngine::set_deep_bass_enabled(bool enabled) { deep_bass_enabled_.store(enabled, std::memory_order_relaxed); }
-bool PlaybackEngine::deep_bass_enabled() const { return deep_bass_enabled_.load(std::memory_order_relaxed); }
-void PlaybackEngine::set_deep_bass_preset(int preset) {
-    const int clamped = std::max(0, std::min(5, preset));
-    deep_bass_preset_.store(clamped, std::memory_order_relaxed);
-}
-void PlaybackEngine::set_deep_bass_amount(int amount_steps) { deep_bass_amount_.store(std::max(-1, std::min(1, amount_steps)), std::memory_order_relaxed); }
 void PlaybackEngine::set_level_meter_enabled(bool enabled) {
     level_meter_enabled_.store(enabled, std::memory_order_relaxed);
     if (!enabled) {
@@ -348,6 +733,37 @@ int PlaybackEngine::bass_db() const { return bass_db_.load(std::memory_order_rel
 int PlaybackEngine::treble_db() const { return treble_db_.load(std::memory_order_relaxed); }
 ResamplerRuntimeKind PlaybackEngine::resampler_runtime_kind() const noexcept {
     return resampler_runtime_kind_.load(std::memory_order_acquire);
+}
+
+Pcm16QuantizationRuntimeKind
+PlaybackEngine::pcm16_quantization_runtime_kind() const noexcept {
+    return pcm16_quantization_runtime_kind_.load(std::memory_order_acquire);
+}
+
+std::uint32_t PlaybackEngine::pcm16_quantization_stage_count() const noexcept {
+    return pcm16_quantization_stage_count_.load(std::memory_order_acquire);
+}
+
+std::string PlaybackEngine::source_codec_name() const {
+    std::lock_guard<std::mutex> lock(runtime_mutex_);
+    return source_codec_name_;
+}
+
+std::uint64_t PlaybackEngine::encoded_bitrate_bps() const noexcept {
+    return encoded_bitrate_bps_.load(std::memory_order_acquire);
+}
+
+std::string PlaybackEngine::decoded_codec_name() const {
+    std::lock_guard<std::mutex> lock(runtime_mutex_);
+    return decoded_codec_name_;
+}
+
+DecoderPcmSampleKind PlaybackEngine::decoded_pcm_sample_kind() const noexcept {
+    return decoded_pcm_sample_kind_.load(std::memory_order_acquire);
+}
+
+std::uint16_t PlaybackEngine::decoded_pcm_significant_bits() const noexcept {
+    return decoded_pcm_significant_bits_.load(std::memory_order_acquire);
 }
 PlaybackStatusSnapshot PlaybackEngine::snapshot() const {
     std::lock_guard<std::mutex> lock(state_mutex_);
@@ -367,6 +783,7 @@ PlaybackTransportSnapshot PlaybackEngine::transport_snapshot() const {
     transport.paused = snapshot_.paused;
     transport.finished = snapshot_.finished;
     transport.format = snapshot_.format;
+    transport.working_format = transport_working_format_;
     transport.current_samples_per_channel = live.current_samples_per_channel;
     transport.total_samples_per_channel = snapshot_.total_samples_per_channel;
     transport.segment_position_valid = live.segment_position_valid;
@@ -570,10 +987,21 @@ void PlaybackEngine::clear_pending_playback_events() noexcept {
 
 void PlaybackEngine::set_realtime_priority_enabled(bool enabled) {
     realtime_priority_enabled_.store(enabled, std::memory_order_relaxed);
+
+    const long tid = playback_thread_tid_.load(std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(runtime_mutex_);
     if (!enabled) {
-        realtime_priority_status_ = "Realtime priority: disabled";
-        last_realtime_priority_error_.clear();
+        if (tid > 0 && realtime_priority_status_.tid == tid) {
+            realtime_priority_status_.enabled = false;
+            realtime_priority_status_.error.clear();
+            format_realtime_priority_status(realtime_priority_status_);
+        } else {
+            realtime_priority_status_ = RealtimePriorityStatusSnapshot{};
+        }
+    } else if (!realtime_priority_status_.enabled) {
+        realtime_priority_status_ = RealtimePriorityStatusSnapshot{};
+        realtime_priority_status_.enabled = true;
+        realtime_priority_status_.text = "Realtime priority: inactive, playback stopped";
     }
 }
 
@@ -603,38 +1031,43 @@ GDBusConnection* rtkit_system_bus(std::string& error_message) {
     return connection;
 }
 
-bool rtkit_name_has_owner(std::string* detail = nullptr) {
-    std::string bus_error;
-    GDBusConnection* connection = rtkit_system_bus(bus_error);
-    if (connection == nullptr) {
-        if (detail != nullptr) *detail = bus_error;
-        return false;
+std::string concise_rtkit_error(GError* error) {
+    if (error == nullptr || error->message == nullptr) {
+        return "request failed";
     }
-    GError* error = nullptr;
-    GVariant* result = g_dbus_connection_call_sync(connection,
-                                                   "org.freedesktop.DBus",
-                                                   "/org/freedesktop/DBus",
-                                                   "org.freedesktop.DBus",
-                                                   "NameHasOwner",
-                                                   g_variant_new("(s)", "org.freedesktop.RealtimeKit1"),
-                                                   G_VARIANT_TYPE("(b)"),
-                                                   G_DBUS_CALL_FLAGS_NONE,
-                                                   750,
-                                                   nullptr,
-                                                   &error);
-    g_object_unref(connection);
-    if (result == nullptr) {
-        if (detail != nullptr) *detail = gerror_message("RTKit availability check failed", error);
-        if (error != nullptr) g_error_free(error);
-        return false;
+    const std::string msg(error->message);
+    if (g_error_matches(error, G_DBUS_ERROR, G_DBUS_ERROR_SERVICE_UNKNOWN) ||
+        g_error_matches(error, G_DBUS_ERROR, G_DBUS_ERROR_NAME_HAS_NO_OWNER) ||
+        msg.find("ServiceUnknown") != std::string::npos ||
+        msg.find("NameHasNoOwner") != std::string::npos ||
+        msg.find("Name has no owner") != std::string::npos ||
+        msg.find("was not provided by any .service files") != std::string::npos ||
+        msg.find("No such interface") != std::string::npos) {
+        return "service not available";
     }
-    gboolean has_owner = FALSE;
-    g_variant_get(result, "(b)", &has_owner);
-    g_variant_unref(result);
-    if (!has_owner && detail != nullptr) {
-        *detail = "RTKit service not available";
+    if (msg.find("AccessDenied") != std::string::npos ||
+        msg.find("not permitted") != std::string::npos ||
+        msg.find("Operation not permitted") != std::string::npos) {
+        return "access denied by system policy";
     }
-    return has_owner != FALSE;
+    if (msg.find("Failed to activate service") != std::string::npos ||
+        msg.find("Spawn.ChildExited") != std::string::npos) {
+        return "service activation failed";
+    }
+    return msg;
+}
+
+std::string rtkit_query_error(const char* context, GError* error) {
+    const std::string concise = concise_rtkit_error(error);
+    if (concise == "service not available") {
+        return "RTKit service not available";
+    }
+    std::string message = context != nullptr ? std::string(context) : std::string("RTKit request failed");
+    if (!concise.empty()) {
+        message += ": ";
+        message += concise;
+    }
+    return message;
 }
 
 bool rtkit_get_max_realtime_priority(GDBusConnection* connection, int& max_priority, std::string& error_message) {
@@ -656,7 +1089,7 @@ bool rtkit_get_max_realtime_priority(GDBusConnection* connection, int& max_prior
                                                    nullptr,
                                                    &error);
     if (result == nullptr) {
-        error_message = gerror_message("RTKit MaxRealtimePriority query failed", error);
+        error_message = rtkit_query_error("RTKit MaxRealtimePriority query failed", error);
         if (error != nullptr) g_error_free(error);
         return false;
     }
@@ -705,7 +1138,7 @@ bool rtkit_get_rttime_usec_max(GDBusConnection* connection, rlim_t& rttime_usec_
                                                    nullptr,
                                                    &error);
     if (result == nullptr) {
-        error_message = gerror_message("RTKit RTTimeUSecMax query failed", error);
+        error_message = rtkit_query_error("RTKit RTTimeUSecMax query failed", error);
         if (error != nullptr) g_error_free(error);
         return false;
     }
@@ -748,23 +1181,24 @@ bool prepare_rtkit_rttime_limit(rlim_t rttime_usec_max, std::string& error_messa
         return false;
     }
 
-    if (current.rlim_max != RLIM_INFINITY &&
-        current.rlim_max >= static_cast<rlim_t>(1) &&
-        current.rlim_max <= rttime_usec_max) {
-        return true;
-    }
-
     if (current.rlim_max == 0) {
         error_message = "RTKit RLIMIT_RTTIME hard limit is zero";
         return false;
     }
 
     rlimit adjusted = current;
-    adjusted.rlim_max = rttime_usec_max;
+    if (current.rlim_max == RLIM_INFINITY || current.rlim_max > rttime_usec_max) {
+        adjusted.rlim_max = rttime_usec_max;
+    }
     if (adjusted.rlim_cur == RLIM_INFINITY ||
         adjusted.rlim_cur == 0 ||
         adjusted.rlim_cur > adjusted.rlim_max) {
         adjusted.rlim_cur = adjusted.rlim_max;
+    }
+
+    if (adjusted.rlim_cur == current.rlim_cur &&
+        adjusted.rlim_max == current.rlim_max) {
+        return true;
     }
 
     if (setrlimit(RLIMIT_RTTIME, &adjusted) != 0) {
@@ -804,6 +1238,31 @@ bool direct_make_thread_realtime(long tid, int requested_priority, std::string& 
     }
     sched_param param{};
     param.sched_priority = std::max(1, std::min(80, requested_priority));
+
+#ifdef SCHED_RESET_ON_FORK
+    if (sched_setscheduler(static_cast<pid_t>(tid),
+                           SCHED_RR | SCHED_RESET_ON_FORK,
+                           &param) == 0) {
+        return true;
+    }
+    const int reset_err = errno;
+    if (reset_err != EINVAL) {
+        switch (reset_err) {
+            case EPERM:
+                error_message = "Direct scheduler request failed: permission required";
+                break;
+            case ESRCH:
+                error_message = "Direct scheduler request failed: playback thread not found";
+                break;
+            default:
+                error_message = std::string("Direct scheduler request failed: ") +
+                                std::strerror(reset_err);
+                break;
+        }
+        return false;
+    }
+#endif
+
     if (sched_setscheduler(static_cast<pid_t>(tid), SCHED_RR, &param) == 0) {
         return true;
     }
@@ -825,21 +1284,37 @@ bool direct_make_thread_realtime(long tid, int requested_priority, std::string& 
     return false;
 }
 
-std::string concise_rtkit_error(GError* error) {
-    if (error == nullptr || error->message == nullptr) {
-        return "request failed";
+bool demote_thread_from_realtime(long tid, std::string& error_message) {
+    if (tid <= 0) {
+        error_message = "invalid audio thread TID";
+        return false;
     }
-    const std::string msg(error->message);
-    if (msg.find("AccessDenied") != std::string::npos ||
-        msg.find("not permitted") != std::string::npos ||
-        msg.find("Operation not permitted") != std::string::npos) {
-        return "access denied by system policy";
+
+    sched_param param{};
+    param.sched_priority = 0;
+#ifdef SCHED_RESET_ON_FORK
+    if (sched_setscheduler(static_cast<pid_t>(tid),
+                           SCHED_OTHER | SCHED_RESET_ON_FORK,
+                           &param) == 0) {
+        return true;
     }
-    if (msg.find("No such interface") != std::string::npos ||
-        msg.find("Name has no owner") != std::string::npos) {
-        return "service not available";
+    const int reset_err = errno;
+    if (reset_err != EINVAL) {
+        error_message = reset_err == ESRCH
+            ? std::string("playback thread not found")
+            : std::string("scheduler demotion failed: ") + std::strerror(reset_err);
+        return false;
     }
-    return msg;
+#endif
+
+    if (sched_setscheduler(static_cast<pid_t>(tid), SCHED_OTHER, &param) == 0) {
+        return true;
+    }
+    const int err = errno;
+    error_message = err == ESRCH
+        ? std::string("playback thread not found")
+        : std::string("scheduler demotion failed: ") + std::strerror(err);
+    return false;
 }
 
 bool rtkit_make_thread_realtime(long tid, int requested_priority, int& effective_priority, int& max_priority, std::string& error_message) {
@@ -857,17 +1332,28 @@ bool rtkit_make_thread_realtime(long tid, int requested_priority, int& effective
     }
 
     std::string max_error;
-    const bool have_max_priority = rtkit_get_max_realtime_priority(connection, max_priority, max_error);
-    if (!have_max_priority) {
-        max_priority = 20;
+    if (!rtkit_get_max_realtime_priority(connection, max_priority, max_error)) {
+        g_object_unref(connection);
+        error_message = max_error.empty()
+            ? std::string("RTKit MaxRealtimePriority query failed")
+            : max_error;
+        return false;
     }
 
     rlim_t rttime_usec_max = 0;
     std::string rttime_error;
-    if (!rtkit_get_rttime_usec_max(connection, rttime_usec_max, rttime_error) ||
-        !prepare_rtkit_rttime_limit(rttime_usec_max, rttime_error)) {
+    if (!rtkit_get_rttime_usec_max(connection, rttime_usec_max, rttime_error)) {
         g_object_unref(connection);
-        error_message = rttime_error.empty() ? "RTKit realtime limit setup failed" : rttime_error;
+        error_message = rttime_error.empty()
+            ? std::string("RTKit RTTimeUSecMax query failed")
+            : rttime_error;
+        return false;
+    }
+    if (!prepare_rtkit_rttime_limit(rttime_usec_max, rttime_error)) {
+        g_object_unref(connection);
+        error_message = rttime_error.empty()
+            ? std::string("RTKit realtime limit setup failed")
+            : rttime_error;
         return false;
     }
 
@@ -891,9 +1377,6 @@ bool rtkit_make_thread_realtime(long tid, int requested_priority, int& effective
            << "; requested " << effective_priority
            << "; service max " << max_priority
            << "; TID " << tid;
-        if (!have_max_priority && !max_error.empty()) {
-            ss << "; max query: " << max_error;
-        }
         error_message = ss.str();
         if (error != nullptr) g_error_free(error);
         return false;
@@ -904,132 +1387,272 @@ bool rtkit_make_thread_realtime(long tid, int requested_priority, int& effective
 
 } // namespace
 
-std::string PlaybackEngine::verified_realtime_priority_status(long tid) const {
-    if (!realtime_priority_enabled_.load(std::memory_order_relaxed)) {
-        return "Realtime priority: disabled";
+void PlaybackEngine::format_realtime_priority_status(RealtimePriorityStatusSnapshot& status) {
+    if (status.tid <= 0) {
+        status.text = status.enabled
+            ? std::string("Realtime priority: inactive, playback stopped")
+            : std::string("Realtime priority: disabled");
+        return;
     }
+
+    std::ostringstream ss;
+    if (!status.enabled) {
+        if (status.active) {
+            ss << "Realtime priority: disable failed, still active, "
+               << policy_display_name(status.scheduler_policy) << ' '
+               << status.priority << ", TID " << status.tid;
+            if (status.source == RealtimePrioritySource::Direct) {
+                ss << ", via direct scheduling";
+            } else if (status.source == RealtimePrioritySource::Rtkit) {
+                ss << ", via RTKit";
+            }
+        } else if (status.scheduler_policy >= 0) {
+            ss << "Realtime priority: disabled";
+        } else {
+            ss << "Realtime priority: disabled, scheduler status unavailable";
+        }
+    } else if (status.active) {
+        ss << "Realtime priority: active, "
+           << policy_display_name(status.scheduler_policy) << ' '
+           << status.priority << ", TID " << status.tid;
+        if (status.source == RealtimePrioritySource::Direct) {
+            ss << ", via direct scheduling";
+        } else if (status.source == RealtimePrioritySource::Rtkit) {
+            ss << ", via RTKit";
+        }
+    } else if (status.scheduler_policy >= 0) {
+        ss << "Realtime priority: not active, scheduler "
+           << policy_display_name(status.scheduler_policy)
+           << ", priority " << status.priority
+           << ", TID " << status.tid;
+    } else {
+        ss << "Realtime priority: status unavailable, TID " << status.tid;
+    }
+    if (!status.error.empty()) {
+        ss << '\n' << status.error;
+    }
+    status.text = ss.str();
+}
+
+RealtimePriorityStatusSnapshot PlaybackEngine::verified_realtime_priority_status(long tid) const {
+    RealtimePriorityStatusSnapshot status;
+    status.enabled = realtime_priority_enabled_.load(std::memory_order_relaxed);
+    status.tid = tid;
+    status.scheduler_policy = -1;
+
     if (tid <= 0) {
-        return "Realtime priority: inactive, playback stopped";
+        format_realtime_priority_status(status);
+        return status;
     }
+
     sched_param param{};
     const int policy = sched_getscheduler(static_cast<pid_t>(tid));
     if (policy < 0) {
-        return "Realtime priority: inactive, playback thread not found, TID " + std::to_string(tid);
+        const int err = errno;
+        status.error = err == ESRCH
+            ? std::string("Playback thread not found")
+            : std::string("Scheduler query failed: ") + std::strerror(err);
+        format_realtime_priority_status(status);
+        return status;
     }
+
+    status.scheduler_policy = base_scheduler_policy(policy);
     if (sched_getparam(static_cast<pid_t>(tid), &param) != 0) {
-        return "Realtime priority: status unavailable, TID " + std::to_string(tid);
+        status.error = std::string("Scheduler priority query failed: ") + std::strerror(errno);
+        format_realtime_priority_status(status);
+        return status;
     }
-    const int base_policy = base_scheduler_policy(policy);
-    if (base_policy == SCHED_RR || base_policy == SCHED_FIFO) {
-        return std::string("Realtime priority: active, ") + policy_display_name(base_policy) + " " +
-               std::to_string(param.sched_priority) + ", TID " + std::to_string(tid);
-    }
-    return std::string("Realtime priority: not active, scheduler ") + policy_display_name(policy) +
-           ", priority " + std::to_string(param.sched_priority) + ", TID " + std::to_string(tid);
+
+    status.priority = param.sched_priority;
+    status.active = status.scheduler_policy == SCHED_RR ||
+                    status.scheduler_policy == SCHED_FIFO;
+    format_realtime_priority_status(status);
+    return status;
+}
+
+RealtimePriorityStatusSnapshot PlaybackEngine::realtime_priority_status_snapshot() const {
+    std::lock_guard<std::mutex> lock(runtime_mutex_);
+    return realtime_priority_status_;
 }
 
 std::string PlaybackEngine::request_realtime_priority_for_playback_thread() {
+    std::lock_guard<std::mutex> transition_lock(realtime_transition_mutex_);
     if (!realtime_priority_enabled_.load(std::memory_order_relaxed)) {
+        RealtimePriorityStatusSnapshot status;
+        format_realtime_priority_status(status);
         std::lock_guard<std::mutex> lock(runtime_mutex_);
-        realtime_priority_status_ = "Realtime priority: disabled";
-        last_realtime_priority_error_.clear();
-        return realtime_priority_status_;
+        realtime_priority_status_ = status;
+        return realtime_priority_status_.text;
     }
 
     const long tid = playback_thread_tid_.load(std::memory_order_relaxed);
     if (tid <= 0) {
+        RealtimePriorityStatusSnapshot status;
+        status.enabled = true;
+        format_realtime_priority_status(status);
         std::lock_guard<std::mutex> lock(runtime_mutex_);
-        realtime_priority_status_ = "Realtime priority: inactive, playback stopped";
-        return realtime_priority_status_;
+        realtime_priority_status_ = status;
+        return realtime_priority_status_.text;
     }
 
-    const std::string current_status = verified_realtime_priority_status(tid);
-    if (current_status.find("active, SCHED_") != std::string::npos) {
+    RealtimePriorityStatusSnapshot current = verified_realtime_priority_status(tid);
+    if (current.active) {
+        {
+            std::lock_guard<std::mutex> lock(runtime_mutex_);
+            if (realtime_priority_status_.active && realtime_priority_status_.tid == tid) {
+                current.source = realtime_priority_status_.source;
+            }
+        }
+        current.error.clear();
+        format_realtime_priority_status(current);
         std::lock_guard<std::mutex> lock(runtime_mutex_);
-        realtime_priority_status_ = current_status;
-        last_realtime_priority_error_.clear();
-        return realtime_priority_status_;
+        realtime_priority_status_ = current;
+        return realtime_priority_status_.text;
     }
 
     const int priority = realtime_priority_.load(std::memory_order_relaxed);
     std::string direct_error;
     if (direct_make_thread_realtime(tid, priority, direct_error)) {
-        const std::string verified = verified_realtime_priority_status(tid);
-        std::lock_guard<std::mutex> lock(runtime_mutex_);
-        realtime_priority_status_ = verified;
-        if (verified.find("active, SCHED_") != std::string::npos) {
-            last_realtime_priority_error_.clear();
+        RealtimePriorityStatusSnapshot verified = verified_realtime_priority_status(tid);
+        if (verified.active) {
+            verified.source = RealtimePrioritySource::Direct;
+            verified.error.clear();
         } else {
-            last_realtime_priority_error_ = "Direct scheduler request returned but scheduler was not changed";
-            realtime_priority_status_ += "\n" + last_realtime_priority_error_;
+            verified.source = RealtimePrioritySource::None;
+            verified.error = "Direct scheduler request returned but scheduler was not changed";
         }
-        Logger::instance().info(realtime_priority_status_);
-        return realtime_priority_status_;
-    }
-
-    std::string detail;
-    if (!rtkit_name_has_owner(&detail)) {
-        std::lock_guard<std::mutex> lock(runtime_mutex_);
-        last_realtime_priority_error_ = detail.empty() ? "RTKit service not available" : detail;
-        realtime_priority_status_ = current_status + "\n" + direct_error + "\nRTKit: not available";
-        return realtime_priority_status_;
+        format_realtime_priority_status(verified);
+        {
+            std::lock_guard<std::mutex> lock(runtime_mutex_);
+            realtime_priority_status_ = verified;
+        }
+        Logger::instance().info(verified.text);
+        return verified.text;
     }
 
     int effective_priority = 0;
     int max_priority = 0;
     std::string rtkit_error;
-    std::string message;
+    RealtimePriorityStatusSnapshot result;
     if (rtkit_make_thread_realtime(tid, priority, effective_priority, max_priority, rtkit_error)) {
-        message = verified_realtime_priority_status(tid);
-        if (message.find("active, SCHED_") == std::string::npos) {
+        result = verified_realtime_priority_status(tid);
+        if (result.active) {
+            result.source = RealtimePrioritySource::Rtkit;
+            result.error.clear();
+        } else {
             std::ostringstream ss;
             ss << "RTKit request returned but scheduler was not changed; requested "
-               << effective_priority << "; service max " << max_priority << "; TID " << tid;
-            rtkit_error = ss.str();
-            message += "\n" + rtkit_error;
+               << effective_priority << "; service max " << max_priority
+               << "; TID " << tid;
+            result.error = ss.str();
         }
     } else {
-        message = current_status + "\n" + direct_error + "\n" + rtkit_error;
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(runtime_mutex_);
-        realtime_priority_status_ = message;
-        if (message.find("active, SCHED_") != std::string::npos) {
-            last_realtime_priority_error_.clear();
-        } else {
-            last_realtime_priority_error_ = rtkit_error.empty() ? direct_error : rtkit_error;
+        result = current;
+        result.source = RealtimePrioritySource::None;
+        result.error = direct_error;
+        if (!rtkit_error.empty()) {
+            if (!result.error.empty()) {
+                result.error += '\n';
+            }
+            result.error += rtkit_error;
         }
     }
-    Logger::instance().info(message);
-    return message;
+
+    format_realtime_priority_status(result);
+    {
+        std::lock_guard<std::mutex> lock(runtime_mutex_);
+        realtime_priority_status_ = result;
+    }
+    Logger::instance().info(result.text);
+    return result.text;
+}
+
+
+std::string PlaybackEngine::disable_realtime_priority_for_playback_thread() {
+    // Publish the desired OFF state before waiting for an older acquisition.
+    // The transition lock then guarantees that this demotion is the last RT
+    // operation applied for this user action.
+    realtime_priority_enabled_.store(false, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> transition_lock(realtime_transition_mutex_);
+    const long tid = playback_thread_tid_.load(std::memory_order_relaxed);
+    if (tid <= 0) {
+        RealtimePriorityStatusSnapshot status;
+        status.enabled = false;
+        format_realtime_priority_status(status);
+        std::lock_guard<std::mutex> lock(runtime_mutex_);
+        realtime_priority_status_ = status;
+        return realtime_priority_status_.text;
+    }
+
+    RealtimePrioritySource previous_source = RealtimePrioritySource::None;
+    {
+        std::lock_guard<std::mutex> lock(runtime_mutex_);
+        if (realtime_priority_status_.tid == tid && realtime_priority_status_.active) {
+            previous_source = realtime_priority_status_.source;
+        }
+    }
+
+    RealtimePriorityStatusSnapshot before = verified_realtime_priority_status(tid);
+    before.source = before.active ? previous_source : RealtimePrioritySource::None;
+    if (before.active) {
+        std::string demote_error;
+        if (!demote_thread_from_realtime(tid, demote_error)) {
+            RealtimePriorityStatusSnapshot failed = verified_realtime_priority_status(tid);
+            failed.source = failed.active ? previous_source : RealtimePrioritySource::None;
+            failed.error = "Realtime disable failed";
+            if (!demote_error.empty()) {
+                failed.error += ": " + demote_error;
+            }
+            format_realtime_priority_status(failed);
+            {
+                std::lock_guard<std::mutex> lock(runtime_mutex_);
+                realtime_priority_status_ = failed;
+            }
+            Logger::instance().error(failed.text);
+            return failed.text;
+        }
+    }
+
+    RealtimePriorityStatusSnapshot result = verified_realtime_priority_status(tid);
+    result.source = result.active ? previous_source : RealtimePrioritySource::None;
+    if (result.active) {
+        result.error = "Realtime disable request returned but scheduler is still realtime";
+    } else if (result.scheduler_policy >= 0) {
+        result.error.clear();
+    }
+    format_realtime_priority_status(result);
+    {
+        std::lock_guard<std::mutex> lock(runtime_mutex_);
+        realtime_priority_status_ = result;
+    }
+    if (before.active || !result.error.empty()) {
+        Logger::instance().info(result.text);
+    }
+    return result.text;
 }
 
 std::string PlaybackEngine::refresh_realtime_priority_status() {
-    std::string message;
-    if (!realtime_priority_enabled_.load(std::memory_order_relaxed)) {
-        message = "Realtime priority: disabled";
-        std::lock_guard<std::mutex> lock(runtime_mutex_);
-        realtime_priority_status_ = message;
-        last_realtime_priority_error_.clear();
-        return message;
-    }
-
     const long tid = playback_thread_tid_.load(std::memory_order_relaxed);
-    if (tid > 0) {
-        message = request_realtime_priority_for_playback_thread();
-    } else {
-        message = "Realtime priority: inactive, playback stopped";
-        std::lock_guard<std::mutex> lock(runtime_mutex_);
-        realtime_priority_status_ = message;
-        last_realtime_priority_error_.clear();
-    }
-    return message;
-}
+    RealtimePriorityStatusSnapshot refreshed = verified_realtime_priority_status(tid);
 
-std::string PlaybackEngine::try_set_realtime_priority_for_current_thread() {
-    playback_thread_tid_.store(static_cast<long>(syscall(SYS_gettid)), std::memory_order_relaxed);
-    return request_realtime_priority_for_playback_thread();
+    {
+        std::lock_guard<std::mutex> lock(runtime_mutex_);
+        if (refreshed.tid > 0 && realtime_priority_status_.tid == refreshed.tid) {
+            if (refreshed.active && realtime_priority_status_.active) {
+                refreshed.source = realtime_priority_status_.source;
+            }
+            const bool preserve_error = refreshed.error.empty() &&
+                !realtime_priority_status_.error.empty() &&
+                ((refreshed.enabled && !refreshed.active) ||
+                 (!refreshed.enabled && refreshed.active));
+            if (preserve_error) {
+                refreshed.error = realtime_priority_status_.error;
+            }
+        }
+        format_realtime_priority_status(refreshed);
+        realtime_priority_status_ = refreshed;
+        return realtime_priority_status_.text;
+    }
 }
 
 std::string PlaybackEngine::active_output_report() const {
@@ -1038,12 +1661,13 @@ std::string PlaybackEngine::active_output_report() const {
 }
 
 void PlaybackEngine::playback_loop(std::uint64_t transport_generation) {
-    playback_thread_tid_.store(static_cast<long>(syscall(SYS_gettid)), std::memory_order_relaxed);
+    const long playback_tid = static_cast<long>(syscall(SYS_gettid));
+    playback_thread_tid_.store(playback_tid, std::memory_order_relaxed);
     if (realtime_priority_enabled_.load(std::memory_order_relaxed)) {
-        try_set_realtime_priority_for_current_thread();
+        request_realtime_priority_for_playback_thread();
     } else {
         std::lock_guard<std::mutex> lock(runtime_mutex_);
-        realtime_priority_status_ = "Realtime priority: disabled";
+        realtime_priority_status_ = RealtimePriorityStatusSnapshot{};
     }
     try {
         const std::uint16_t ch = std::max<std::uint16_t>(1, format_.channels);
@@ -1051,6 +1675,7 @@ void PlaybackEngine::playback_loop(std::uint64_t transport_generation) {
         const std::size_t block_samples = std::max<std::size_t>(
             ch, (static_cast<std::size_t>(4096) / ch) * ch);
         std::vector<PcmSample> block(block_samples);
+        std::vector<PcmSample> output_block(block_samples);
         std::uint64_t played_samples_per_channel = initial_samples_per_channel_;
         std::size_t next_logical_boundary = logical_segment_offsets_.size();
         if (logical_segment_offsets_.size() >= 2) {
@@ -1061,30 +1686,58 @@ void PlaybackEngine::playback_loop(std::uint64_t transport_generation) {
                 logical_segment_offsets_.begin());
         }
         DecoderSegmentPosition last_published_segment = decoder_->segment_position();
-        ResamplerRuntimeKind last_published_resampler_runtime_kind =
-            resampler_runtime_kind_.load(std::memory_order_acquire);
-        int active_bass_db = stereo_tonal_dsp_allowed
-            ? bass_db_.load(std::memory_order_relaxed)
-            : 0;
-        int active_treble_db = stereo_tonal_dsp_allowed
-            ? treble_db_.load(std::memory_order_relaxed)
-            : 0;
-        int active_bass_hz = bass_hz_.load(std::memory_order_relaxed);
-        int active_treble_hz = treble_hz_.load(std::memory_order_relaxed);
-        ShelfCoefficients low = tone::make_low_shelf(format_.sample_rate, static_cast<double>(active_bass_db), static_cast<double>(active_bass_hz));
-        ShelfCoefficients high = tone::make_high_shelf(format_.sample_rate, static_cast<double>(active_treble_db), static_cast<double>(active_treble_hz));
-        ShelfState low_l{}, low_r{}, high_l{}, high_r{};
-        DeepBassState deep_bass_l{}, deep_bass_r{};
-        bool active_deep_bass_enabled = stereo_tonal_dsp_allowed &&
-            deep_bass_enabled_.load(std::memory_order_relaxed);
-        int active_deep_bass_preset = deep_bass_preset_.load(std::memory_order_relaxed);
-        int active_deep_bass_amount = deep_bass_amount_.load(std::memory_order_relaxed);
+        DecoderRuntimeStateSnapshot decoder_runtime_state =
+            decoder_->runtime_state_snapshot();
+        std::uint64_t last_decoder_runtime_generation =
+            decoder_runtime_state.generation;
+        Pcm16QuantizationRuntimeKind last_published_pcm16_quantization_runtime_kind =
+            pcm16_quantization_runtime_kind_.load(std::memory_order_acquire);
+        std::uint32_t last_published_pcm16_quantization_stage_count =
+            pcm16_quantization_stage_count_.load(std::memory_order_acquire);
+        const ToneFilterTarget initial_tone_target{
+            stereo_tonal_dsp_allowed
+                ? bass_db_.load(std::memory_order_relaxed)
+                : 0,
+            stereo_tonal_dsp_allowed
+                ? treble_db_.load(std::memory_order_relaxed)
+                : 0,
+            bass_hz_.load(std::memory_order_relaxed),
+            treble_hz_.load(std::memory_order_relaxed),
+            stereo_tonal_dsp_allowed
+                ? pre_eq_headroom_tenths_db_.load(std::memory_order_relaxed)
+                : 0};
+        ToneFilterCrossfade tone_filter(format_.sample_rate, initial_tone_target);
         while (!stop_requested_ && !decoder_->eof()) {
             wait_if_paused();
             if (stop_requested_) break;
+
             const std::size_t got = decoder_->read_samples(block.data(), block.size());
-            const ResamplerRuntimeKind current_resampler_runtime_kind =
-                decoder_->resampler_runtime_kind();
+            bool processing_state_changed = false;
+            const std::uint64_t decoder_runtime_generation =
+                decoder_->runtime_state_generation();
+            if (decoder_runtime_generation != last_decoder_runtime_generation) {
+                decoder_runtime_state = decoder_->runtime_state_snapshot();
+                last_decoder_runtime_generation = decoder_runtime_state.generation;
+                resampler_runtime_kind_.store(
+                    decoder_runtime_state.resampler_runtime_kind,
+                    std::memory_order_release);
+                decoded_pcm_sample_kind_.store(
+                    decoder_runtime_state.decoded_pcm_sample_kind,
+                    std::memory_order_release);
+                decoded_pcm_significant_bits_.store(
+                    decoder_runtime_state.decoded_pcm_significant_bits,
+                    std::memory_order_release);
+                encoded_bitrate_bps_.store(
+                    decoder_runtime_state.encoded_bitrate_bps,
+                    std::memory_order_release);
+                {
+                    std::lock_guard<std::mutex> lock(runtime_mutex_);
+                    source_codec_name_ = decoder_runtime_state.source_codec_name;
+                    decoded_codec_name_ =
+                        decoder_runtime_state.decoder_implementation_name;
+                }
+                processing_state_changed = true;
+            }
             if (got > block.size()) {
                 throw std::runtime_error("Decoder returned more PCM samples than requested");
             }
@@ -1093,7 +1746,39 @@ void PlaybackEngine::playback_loop(std::uint64_t transport_generation) {
             }
             if (got == 0) break;
 
-            const int current_soft_volume_percent = soft_volume_percent_.load(std::memory_order_relaxed);
+            const AudioFormat decoder_block_format = decoder_->format();
+            if (decoder_block_format.sample_rate != format_.sample_rate ||
+                decoder_block_format.channels != format_.channels ||
+                decoder_block_format.bits_per_sample < 16 ||
+                decoder_block_format.bits_per_sample > 32) {
+                throw std::runtime_error(
+                    "Decoder changed to an incompatible working PCM format");
+            }
+            const std::uint16_t block_processing_bits = std::max(
+                decoder_block_format.bits_per_sample,
+                output_format_.bits_per_sample);
+            if (block_processing_bits != format_.bits_per_sample) {
+                const int bit_delta =
+                    static_cast<int>(block_processing_bits) -
+                    static_cast<int>(format_.bits_per_sample);
+                tone_filter.rescale_state(std::ldexp(1.0, bit_delta));
+                format_.bits_per_sample = block_processing_bits;
+                {
+                    std::lock_guard<std::mutex> lock(state_mutex_);
+                    transport_working_format_ = format_;
+                }
+                processing_state_changed = true;
+            }
+            if (decoder_block_format.bits_per_sample < format_.bits_per_sample) {
+                widen_pcm_block_exact(
+                    block.data(),
+                    got,
+                    decoder_block_format.bits_per_sample,
+                    format_.bits_per_sample);
+            }
+
+            const int current_soft_volume_percent =
+                soft_volume_percent_.load(std::memory_order_relaxed);
             const int current_bass_db = stereo_tonal_dsp_allowed
                 ? bass_db_.load(std::memory_order_relaxed)
                 : 0;
@@ -1105,75 +1790,132 @@ void PlaybackEngine::playback_loop(std::uint64_t transport_generation) {
             const int current_pre_eq_headroom_tenths_db = stereo_tonal_dsp_allowed
                 ? pre_eq_headroom_tenths_db_.load(std::memory_order_relaxed)
                 : 0;
-            const bool current_deep_bass_enabled = stereo_tonal_dsp_allowed &&
-                deep_bass_enabled_.load(std::memory_order_relaxed);
-            const int current_deep_bass_preset = deep_bass_preset_.load(std::memory_order_relaxed);
-            const int current_deep_bass_amount = deep_bass_amount_.load(std::memory_order_relaxed);
-            const double current_deep_bass_amount_gain = tone::deep_bass_amount_gain_from_steps(current_deep_bass_amount);
-            if (current_deep_bass_enabled != active_deep_bass_enabled || current_deep_bass_preset != active_deep_bass_preset) {
-                active_deep_bass_enabled = current_deep_bass_enabled;
-                active_deep_bass_preset = current_deep_bass_preset;
-                active_deep_bass_amount = current_deep_bass_amount;
-                deep_bass_l = DeepBassState{};
-                deep_bass_r = DeepBassState{};
-            }
-            if (current_deep_bass_amount != active_deep_bass_amount) {
-                active_deep_bass_amount = current_deep_bass_amount;
-            }
-            if (current_bass_db != active_bass_db || current_bass_hz != active_bass_hz) {
-                active_bass_db = current_bass_db;
-                active_bass_hz = current_bass_hz;
-                low = tone::make_low_shelf(format_.sample_rate, static_cast<double>(active_bass_db), static_cast<double>(active_bass_hz));
-                low_l = ShelfState{};
-                low_r = ShelfState{};
-            }
-            if (current_treble_db != active_treble_db || current_treble_hz != active_treble_hz) {
-                active_treble_db = current_treble_db;
-                active_treble_hz = current_treble_hz;
-                high = tone::make_high_shelf(format_.sample_rate, static_cast<double>(active_treble_db), static_cast<double>(active_treble_hz));
-                high_l = ShelfState{};
-                high_r = ShelfState{};
-            }
-            const bool dsp_active = current_soft_volume_percent < 100 || current_bass_db != 0 || current_treble_db != 0 || current_pre_eq_headroom_tenths_db > 0 || current_deep_bass_enabled;
-            const double user_volume = static_cast<double>(current_soft_volume_percent) / 100.0;
-            const double pre_eq_headroom_db = static_cast<double>(current_pre_eq_headroom_tenths_db) / 10.0;
-            const double pre_eq_headroom_gain = std::pow(10.0, -pre_eq_headroom_db / 20.0);
-            const bool measure_level = level_meter_enabled_.load(std::memory_order_relaxed);
-            const bool detect_clip = clip_detection_enabled_.load(std::memory_order_relaxed);
-            const double full_scale = static_cast<double>(pcm_full_scale(format_.bits_per_sample));
-            const double inv_full_scale = full_scale > 0.0 ? (1.0 / full_scale) : 0.0;
+            const ToneFilterTarget requested_tone_target{
+                current_bass_db,
+                current_treble_db,
+                current_bass_hz,
+                current_treble_hz,
+                current_pre_eq_headroom_tenths_db};
+            tone_filter.request(requested_tone_target);
+
+            bool tone_processing_for_frame = tone_filter.requires_processing();
+            const bool dsp_active =
+                current_soft_volume_percent < 100 ||
+                tone_processing_for_frame;
+            const bool narrowing_required =
+                output_format_.bits_per_sample < format_.bits_per_sample;
+            const DecoderPcmSampleKind decoded_sample_kind =
+                decoder_runtime_state.decoded_pcm_sample_kind;
+            const bool decoded_s16 =
+                decoded_sample_kind == DecoderPcmSampleKind::S16 ||
+                decoded_sample_kind == DecoderPcmSampleKind::S16Planar;
+            const bool exact_s16_repack =
+                output_format_.bits_per_sample == 16 &&
+                narrowing_required && !dsp_active &&
+                decoder_runtime_state.pcm16_quantization_stage_count > 0 &&
+                decoded_s16 &&
+                decoder_runtime_state.resampler_runtime_kind ==
+                    ResamplerRuntimeKind::NotUsed;
+            const bool final_output_conversion =
+                narrowing_required && !exact_s16_repack;
+            const bool final_s16_quantization =
+                output_format_.bits_per_sample == 16 &&
+                (final_output_conversion || dsp_active);
+            const Pcm16QuantizationRuntimeKind current_pcm16_quantization_runtime_kind =
+                final_s16_quantization
+                    ? (pcm16_quantization_mode_ == Pcm16QuantizationMode::Truncate
+                           ? Pcm16QuantizationRuntimeKind::Truncate
+                           : Pcm16QuantizationRuntimeKind::RoundToNearest)
+                    : decoder_runtime_state.pcm16_quantization_runtime_kind;
+            const std::uint32_t current_pcm16_quantization_stage_count =
+                decoder_runtime_state.pcm16_quantization_stage_count +
+                (final_s16_quantization ? 1U : 0U);
+            const double user_volume =
+                static_cast<double>(current_soft_volume_percent) / 100.0;
+            const bool measure_level =
+                level_meter_enabled_.load(std::memory_order_relaxed);
+            const bool detect_clip =
+                clip_detection_enabled_.load(std::memory_order_relaxed);
+            const double full_scale =
+                static_cast<double>(pcm_full_scale(format_.bits_per_sample));
+            const double minimum_scale =
+                static_cast<double>(pcm_minimum_sample(format_.bits_per_sample));
+
             float peak = 0.0f;
             std::uint32_t clipped_samples = 0;
             if (dsp_active) {
                 for (std::size_t i = 0; i < got; ++i) {
-                    const bool left = (ch == 1) || ((i % ch) == 0);
+                    const std::size_t channel_index = i % ch;
+                    const bool left = (ch == 1) || (channel_index == 0);
                     double sample = static_cast<double>(block[i]);
-                    sample *= pre_eq_headroom_gain;
-                    if (current_bass_db != 0) sample = process_sample(sample, low, left ? low_l : low_r);
-                    if (current_treble_db != 0) sample = process_sample(sample, high, left ? high_l : high_r);
-                    if (current_deep_bass_enabled && inv_full_scale > 0.0) {
-                        const double normalized = sample * inv_full_scale;
-                        sample = tone::process_deep_bass_normalized(normalized, format_.sample_rate, static_cast<tone::DeepBassPreset>(current_deep_bass_preset), left ? deep_bass_l : deep_bass_r, current_deep_bass_amount_gain) * full_scale;
+
+                    if (tone_processing_for_frame) {
+                        sample = tone_filter.process(sample, left);
+                        if (channel_index + 1 == ch) {
+                            tone_filter.advance_frame();
+                            tone_processing_for_frame = tone_filter.requires_processing();
+                        }
                     }
                     sample *= user_volume;
+
                     if (measure_level) {
-                        const double meter_mag = full_scale > 0.0 ? (std::fabs(sample) / full_scale) : 0.0;
-                        if (meter_mag > static_cast<double>(peak)) peak = static_cast<float>(meter_mag);
+                        const double meter_mag = full_scale > 0.0
+                            ? std::fabs(sample) / full_scale
+                            : 0.0;
+                        if (meter_mag > static_cast<double>(peak)) {
+                            peak = static_cast<float>(meter_mag);
+                        }
                     }
-                    if (detect_clip && sample_exceeds_full_scale(sample, format_.bits_per_sample)) {
+                    if (detect_clip &&
+                        (sample > full_scale || sample < minimum_scale)) {
                         ++clipped_samples;
                     }
-                    block[i] = static_cast<PcmSample>(std::llround(clamp_sample_to_bits(sample, format_.bits_per_sample)));
+
+                    if (output_format_.bits_per_sample < format_.bits_per_sample) {
+                        output_block[i] = quantize_working_sample_to_bits(
+                            sample,
+                            format_.bits_per_sample,
+                            output_format_.bits_per_sample,
+                            pcm16_quantization_mode_);
+                    } else {
+                        block[i] = quantize_processed_sample(
+                            sample, format_.bits_per_sample, pcm16_quantization_mode_);
+                    }
                 }
             } else {
                 if (measure_level) {
+                    std::int64_t peak_magnitude = 0;
                     for (std::size_t i = 0; i < got; ++i) {
-                        const double meter_mag = full_scale > 0.0 ? (std::fabs(static_cast<double>(block[i])) / full_scale) : 0.0;
-                        if (meter_mag > static_cast<double>(peak)) peak = static_cast<float>(meter_mag);
+                        const std::int64_t sample = static_cast<std::int64_t>(block[i]);
+                        const std::int64_t magnitude = sample < 0 ? -sample : sample;
+                        if (magnitude > peak_magnitude) {
+                            peak_magnitude = magnitude;
+                        }
+                    }
+                    if (full_scale > 0.0) {
+                        peak = static_cast<float>(
+                            static_cast<double>(peak_magnitude) / full_scale);
+                    }
+                }
+                if (narrowing_required) {
+                    for (std::size_t i = 0; i < got; ++i) {
+                        output_block[i] = exact_s16_repack
+                            ? narrow_exact_working_sample(
+                                  block[i],
+                                  format_.bits_per_sample,
+                                  output_format_.bits_per_sample)
+                            : quantize_working_sample_to_bits(
+                                  static_cast<double>(block[i]),
+                                  format_.bits_per_sample,
+                                  output_format_.bits_per_sample,
+                                  pcm16_quantization_mode_);
                     }
                 }
             }
-            backend_->write_samples(block.data(), got);
+
+            backend_->write_samples(
+                narrowing_required ? output_block.data() : block.data(),
+                got);
             // Publish visualization facts only after the PCM block has been
             // accepted by the output backend.  The GUI owns the display
             // ballistics; the playback thread only accumulates raw facts.
@@ -1198,21 +1940,38 @@ void PlaybackEngine::playback_loop(std::uint64_t transport_generation) {
                     }
                 }
             }
+
             played_samples_per_channel += got / ch;
             const DecoderSegmentPosition segment = decoder_->segment_position();
             publish_live_transport_position(played_samples_per_channel, segment);
-            const bool processing_state_changed =
-                current_resampler_runtime_kind !=
-                last_published_resampler_runtime_kind;
-            if (processing_state_changed) {
-                resampler_runtime_kind_.store(
-                    current_resampler_runtime_kind, std::memory_order_release);
-                last_published_resampler_runtime_kind =
-                    current_resampler_runtime_kind;
-            }
             const bool decoder_segment_changed = segment.valid &&
                 (!last_published_segment.valid ||
                  segment.index != last_published_segment.index);
+
+            const bool pcm16_quantization_state_changed =
+                current_pcm16_quantization_runtime_kind !=
+                last_published_pcm16_quantization_runtime_kind;
+            const bool pcm16_quantization_stage_count_changed =
+                current_pcm16_quantization_stage_count !=
+                last_published_pcm16_quantization_stage_count;
+            if (pcm16_quantization_state_changed) {
+                pcm16_quantization_runtime_kind_.store(
+                    current_pcm16_quantization_runtime_kind,
+                    std::memory_order_release);
+                last_published_pcm16_quantization_runtime_kind =
+                    current_pcm16_quantization_runtime_kind;
+            }
+            if (pcm16_quantization_stage_count_changed) {
+                pcm16_quantization_stage_count_.store(
+                    current_pcm16_quantization_stage_count,
+                    std::memory_order_release);
+                last_published_pcm16_quantization_stage_count =
+                    current_pcm16_quantization_stage_count;
+            }
+            processing_state_changed = processing_state_changed ||
+                pcm16_quantization_state_changed ||
+                pcm16_quantization_stage_count_changed;
+
             bool logical_segment_changed = false;
             while (next_logical_boundary + 1 < logical_segment_offsets_.size() &&
                    played_samples_per_channel >=
@@ -1236,6 +1995,7 @@ void PlaybackEngine::playback_loop(std::uint64_t transport_generation) {
                                     transport_generation);
             }
         }
+
         if (backend_ && !stop_requested_) backend_->drain();
         bool naturally_finished = false;
         {
@@ -1260,7 +2020,12 @@ void PlaybackEngine::playback_loop(std::uint64_t transport_generation) {
         }
     } catch (const std::exception& ex) {
         set_error(ex.what());
-        { std::lock_guard<std::mutex> lock(state_mutex_); snapshot_.playing = false; snapshot_.paused = false; snapshot_.message = last_error_; }
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            snapshot_.playing = false;
+            snapshot_.paused = false;
+            snapshot_.message = last_error_;
+        }
         emit_playback_event(PlaybackEventKind::Error,
                             transport_generation);
     } catch (...) {
@@ -1268,6 +2033,10 @@ void PlaybackEngine::playback_loop(std::uint64_t transport_generation) {
         emit_playback_event(PlaybackEventKind::Error,
                             transport_generation);
     }
+
+    long expected_tid = playback_tid;
+    playback_thread_tid_.compare_exchange_strong(
+        expected_tid, 0, std::memory_order_relaxed);
 }
 
 void PlaybackEngine::wait_if_paused() {

@@ -28,6 +28,9 @@ std::string to_upper_ascii(std::string value) {
 
 } // namespace
 
+FlacStreamDecoder::FlacStreamDecoder(std::uint16_t output_bits_per_sample) noexcept
+    : requested_output_bits_per_sample_(output_bits_per_sample) {}
+
 FlacStreamDecoder::~FlacStreamDecoder() {
     reset_decoder();
 }
@@ -52,6 +55,7 @@ void FlacStreamDecoder::open(const std::string& path) {
     metadata_seen_ = false;
     total_samples_per_channel_ = 0;
     format_ = AudioFormat{};
+    source_bits_per_sample_ = 0;
 
     decoder_ = FLAC__stream_decoder_new();
     if (decoder_ == nullptr) {
@@ -163,6 +167,27 @@ PresentationEndKind FlacStreamDecoder::presentation_end_kind() const noexcept {
     return total_samples_per_channel_ > 0
         ? PresentationEndKind::ExactSampleSpan
         : PresentationEndKind::Unknown;
+}
+
+std::string FlacStreamDecoder::decoded_codec_name() const {
+    return "flac/libFLAC";
+}
+
+DecoderPcmSampleKind FlacStreamDecoder::decoded_pcm_sample_kind() const noexcept {
+    return metadata_seen_ ? DecoderPcmSampleKind::S32 : DecoderPcmSampleKind::Unknown;
+}
+
+std::uint16_t FlacStreamDecoder::decoded_pcm_significant_bits() const noexcept {
+    return source_bits_per_sample_;
+}
+
+DecoderRuntimeStateSnapshot FlacStreamDecoder::runtime_state_snapshot() const {
+    DecoderRuntimeStateSnapshot state;
+    state.source_codec_name = "flac";
+    state.decoder_implementation_name = "libFLAC";
+    state.decoded_pcm_sample_kind = decoded_pcm_sample_kind();
+    state.decoded_pcm_significant_bits = decoded_pcm_significant_bits();
+    return state;
 }
 
 bool FlacStreamDecoder::seek_to_sample(std::uint64_t sample_index) {
@@ -287,10 +312,30 @@ void FlacStreamDecoder::handle_write(const ::FLAC__Frame* frame, const ::FLAC__i
     if (block.empty()) {
         return;
     }
+    const unsigned output_bits = format_.bits_per_sample;
+    const unsigned source_bits = source_bits_per_sample_ > 0
+        ? source_bits_per_sample_
+        : output_bits;
     std::size_t out = 0;
-    for (unsigned i = 0; i < blocksize; ++i) {
-        for (unsigned ch = 0; ch < channels; ++ch) {
-            block[out++] = static_cast<PcmSample>(buffer[ch][i]);
+    if (output_bits == source_bits) {
+        // Preserve the native lossless hot path when no precision widening is
+        // requested.
+        for (unsigned i = 0; i < blocksize; ++i) {
+            for (unsigned ch = 0; ch < channels; ++ch) {
+                block[out++] = static_cast<PcmSample>(buffer[ch][i]);
+            }
+        }
+    } else {
+        const unsigned shift = output_bits > source_bits
+            ? output_bits - source_bits
+            : 0U;
+        const std::int64_t scale = std::int64_t{1} << shift;
+        for (unsigned i = 0; i < blocksize; ++i) {
+            for (unsigned ch = 0; ch < channels; ++ch) {
+                const std::int64_t sample =
+                    static_cast<std::int64_t>(buffer[ch][i]) * scale;
+                block[out++] = static_cast<PcmSample>(sample);
+            }
         }
     }
     std::lock_guard<std::mutex> lock(mutex_);
@@ -304,7 +349,15 @@ void FlacStreamDecoder::handle_metadata(const ::FLAC__StreamMetadata* metadata) 
     }
     format_.sample_rate = metadata->data.stream_info.sample_rate;
     format_.channels = metadata->data.stream_info.channels;
-    format_.bits_per_sample = static_cast<std::uint16_t>(metadata->data.stream_info.bits_per_sample);
+    source_bits_per_sample_ =
+        static_cast<std::uint16_t>(metadata->data.stream_info.bits_per_sample);
+    format_.bits_per_sample = source_bits_per_sample_;
+    if ((requested_output_bits_per_sample_ == 16 ||
+         requested_output_bits_per_sample_ == 24 ||
+         requested_output_bits_per_sample_ == 32) &&
+        requested_output_bits_per_sample_ > source_bits_per_sample_) {
+        format_.bits_per_sample = requested_output_bits_per_sample_;
+    }
     total_samples_per_channel_ = metadata->data.stream_info.total_samples;
     metadata_seen_ = true;
 }

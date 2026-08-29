@@ -6,7 +6,7 @@
 
 ## Contributors
 
-- loki1368 (@loki1368)
+- Aleksandr Vysotskiy (@loki1368)
 
 PCM Transport was created and is maintained by Andrey Berestov.
 

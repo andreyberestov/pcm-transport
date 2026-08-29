@@ -20,10 +20,22 @@ constexpr std::uint64_t kExternalPrepareSeconds = 5;
 constexpr std::uint64_t kNativePrefetchMillis = 500;
 constexpr std::uint64_t kExternalPrefetchMillis = 1000;
 
-bool same_format(const AudioFormat& a, const AudioFormat& b) {
+bool same_transport_format(const AudioFormat& a, const AudioFormat& b) {
     return a.sample_rate == b.sample_rate &&
-           a.channels == b.channels &&
-           a.bits_per_sample == b.bits_per_sample;
+           a.channels == b.channels;
+}
+
+AudioFormat working_format_for_track(const GaplessTrackSpec& spec) {
+    return spec.format;
+}
+
+bool working_precision_changes(const std::vector<GaplessTrackSpec>& tracks,
+                               std::size_t current_index) {
+    if (current_index + 1 >= tracks.size()) {
+        return false;
+    }
+    return working_format_for_track(tracks[current_index]).bits_per_sample !=
+           working_format_for_track(tracks[current_index + 1]).bits_per_sample;
 }
 
 } // namespace
@@ -33,12 +45,14 @@ GaplessChainDecoder::GaplessChainDecoder(std::vector<GaplessTrackSpec> tracks, s
     if (tracks_.empty()) {
         throw std::invalid_argument("GaplessChainDecoder requires at least one track");
     }
-    format_ = tracks_.front().format;
+    output_format_ = tracks_.front().format;
+    format_ = working_format_for_track(tracks_.front());
     track_offsets_.reserve(tracks_.size());
     for (std::size_t i = 0; i < tracks_.size(); ++i) {
         const GaplessTrackSpec& spec = tracks_[i];
-        if (!same_format(format_, spec.format)) {
-            throw std::invalid_argument("GaplessChainDecoder requires matching output formats");
+        if (!same_transport_format(output_format_, spec.format)) {
+            throw std::invalid_argument(
+                "GaplessChainDecoder requires matching sample rate and channels");
         }
         if (!spec.start_sample_known ||
             spec.planned_end_sample < spec.start_sample) {
@@ -73,12 +87,12 @@ GaplessChainDecoder::~GaplessChainDecoder() {
 std::unique_ptr<IAudioDecoder> GaplessChainDecoder::create_decoder_for_track(const GaplessTrackSpec& spec) const {
     std::unique_ptr<IAudioDecoder> decoder;
     if (spec.native_flac) {
-        decoder.reset(new FlacStreamDecoder());
+        decoder.reset(new FlacStreamDecoder(spec.format.bits_per_sample));
     } else {
-        std::unique_ptr<ExternalAudioDecoder> external(new ExternalAudioDecoder(spec.forced_output_sample_rate,
-                                                                                spec.forced_output_bits_per_sample,
-                                                                                spec.resample_quality,
-                                                                                spec.bitdepth_quality));
+        std::unique_ptr<ExternalAudioDecoder> external(
+            new ExternalAudioDecoder(spec.forced_output_sample_rate,
+                                     spec.forced_output_bits_per_sample,
+                                     spec.resample_quality));
         if (spec.has_known_external_info) {
             external->set_known_info(spec.known_external_info);
         }
@@ -118,6 +132,39 @@ void GaplessChainDecoder::open_decoder_at_local_offset(
     decoder.open_at_sample(spec.path, source_offset);
 }
 
+void GaplessChainDecoder::publish_runtime_state(
+    const DecoderRuntimeStateSnapshot& state) {
+    bool changed = false;
+    const auto update_atomic = [&changed](auto& target, auto value) {
+        const auto previous = target.load(std::memory_order_relaxed);
+        if (previous != value) {
+            target.store(value, std::memory_order_release);
+            changed = true;
+        }
+    };
+
+    update_atomic(resampler_runtime_kind_, state.resampler_runtime_kind);
+    update_atomic(pcm16_quantization_runtime_kind_,
+                  state.pcm16_quantization_runtime_kind);
+    update_atomic(pcm16_quantization_stage_count_,
+                  state.pcm16_quantization_stage_count);
+    update_atomic(decoded_pcm_sample_kind_, state.decoded_pcm_sample_kind);
+    update_atomic(decoded_pcm_significant_bits_,
+                  state.decoded_pcm_significant_bits);
+    update_atomic(encoded_bitrate_bps_, state.encoded_bitrate_bps);
+    if (source_codec_name_ != state.source_codec_name) {
+        source_codec_name_ = state.source_codec_name;
+        changed = true;
+    }
+    if (decoded_codec_name_ != state.decoder_implementation_name) {
+        decoded_codec_name_ = state.decoder_implementation_name;
+        changed = true;
+    }
+    if (changed) {
+        runtime_state_generation_.fetch_add(1, std::memory_order_release);
+    }
+}
+
 void GaplessChainDecoder::open_current_decoder(std::uint64_t offset) {
     std::unique_ptr<IAudioDecoder> decoder =
         create_decoder_for_track(tracks_[current_index_]);
@@ -129,8 +176,17 @@ void GaplessChainDecoder::open_current_decoder(std::uint64_t offset) {
         }
     }
     open_decoder_at_local_offset(*current_decoder_, tracks_[current_index_], offset);
-    resampler_runtime_kind_.store(
-        current_decoder_->resampler_runtime_kind(), std::memory_order_release);
+    const AudioFormat decoder_format = current_decoder_->format();
+    if (decoder_format.sample_rate != output_format_.sample_rate ||
+        decoder_format.channels != output_format_.channels) {
+        throw std::runtime_error(
+            "Gapless decoder returned an incompatible transport format");
+    }
+    format_ = decoder_format;
+    const DecoderRuntimeStateSnapshot runtime_state =
+        current_decoder_->runtime_state_snapshot();
+    current_decoder_runtime_generation_ = runtime_state.generation;
+    publish_runtime_state(runtime_state);
     current_track_position_ = offset;
     Logger::instance().debug("GaplessChainDecoder opened track index=" + std::to_string(current_index_) +
                              " offset=" + std::to_string(offset) +
@@ -160,6 +216,7 @@ void GaplessChainDecoder::open_at_sample(const std::string&, std::uint64_t sampl
 const AudioFormat& GaplessChainDecoder::format() const {
     return format_;
 }
+
 
 std::size_t GaplessChainDecoder::read_samples(PcmSample* destination, std::size_t max_samples) {
     if (!opened_ || !current_decoder_) {
@@ -226,6 +283,9 @@ std::size_t GaplessChainDecoder::read_samples(PcmSample* destination, std::size_
                 reached_eof_ = true;
                 break;
             }
+            if (copied > 0 && working_precision_changes(tracks_, current_index_)) {
+                break;
+            }
             const SwitchResult sw = stop_requested_after_current_segment()
                 ? SwitchResult::NoNext
                 : switch_to_next_track();
@@ -260,6 +320,9 @@ std::size_t GaplessChainDecoder::read_samples(PcmSample* destination, std::size_
                 reached_eof_ = true;
                 break;
             }
+            if (copied > 0 && working_precision_changes(tracks_, current_index_)) {
+                break;
+            }
             const SwitchResult sw = stop_requested_after_current_segment()
                 ? SwitchResult::NoNext
                 : switch_to_next_track();
@@ -270,9 +333,16 @@ std::size_t GaplessChainDecoder::read_samples(PcmSample* destination, std::size_
             break;
         }
 
-        const std::size_t got = current_decoder_->read_samples(destination + copied, request_samples);
-        resampler_runtime_kind_.store(
-            current_decoder_->resampler_runtime_kind(), std::memory_order_release);
+        const std::size_t got = current_decoder_->read_samples(
+            destination + copied, request_samples);
+        const std::uint64_t runtime_generation =
+            current_decoder_->runtime_state_generation();
+        if (runtime_generation != current_decoder_runtime_generation_) {
+            const DecoderRuntimeStateSnapshot runtime_state =
+                current_decoder_->runtime_state_snapshot();
+            current_decoder_runtime_generation_ = runtime_state.generation;
+            publish_runtime_state(runtime_state);
+        }
         if (got > request_samples) {
             throw std::runtime_error("Decoder returned more PCM samples than requested");
         }
@@ -282,6 +352,9 @@ std::size_t GaplessChainDecoder::read_samples(PcmSample* destination, std::size_
         if (got == 0) {
             if (requested_segment_end_reached()) {
                 reached_eof_ = true;
+                break;
+            }
+            if (copied > 0 && working_precision_changes(tracks_, current_index_)) {
                 break;
             }
             const SwitchResult sw = stop_requested_after_current_segment()
@@ -335,6 +408,46 @@ TransportTruncationKind GaplessChainDecoder::transport_truncation_kind() const n
 
 ResamplerRuntimeKind GaplessChainDecoder::resampler_runtime_kind() const noexcept {
     return resampler_runtime_kind_.load(std::memory_order_acquire);
+}
+
+Pcm16QuantizationRuntimeKind
+GaplessChainDecoder::pcm16_quantization_runtime_kind() const noexcept {
+    return pcm16_quantization_runtime_kind_.load(std::memory_order_acquire);
+}
+
+std::uint32_t GaplessChainDecoder::pcm16_quantization_stage_count() const noexcept {
+    return pcm16_quantization_stage_count_.load(std::memory_order_acquire);
+}
+
+std::string GaplessChainDecoder::decoded_codec_name() const {
+    return decoded_codec_name_;
+}
+
+DecoderPcmSampleKind GaplessChainDecoder::decoded_pcm_sample_kind() const noexcept {
+    return decoded_pcm_sample_kind_.load(std::memory_order_acquire);
+}
+
+std::uint16_t GaplessChainDecoder::decoded_pcm_significant_bits() const noexcept {
+    return decoded_pcm_significant_bits_.load(std::memory_order_acquire);
+}
+
+std::uint64_t GaplessChainDecoder::runtime_state_generation() const noexcept {
+    return runtime_state_generation_.load(std::memory_order_acquire);
+}
+
+DecoderRuntimeStateSnapshot GaplessChainDecoder::runtime_state_snapshot() const {
+    DecoderRuntimeStateSnapshot state;
+    state.generation = runtime_state_generation();
+    state.resampler_runtime_kind = resampler_runtime_kind();
+    state.pcm16_quantization_runtime_kind = pcm16_quantization_runtime_kind();
+    state.pcm16_quantization_stage_count = pcm16_quantization_stage_count();
+    state.source_codec_name = source_codec_name_;
+    state.encoded_bitrate_bps =
+        encoded_bitrate_bps_.load(std::memory_order_acquire);
+    state.decoder_implementation_name = decoded_codec_name_;
+    state.decoded_pcm_sample_kind = decoded_pcm_sample_kind();
+    state.decoded_pcm_significant_bits = decoded_pcm_significant_bits();
+    return state;
 }
 
 bool GaplessChainDecoder::seek_to_sample(std::uint64_t sample_index) {
@@ -539,8 +652,7 @@ void GaplessChainDecoder::prepare_next_worker(std::size_t index,
             const std::size_t got = prepared.decoder->read_samples(
                 prepared.prebuffer.data(), prepared.prebuffer.size());
             prepared.prebuffer.resize(got);
-            prepared.resampler_runtime_kind =
-                prepared.decoder->resampler_runtime_kind();
+            prepared.runtime_state = prepared.decoder->runtime_state_snapshot();
             if (!cancelled()) {
                 prepared.ready = true;
                 Logger::instance().debug(
@@ -599,8 +711,8 @@ GaplessChainDecoder::SwitchResult GaplessChainDecoder::switch_to_next_track() {
     {
         std::lock_guard<std::mutex> lock(prepare_mutex_);
         if (prepared_.ready && prepared_.index == next_index && prepared_.decoder) {
-            const ResamplerRuntimeKind prepared_resampler_runtime_kind =
-                prepared_.resampler_runtime_kind;
+            const DecoderRuntimeStateSnapshot prepared_runtime_state =
+                prepared_.runtime_state;
             {
                 std::lock_guard<std::mutex> decoder_lock(decoder_mutex_);
                 current_decoder_ = std::move(prepared_.decoder);
@@ -608,13 +720,20 @@ GaplessChainDecoder::SwitchResult GaplessChainDecoder::switch_to_next_track() {
                     current_decoder_->request_abort();
                 }
             }
+            const AudioFormat decoder_format = current_decoder_->format();
+            if (decoder_format.sample_rate != output_format_.sample_rate ||
+                decoder_format.channels != output_format_.channels) {
+                throw std::runtime_error(
+                    "Gapless prebuffered decoder returned an incompatible working format");
+            }
+            format_ = decoder_format;
             current_prebuffer_ = std::move(prepared_.prebuffer);
             current_prebuffer_offset_ = 0;
             prepared_ = PreparedNext{};
             current_index_ = next_index;
             current_track_position_ = 0;
-            resampler_runtime_kind_.store(
-                prepared_resampler_runtime_kind, std::memory_order_release);
+            current_decoder_runtime_generation_ = prepared_runtime_state.generation;
+            publish_runtime_state(prepared_runtime_state);
             switched_to_prebuffered = true;
         } else if (prepared_.failed && prepared_.index == next_index) {
             Logger::instance().debug(

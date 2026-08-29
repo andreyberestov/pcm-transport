@@ -33,7 +33,7 @@ struct FlacFileProbe {
 
 class FlacStreamDecoder final : public IAudioDecoder {
 public:
-    FlacStreamDecoder() = default;
+    explicit FlacStreamDecoder(std::uint16_t output_bits_per_sample = 0) noexcept;
     ~FlacStreamDecoder() override;
 
     void open(const std::string& path) override;
@@ -44,6 +44,10 @@ public:
     std::uint64_t total_samples_per_channel() const override;
     std::string source_path() const override;
     PresentationEndKind presentation_end_kind() const noexcept override;
+    std::string decoded_codec_name() const override;
+    DecoderPcmSampleKind decoded_pcm_sample_kind() const noexcept override;
+    std::uint16_t decoded_pcm_significant_bits() const noexcept override;
+    DecoderRuntimeStateSnapshot runtime_state_snapshot() const override;
     bool seek_to_sample(std::uint64_t sample_index) override;
 
     static FlacFileProbe probe_file(const std::string& path);
@@ -66,6 +70,8 @@ private:
     void fill_queue_if_needed();
     void reset_decoder();
 
+    std::uint16_t requested_output_bits_per_sample_ = 0;
+    std::uint16_t source_bits_per_sample_ = 0;
     AudioFormat format_{};
     bool opened_ = false;
     bool reached_eof_ = false;

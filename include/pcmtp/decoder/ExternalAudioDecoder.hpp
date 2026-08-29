@@ -52,8 +52,7 @@ class ExternalAudioDecoder final : public IAudioDecoder {
 public:
     explicit ExternalAudioDecoder(std::uint32_t forced_output_sample_rate = 0,
                                   std::uint16_t forced_output_bits_per_sample = 0,
-                                  const std::string& resample_quality = "maximum",
-                                  const std::string& bitdepth_quality = "tpdf_hp");
+                                  const std::string& resample_quality = "maximum");
     ~ExternalAudioDecoder() override;
 
     ExternalAudioDecoder(const ExternalAudioDecoder&) = delete;
@@ -69,6 +68,13 @@ public:
     std::string source_path() const override;
     PresentationEndKind presentation_end_kind() const noexcept override;
     ResamplerRuntimeKind resampler_runtime_kind() const noexcept override;
+    Pcm16QuantizationRuntimeKind pcm16_quantization_runtime_kind() const noexcept override;
+    std::uint32_t pcm16_quantization_stage_count() const noexcept override;
+    std::string decoded_codec_name() const override;
+    DecoderPcmSampleKind decoded_pcm_sample_kind() const noexcept override;
+    std::uint16_t decoded_pcm_significant_bits() const noexcept override;
+    std::uint64_t runtime_state_generation() const noexcept override;
+    DecoderRuntimeStateSnapshot runtime_state_snapshot() const override;
     bool seek_to_sample(std::uint64_t sample_index) override;
     void request_abort() override;
 
@@ -92,7 +98,6 @@ private:
     std::uint32_t forced_output_sample_rate_ = 0;
     std::uint16_t forced_output_bits_per_sample_ = 0;
     std::string resample_quality_ = "maximum";
-    std::string bitdepth_quality_ = "tpdf_hp";
     bool have_known_info_ = false;
     ExternalAudioInfo known_info_{};
     AudioFormat format_{};
@@ -100,9 +105,13 @@ private:
     std::uint64_t total_samples_per_channel_ = 0;
     std::string path_;
     std::string codec_name_;
+    std::string runtime_codec_name_;
+    std::string runtime_source_codec_name_;
+    std::uint64_t runtime_encoded_bitrate_bps_ = 0;
     PresentationEndKind presentation_end_kind_ = PresentationEndKind::Unknown;
     std::uint64_t presentation_timeline_origin_sample_ = 0;
     bool dsd_source_ = false;
+    bool lossless_source_ = false;
     bool opened_ = false;
     bool reached_eof_ = false;
     std::uint64_t current_samples_per_channel_ = 0;

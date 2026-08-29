@@ -2214,20 +2214,6 @@ int soxr_precision(const std::string& quality) {
     return 33;
 }
 
-const char* dither_method(const std::string& quality) {
-    if (quality == "tpdf") return "triangular";
-    if (quality == "rectangular") return "rectangular";
-    return "triangular_hp";
-}
-
-void set_swr_option(SwrContext* context, const char* name, const char* value) {
-    const int result = av_opt_set(context, name, value, 0);
-    if (result < 0) {
-        throw std::runtime_error(std::string("Cannot set FFmpeg resampler option ") +
-                                 name + ": " + av_error_string(result));
-    }
-}
-
 void set_swr_option_int(SwrContext* context, const char* name, std::int64_t value) {
     const int result = av_opt_set_int(context, name, value, 0);
     if (result < 0) {
@@ -2259,6 +2245,13 @@ struct ExternalAudioDecoder::Impl {
     std::vector<const std::uint8_t*> input_planes;
     std::atomic<ResamplerRuntimeKind> resampler_runtime_kind{
         ResamplerRuntimeKind::NotUsed};
+    std::atomic<Pcm16QuantizationRuntimeKind> pcm16_quantization_runtime_kind{
+        Pcm16QuantizationRuntimeKind::NotUsed};
+    std::atomic<std::uint32_t> pcm16_quantization_stage_count{0};
+    std::atomic<DecoderPcmSampleKind> decoded_pcm_sample_kind{
+        DecoderPcmSampleKind::Unknown};
+    std::atomic<std::uint16_t> decoded_pcm_significant_bits{0};
+    std::atomic<std::uint64_t> runtime_state_generation{0};
     bool seeking = false;
     std::uint64_t seek_target_sample = 0;
     std::uint64_t output_timeline_sample = 0;
@@ -2279,6 +2272,22 @@ struct ExternalAudioDecoder::Impl {
 
     ~Impl() {
         clear_configured_input_layout();
+    }
+
+    template <typename T>
+    bool update_runtime_value(std::atomic<T>& target, T value) noexcept {
+        const T previous = target.load(std::memory_order_relaxed);
+        if (previous == value) {
+            return false;
+        }
+        target.store(value, std::memory_order_release);
+        return true;
+    }
+
+    void publish_runtime_state_change(bool changed) noexcept {
+        if (changed) {
+            runtime_state_generation.fetch_add(1, std::memory_order_release);
+        }
     }
 
     void clear_configured_input_layout() {
@@ -2302,6 +2311,13 @@ struct ExternalAudioDecoder::Impl {
         pending_offset = 0;
         resampler_runtime_kind.store(
             ResamplerRuntimeKind::NotUsed, std::memory_order_release);
+        pcm16_quantization_runtime_kind.store(
+            Pcm16QuantizationRuntimeKind::NotUsed, std::memory_order_release);
+        pcm16_quantization_stage_count.store(0, std::memory_order_release);
+        decoded_pcm_sample_kind.store(
+            DecoderPcmSampleKind::Unknown, std::memory_order_release);
+        decoded_pcm_significant_bits.store(0, std::memory_order_release);
+        runtime_state_generation.fetch_add(1, std::memory_order_release);
         seeking = false;
         seek_target_sample = 0;
         output_timeline_sample = 0;
@@ -2315,12 +2331,10 @@ struct ExternalAudioDecoder::Impl {
 
 ExternalAudioDecoder::ExternalAudioDecoder(std::uint32_t forced_output_sample_rate,
                                            std::uint16_t forced_output_bits_per_sample,
-                                           const std::string& resample_quality,
-                                           const std::string& bitdepth_quality)
+                                           const std::string& resample_quality)
     : forced_output_sample_rate_(forced_output_sample_rate),
       forced_output_bits_per_sample_(forced_output_bits_per_sample),
       resample_quality_(resample_quality),
-      bitdepth_quality_(bitdepth_quality),
       impl_(new Impl()) {}
 
 ExternalAudioDecoder::~ExternalAudioDecoder() {
@@ -2698,16 +2712,66 @@ std::uint64_t resolved_input_layout(const AVFrame* frame,
 }
 #endif
 
+bool input_layout_matches_default(const AVFrame* frame,
+                                  const AVCodecContext* codec_context,
+                                  int channels) {
+#if PCMTP_FFMPEG_HAS_MODERN_CHANNEL_LAYOUT
+    ChannelLayoutGuard input_layout(
+        resolved_input_layout(frame, codec_context, channels));
+    ChannelLayoutGuard default_layout;
+    av_channel_layout_default(default_layout.get(), channels);
+    return av_channel_layout_compare(input_layout.get(), default_layout.get()) == 0;
+#else
+    const std::uint64_t input_layout =
+        resolved_input_layout(frame, codec_context, channels);
+    const std::int64_t default_layout = av_get_default_channel_layout(channels);
+    return default_layout > 0 &&
+           input_layout == static_cast<std::uint64_t>(default_layout);
+#endif
+}
+
+DecoderPcmSampleKind decoder_pcm_sample_kind_from_av(AVSampleFormat format) noexcept {
+    switch (format) {
+    case AV_SAMPLE_FMT_U8: return DecoderPcmSampleKind::U8;
+    case AV_SAMPLE_FMT_U8P: return DecoderPcmSampleKind::U8Planar;
+    case AV_SAMPLE_FMT_S16: return DecoderPcmSampleKind::S16;
+    case AV_SAMPLE_FMT_S16P: return DecoderPcmSampleKind::S16Planar;
+    case AV_SAMPLE_FMT_S32: return DecoderPcmSampleKind::S32;
+    case AV_SAMPLE_FMT_S32P: return DecoderPcmSampleKind::S32Planar;
+    case AV_SAMPLE_FMT_FLT: return DecoderPcmSampleKind::Float;
+    case AV_SAMPLE_FMT_FLTP: return DecoderPcmSampleKind::FloatPlanar;
+    case AV_SAMPLE_FMT_DBL: return DecoderPcmSampleKind::Double;
+    case AV_SAMPLE_FMT_DBLP: return DecoderPcmSampleKind::DoublePlanar;
+#if LIBAVUTIL_VERSION_MAJOR >= 56
+    case AV_SAMPLE_FMT_S64: return DecoderPcmSampleKind::S64;
+    case AV_SAMPLE_FMT_S64P: return DecoderPcmSampleKind::S64Planar;
+#endif
+    case AV_SAMPLE_FMT_NONE:
+    default: return DecoderPcmSampleKind::Unknown;
+    }
+}
+
+std::uint16_t decoder_pcm_significant_bits_from_av(AVSampleFormat format) noexcept {
+    switch (av_get_packed_sample_fmt(format)) {
+    case AV_SAMPLE_FMT_U8: return 8;
+    case AV_SAMPLE_FMT_S16: return 16;
+    case AV_SAMPLE_FMT_S32: return 32;
+#if LIBAVUTIL_VERSION_MAJOR >= 56
+    case AV_SAMPLE_FMT_S64: return 64;
+#endif
+    default: return 0;
+    }
+}
+
 template <typename DecoderImpl>
 void configure_resampler(DecoderImpl& impl,
                          const AVFrame* frame,
                          const AudioFormat& output_format,
                          const AudioFormat& source_format,
                          bool dsd_source,
+                         bool lossless_source,
                          std::uint32_t forced_output_sample_rate,
-                         std::uint16_t forced_output_bits,
-                         const std::string& resample_quality,
-                         const std::string& bitdepth_quality) {
+                         const std::string& resample_quality) {
     const int input_rate =
         frame->sample_rate > 0 ? frame->sample_rate : impl.codec_context->sample_rate;
     const AVSampleFormat input_format = static_cast<AVSampleFormat>(frame->format);
@@ -2715,6 +2779,19 @@ void configure_resampler(DecoderImpl& impl,
     if (input_rate <= 0 || channels <= 0 || input_format == AV_SAMPLE_FMT_NONE) {
         throw std::runtime_error("Invalid decoded audio frame format");
     }
+    bool runtime_state_changed = impl.update_runtime_value(
+        impl.decoded_pcm_sample_kind,
+        decoder_pcm_sample_kind_from_av(input_format));
+    const std::uint16_t decoded_storage_bits =
+        decoder_pcm_significant_bits_from_av(input_format);
+    const std::uint16_t decoded_significant_bits =
+        lossless_source && decoded_storage_bits > 0 &&
+                source_format.bits_per_sample > 0
+            ? std::min(decoded_storage_bits, source_format.bits_per_sample)
+            : 0;
+    runtime_state_changed = impl.update_runtime_value(
+        impl.decoded_pcm_significant_bits,
+        decoded_significant_bits) || runtime_state_changed;
 
 #if PCMTP_FFMPEG_HAS_MODERN_CHANNEL_LAYOUT
     ChannelLayoutGuard input_layout(
@@ -2736,6 +2813,7 @@ void configure_resampler(DecoderImpl& impl,
         impl.configured_input_format == input_format &&
         impl.configured_channels == channels &&
         layout_matches) {
+        impl.publish_runtime_state_change(runtime_state_changed);
         return;
     }
 
@@ -2745,8 +2823,14 @@ void configure_resampler(DecoderImpl& impl,
         }
     }
 
+    const bool forced_rate_active =
+        forced_output_sample_rate > 0 &&
+        forced_output_sample_rate != source_format.sample_rate;
+    const bool resampling_active = forced_rate_active;
     const AVSampleFormat output_sample_format =
-        output_format.bits_per_sample <= 16 ? AV_SAMPLE_FMT_S16 : AV_SAMPLE_FMT_S32;
+        output_format.bits_per_sample <= 16
+            ? AV_SAMPLE_FMT_S16
+            : AV_SAMPLE_FMT_S32;
 #if PCMTP_FFMPEG_HAS_MODERN_CHANNEL_LAYOUT
     ChannelLayoutGuard output_layout;
     av_channel_layout_default(output_layout.get(), output_format.channels);
@@ -2790,23 +2874,8 @@ void configure_resampler(DecoderImpl& impl,
     };
 #endif
 
-    const bool forced_rate_active =
-        forced_output_sample_rate > 0 &&
-        forced_output_sample_rate != source_format.sample_rate;
-    const bool forced_bits_active =
-        forced_output_bits > 0 &&
-        forced_output_bits != source_format.bits_per_sample;
-    const bool quality_filter_active =
-        forced_rate_active ||
-        (dsd_source ? output_format.bits_per_sample <= 16 : forced_bits_active);
-
     const auto apply_output_options = [&](SwrContext* context) {
-        set_swr_option_int(
-            context, "output_sample_bits", output_format.bits_per_sample);
-        if (output_format.bits_per_sample <= 16) {
-            set_swr_option(
-                context, "dither_method", dither_method(bitdepth_quality));
-        }
+        set_swr_option_int(context, "dither_method", SWR_DITHER_NONE);
     };
 
     SwrContextGuard new_context;
@@ -2814,7 +2883,7 @@ void configure_resampler(DecoderImpl& impl,
     bool initialized = false;
     ResamplerRuntimeKind runtime_kind = ResamplerRuntimeKind::NotUsed;
     int soxr_failure = 0;
-    if (quality_filter_active) {
+    if (resampling_active) {
         const std::string precision =
             std::to_string(soxr_precision(resample_quality));
         int option_result = av_opt_set(new_context.get(), "resampler", "soxr", 0);
@@ -2840,25 +2909,25 @@ void configure_resampler(DecoderImpl& impl,
 
         if (!initialized) {
             std::string warning =
-                "FFmpeg SoXr resampler unavailable; falling back to the "
+                "FFmpeg SoXR resampler unavailable; falling back to the "
                 "built-in SWR engine";
             if (soxr_failure < 0) {
                 warning += ": " + av_error_string(soxr_failure);
             }
             Logger::instance().warning(warning);
             new_context.reset(allocate_resampler_context());
-            apply_output_options(new_context.get());
         }
     }
 
     if (!initialized) {
+        apply_output_options(new_context.get());
         const int init_result = swr_init(new_context.get());
         if (init_result < 0) {
             throw std::runtime_error(
                 "Cannot initialize FFmpeg API resampler: " +
                 av_error_string(init_result));
         }
-        if (quality_filter_active) {
+        if (resampling_active) {
             runtime_kind = ResamplerRuntimeKind::FfmpegSwr;
         }
     }
@@ -2887,7 +2956,23 @@ void configure_resampler(DecoderImpl& impl,
     impl.configured_input_layout = input_layout;
 #endif
     impl.swr_drained = false;
-    impl.resampler_runtime_kind.store(runtime_kind, std::memory_order_release);
+    runtime_state_changed = impl.update_runtime_value(
+        impl.resampler_runtime_kind, runtime_kind) || runtime_state_changed;
+    const AVSampleFormat packed_input_format =
+        av_get_packed_sample_fmt(input_format);
+    const bool lossy_decoder_s16_stage =
+        !lossless_source && !dsd_source && packed_input_format == AV_SAMPLE_FMT_S16;
+    const std::uint32_t pcm16_stage_count =
+        lossy_decoder_s16_stage ? 1U : 0U;
+    runtime_state_changed = impl.update_runtime_value(
+        impl.pcm16_quantization_stage_count,
+        pcm16_stage_count) || runtime_state_changed;
+    runtime_state_changed = impl.update_runtime_value(
+        impl.pcm16_quantization_runtime_kind,
+        pcm16_stage_count == 0
+            ? Pcm16QuantizationRuntimeKind::NotUsed
+            : Pcm16QuantizationRuntimeKind::Ffmpeg) || runtime_state_changed;
+    impl.publish_runtime_state_change(runtime_state_changed);
 }
 
 std::optional<std::uint64_t> frame_timestamp_sample(
@@ -2947,25 +3032,159 @@ std::uint64_t frame_duration_at_output_rate(const AVFrame* frame,
 }
 
 template <typename DecoderImpl>
+std::optional<std::size_t> append_native_lossless_frame_fast(
+    DecoderImpl& impl,
+    const AVFrame* frame,
+    const AudioFormat& output_format,
+    const AudioFormat& source_format,
+    bool dsd_source,
+    bool lossless_source,
+    std::uint32_t forced_output_sample_rate,
+    std::uint16_t forced_output_bits) {
+    if (frame == nullptr || !lossless_source || dsd_source || impl.swr_context != nullptr) {
+        return std::nullopt;
+    }
+    const bool forced_rate_active =
+        forced_output_sample_rate > 0 &&
+        forced_output_sample_rate != source_format.sample_rate;
+    const bool forced_bits_active =
+        forced_output_bits > 0 &&
+        forced_output_bits != source_format.bits_per_sample;
+    if (forced_rate_active || forced_bits_active) {
+        return std::nullopt;
+    }
+
+    const int input_rate =
+        frame->sample_rate > 0 ? frame->sample_rate : impl.codec_context->sample_rate;
+    const AVSampleFormat input_format = static_cast<AVSampleFormat>(frame->format);
+    const AVSampleFormat packed_format = av_get_packed_sample_fmt(input_format);
+    const int channels = frame_channels(frame, impl.codec_context);
+    if (input_rate <= 0 || channels <= 0 || channels > 2 ||
+        input_rate != static_cast<int>(output_format.sample_rate) ||
+        channels != static_cast<int>(output_format.channels)) {
+        return std::nullopt;
+    }
+
+    const bool direct_s16 =
+        output_format.bits_per_sample == 16 &&
+        source_format.bits_per_sample == 16 &&
+        packed_format == AV_SAMPLE_FMT_S16;
+    const bool direct_s32 =
+        output_format.bits_per_sample == 32 &&
+        source_format.bits_per_sample == 32 &&
+        packed_format == AV_SAMPLE_FMT_S32;
+    if (!direct_s16 && !direct_s32) {
+        return std::nullopt;
+    }
+    if (!input_layout_matches_default(frame, impl.codec_context, channels)) {
+        return std::nullopt;
+    }
+
+    if (frame->nb_samples <= 0) {
+        return std::size_t{0};
+    }
+    const std::size_t frames = static_cast<std::size_t>(frame->nb_samples);
+    const std::size_t sample_count = frames * static_cast<std::size_t>(channels);
+    const std::size_t old_size = impl.pending_samples.size();
+    impl.pending_samples.resize(old_size + sample_count);
+    const bool planar = av_sample_fmt_is_planar(input_format) != 0;
+
+    if (direct_s16) {
+        if (planar) {
+            std::size_t out = old_size;
+            for (std::size_t i = 0; i < frames; ++i) {
+                for (int ch = 0; ch < channels; ++ch) {
+                    const auto* plane = reinterpret_cast<const std::int16_t*>(
+                        frame->extended_data[ch]);
+                    impl.pending_samples[out++] = static_cast<PcmSample>(plane[i]);
+                }
+            }
+        } else {
+            const auto* input = reinterpret_cast<const std::int16_t*>(
+                frame->extended_data[0]);
+            for (std::size_t i = 0; i < sample_count; ++i) {
+                impl.pending_samples[old_size + i] = static_cast<PcmSample>(input[i]);
+            }
+        }
+    } else {
+        if (planar) {
+            std::size_t out = old_size;
+            for (std::size_t i = 0; i < frames; ++i) {
+                for (int ch = 0; ch < channels; ++ch) {
+                    const auto* plane = reinterpret_cast<const std::int32_t*>(
+                        frame->extended_data[ch]);
+                    impl.pending_samples[out++] = static_cast<PcmSample>(plane[i]);
+                }
+            }
+        } else {
+            const auto* input = reinterpret_cast<const std::int32_t*>(
+                frame->extended_data[0]);
+            std::copy_n(input, sample_count, impl.pending_samples.data() + old_size);
+        }
+    }
+
+    const bool runtime_format_changed =
+        impl.configured_input_rate != input_rate ||
+        impl.configured_input_format != input_format ||
+        impl.configured_channels != channels;
+    if (runtime_format_changed) {
+        bool runtime_state_changed = impl.update_runtime_value(
+            impl.decoded_pcm_sample_kind,
+            decoder_pcm_sample_kind_from_av(input_format));
+        runtime_state_changed = impl.update_runtime_value(
+            impl.decoded_pcm_significant_bits,
+            source_format.bits_per_sample) || runtime_state_changed;
+        runtime_state_changed = impl.update_runtime_value(
+            impl.resampler_runtime_kind,
+            ResamplerRuntimeKind::NotUsed) || runtime_state_changed;
+        runtime_state_changed = impl.update_runtime_value(
+            impl.pcm16_quantization_runtime_kind,
+            Pcm16QuantizationRuntimeKind::NotUsed) || runtime_state_changed;
+        runtime_state_changed = impl.update_runtime_value(
+            impl.pcm16_quantization_stage_count,
+            std::uint32_t{0}) || runtime_state_changed;
+        impl.configured_input_rate = input_rate;
+        impl.configured_input_format = input_format;
+        impl.configured_channels = channels;
+        impl.publish_runtime_state_change(runtime_state_changed);
+    }
+    impl.swr_drained = true;
+    return sample_count;
+}
+
+template <typename DecoderImpl>
 std::size_t append_converted_frame(DecoderImpl& impl,
                             const AVFrame* frame,
                             const AudioFormat& output_format,
                             const AudioFormat& source_format,
                             bool dsd_source,
+                            bool lossless_source,
                             std::uint32_t forced_output_sample_rate,
                             std::uint16_t forced_output_bits,
-                            const std::string& resample_quality,
-                            const std::string& bitdepth_quality) {
+                            const std::string& resample_quality) {
+    const std::optional<std::size_t> native_lossless_samples =
+        append_native_lossless_frame_fast(
+            impl,
+            frame,
+            output_format,
+            source_format,
+            dsd_source,
+            lossless_source,
+            forced_output_sample_rate,
+            forced_output_bits);
+    if (native_lossless_samples.has_value()) {
+        return *native_lossless_samples;
+    }
+
     configure_resampler(
         impl,
         frame,
         output_format,
         source_format,
         dsd_source,
+        lossless_source,
         forced_output_sample_rate,
-        forced_output_bits,
-        resample_quality,
-        bitdepth_quality);
+        resample_quality);
     const int input_rate =
         frame->sample_rate > 0 ? frame->sample_rate : impl.codec_context->sample_rate;
     const AVSampleFormat input_format = static_cast<AVSampleFormat>(frame->format);
@@ -3046,6 +3265,9 @@ bool recover_from_invalid_data(DecoderImpl& impl,
 
 void ExternalAudioDecoder::open_decoder(std::uint64_t sample_index) {
     close_decoder();
+    runtime_codec_name_.clear();
+    runtime_source_codec_name_.clear();
+    runtime_encoded_bitrate_bps_ = 0;
     try {
         impl_->interrupt.abort_requested = &impl_->abort_requested;
         impl_->format_context = open_input_context(path_, &impl_->interrupt, true);
@@ -3074,6 +3296,14 @@ void ExternalAudioDecoder::open_decoder(std::uint64_t sample_index) {
         if (result < 0) {
             close_decoder();
             throw std::runtime_error("Cannot open FFmpeg decoder: " + av_error_string(result));
+        }
+        runtime_codec_name_ = decoder->name != nullptr
+            ? std::string(decoder->name)
+            : std::string(avcodec_get_name(parameters->codec_id));
+        runtime_source_codec_name_ = std::string(avcodec_get_name(parameters->codec_id));
+        if (parameters->bit_rate > 0) {
+            runtime_encoded_bitrate_bps_ =
+                static_cast<std::uint64_t>(parameters->bit_rate);
         }
         impl_->packet = av_packet_alloc();
         impl_->frame = av_frame_alloc();
@@ -3104,6 +3334,8 @@ void ExternalAudioDecoder::open_at_sample(const std::string& path, std::uint64_t
     const ExternalAudioInfo info = effective_probe_info(path);
     format_ = info.format;
     source_format_ = info.source_format.sample_rate > 0 ? info.source_format : info.format;
+    dsd_source_ = info.dsd_source;
+    lossless_source_ = info.lossless;
     presentation_timeline_origin_sample_ = 0;
     if (info.source_presentation_start_known &&
         source_format_.sample_rate > 0 && format_.sample_rate > 0 &&
@@ -3124,9 +3356,8 @@ void ExternalAudioDecoder::open_at_sample(const std::string& path, std::uint64_t
     }
     codec_name_ = info.codec_name;
     presentation_end_kind_ = info.presentation_end_kind;
-    dsd_source_ = info.dsd_source;
     total_samples_per_channel_ = info.total_samples_per_channel;
-    Logger::instance().debug("ExternalAudioDecoder direct libav format: " +
+    Logger::instance().debug("ExternalAudioDecoder direct libav format: working " +
                              std::to_string(format_.sample_rate) + " Hz / " +
                              std::to_string(format_.bits_per_sample) + "-bit / " +
                              std::to_string(format_.channels) + " ch, total samples/ch=" +
@@ -3141,6 +3372,7 @@ void ExternalAudioDecoder::open_at_sample(const std::string& path, std::uint64_t
 const AudioFormat& ExternalAudioDecoder::format() const {
     return format_;
 }
+
 
 std::size_t ExternalAudioDecoder::read_samples(PcmSample* destination, std::size_t max_samples) {
     if (!opened_ || impl_->format_context == nullptr || impl_->codec_context == nullptr) {
@@ -3296,10 +3528,10 @@ std::size_t ExternalAudioDecoder::read_samples(PcmSample* destination, std::size
                 format_,
                 source_format_,
                 dsd_source_,
+                lossless_source_,
                 forced_output_sample_rate_,
                 forced_output_bits_per_sample_,
-                resample_quality_,
-                bitdepth_quality_);
+                resample_quality_);
             const std::uint64_t produced_frames = produced_samples / channels;
             impl_->output_timeline_sample = produced_frames >
                     std::numeric_limits<std::uint64_t>::max() - start_sample
@@ -3445,15 +3677,68 @@ ResamplerRuntimeKind ExternalAudioDecoder::resampler_runtime_kind() const noexce
     const bool forced_rate_active =
         forced_output_sample_rate_ > 0 &&
         forced_output_sample_rate_ != source_format_.sample_rate;
-    const bool forced_bits_active =
-        forced_output_bits_per_sample_ > 0 &&
-        forced_output_bits_per_sample_ != source_format_.bits_per_sample;
-    const bool quality_filter_active =
-        forced_rate_active ||
-        (dsd_source_ ? format_.bits_per_sample <= 16 : forced_bits_active);
-    return quality_filter_active
+    return forced_rate_active
         ? ResamplerRuntimeKind::Initializing
         : ResamplerRuntimeKind::NotUsed;
+}
+
+Pcm16QuantizationRuntimeKind
+ExternalAudioDecoder::pcm16_quantization_runtime_kind() const noexcept {
+    if (!opened_ || impl_ == nullptr) {
+        return Pcm16QuantizationRuntimeKind::NotUsed;
+    }
+    return impl_->pcm16_quantization_runtime_kind.load(std::memory_order_acquire);
+}
+
+std::uint32_t ExternalAudioDecoder::pcm16_quantization_stage_count() const noexcept {
+    if (!opened_ || impl_ == nullptr) {
+        return 0;
+    }
+    return impl_->pcm16_quantization_stage_count.load(std::memory_order_acquire);
+}
+
+std::string ExternalAudioDecoder::decoded_codec_name() const {
+    return runtime_codec_name_.empty() ? codec_name_ : runtime_codec_name_;
+}
+
+DecoderPcmSampleKind ExternalAudioDecoder::decoded_pcm_sample_kind() const noexcept {
+    if (!opened_ || impl_ == nullptr) {
+        return DecoderPcmSampleKind::Unknown;
+    }
+    return impl_->decoded_pcm_sample_kind.load(std::memory_order_acquire);
+}
+
+std::uint16_t ExternalAudioDecoder::decoded_pcm_significant_bits() const noexcept {
+    if (!opened_ || impl_ == nullptr) {
+        return 0;
+    }
+    return impl_->decoded_pcm_significant_bits.load(std::memory_order_acquire);
+}
+
+std::uint64_t ExternalAudioDecoder::runtime_state_generation() const noexcept {
+    if (!opened_ || impl_ == nullptr) {
+        return 0;
+    }
+    return impl_->runtime_state_generation.load(std::memory_order_acquire);
+}
+
+DecoderRuntimeStateSnapshot ExternalAudioDecoder::runtime_state_snapshot() const {
+    DecoderRuntimeStateSnapshot state;
+    if (!opened_ || impl_ == nullptr) {
+        return state;
+    }
+    state.generation = runtime_state_generation();
+    state.resampler_runtime_kind = resampler_runtime_kind();
+    state.pcm16_quantization_runtime_kind = pcm16_quantization_runtime_kind();
+    state.pcm16_quantization_stage_count = pcm16_quantization_stage_count();
+    state.source_codec_name = runtime_source_codec_name_.empty()
+        ? codec_name_
+        : runtime_source_codec_name_;
+    state.encoded_bitrate_bps = runtime_encoded_bitrate_bps_;
+    state.decoder_implementation_name = decoded_codec_name();
+    state.decoded_pcm_sample_kind = decoded_pcm_sample_kind();
+    state.decoded_pcm_significant_bits = decoded_pcm_significant_bits();
+    return state;
 }
 
 void ExternalAudioDecoder::request_abort() {

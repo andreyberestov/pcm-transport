@@ -42,6 +42,7 @@ struct PlaybackTransportSnapshot {
     bool paused = false;
     bool finished = false;
     AudioFormat format{};
+    AudioFormat working_format{};
     std::uint64_t current_samples_per_channel = 0;
     std::uint64_t total_samples_per_channel = 0;
     bool segment_position_valid = false;
@@ -56,6 +57,23 @@ struct PlaybackMeterSnapshot {
     float peak_level = 0.0f;
     std::uint32_t clipped_samples = 0;
     bool transport_active = false;
+};
+
+enum class RealtimePrioritySource {
+    None,
+    Direct,
+    Rtkit
+};
+
+struct RealtimePriorityStatusSnapshot {
+    bool enabled = false;
+    bool active = false;
+    int scheduler_policy = -1;
+    int priority = 0;
+    long tid = 0;
+    RealtimePrioritySource source = RealtimePrioritySource::None;
+    std::string error;
+    std::string text = "Realtime priority: disabled";
 };
 
 enum class PlaybackEventKind {
@@ -78,8 +96,11 @@ public:
     void start(std::unique_ptr<IAudioDecoder> decoder,
                std::unique_ptr<IAudioBackend> backend,
                const std::string& device_name,
+               const std::vector<std::uint16_t>& output_precision_candidates,
                std::uint64_t initial_samples_per_channel = 0,
-               std::vector<std::uint64_t> logical_segment_offsets = {});
+               std::vector<std::uint64_t> logical_segment_offsets = {},
+               Pcm16QuantizationMode pcm16_quantization_mode =
+                   Pcm16QuantizationMode::RoundToNearest);
 
     void stop();
     void pause();
@@ -95,15 +116,18 @@ public:
     void set_pre_eq_headroom_tenths_db(int tenths_db);
     int pre_eq_headroom_tenths_db() const;
     void set_soft_eq_profile(int bass_hz, int treble_hz);
-    void set_deep_bass_enabled(bool enabled);
-    bool deep_bass_enabled() const;
-    void set_deep_bass_preset(int preset);
-    void set_deep_bass_amount(int amount_steps);
     void set_level_meter_enabled(bool enabled);
     void set_clip_detection_enabled(bool enabled);
     int bass_db() const;
     int treble_db() const;
     ResamplerRuntimeKind resampler_runtime_kind() const noexcept;
+    Pcm16QuantizationRuntimeKind pcm16_quantization_runtime_kind() const noexcept;
+    std::uint32_t pcm16_quantization_stage_count() const noexcept;
+    std::string source_codec_name() const;
+    std::uint64_t encoded_bitrate_bps() const noexcept;
+    std::string decoded_codec_name() const;
+    DecoderPcmSampleKind decoded_pcm_sample_kind() const noexcept;
+    std::uint16_t decoded_pcm_significant_bits() const noexcept;
     PlaybackStatusSnapshot snapshot() const;
     PlaybackTransportSnapshot transport_snapshot() const;
     PlaybackMeterSnapshot consume_meter_snapshot();
@@ -118,10 +142,13 @@ public:
     void set_realtime_priority(int priority);
     std::string refresh_realtime_priority_status();
     std::string request_realtime_priority_for_playback_thread();
+    std::string disable_realtime_priority_for_playback_thread();
+    RealtimePriorityStatusSnapshot realtime_priority_status_snapshot() const;
 
     std::string active_output_report() const;
 
 private:
+
     struct LiveTransportPosition {
         std::uint64_t current_samples_per_channel = 0;
         bool segment_position_valid = false;
@@ -137,8 +164,8 @@ private:
     void emit_playback_event(PlaybackEventKind kind,
                              std::uint64_t transport_generation) noexcept;
     void clear_pending_playback_events() noexcept;
-    std::string try_set_realtime_priority_for_current_thread();
-    std::string verified_realtime_priority_status(long tid) const;
+    RealtimePriorityStatusSnapshot verified_realtime_priority_status(long tid) const;
+    static void format_realtime_priority_status(RealtimePriorityStatusSnapshot& status);
     void wait_if_paused();
     void set_error(const std::string& message);
     void join_threads();
@@ -148,6 +175,7 @@ private:
     // are maintained at lifecycle transitions only; snapshot accessors always
     // overlay the coherent live-position tuple published below.
     PlaybackStatusSnapshot snapshot_{};
+    AudioFormat transport_working_format_{};
     std::string last_error_;
 
     // The playback thread is the only writer while a transport is active.
@@ -161,11 +189,21 @@ private:
     std::atomic<std::uint64_t> live_segment_samples_per_channel_{0};
     std::atomic<ResamplerRuntimeKind> resampler_runtime_kind_{
         ResamplerRuntimeKind::NotUsed};
+    std::atomic<Pcm16QuantizationRuntimeKind> pcm16_quantization_runtime_kind_{
+        Pcm16QuantizationRuntimeKind::NotUsed};
+    std::atomic<std::uint32_t> pcm16_quantization_stage_count_{0};
+    std::atomic<DecoderPcmSampleKind> decoded_pcm_sample_kind_{
+        DecoderPcmSampleKind::Unknown};
+    std::atomic<std::uint16_t> decoded_pcm_significant_bits_{0};
+    std::atomic<std::uint64_t> encoded_bitrate_bps_{0};
 
     std::unique_ptr<IAudioDecoder> decoder_;
     std::unique_ptr<IAudioBackend> backend_;
     AudioFormat format_{};
+    AudioFormat output_format_{};
     std::string device_name_;
+    Pcm16QuantizationMode pcm16_quantization_mode_ =
+        Pcm16QuantizationMode::RoundToNearest;
 
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> pause_requested_{false};
@@ -179,9 +217,6 @@ private:
     std::atomic<int> pre_eq_headroom_tenths_db_{0};
     std::atomic<int> bass_hz_{110};
     std::atomic<int> treble_hz_{10000};
-    std::atomic<bool> deep_bass_enabled_{false};
-    std::atomic<int> deep_bass_preset_{static_cast<int>(tone::DeepBassPreset::Focused)};
-    std::atomic<int> deep_bass_amount_{0};
     std::atomic<bool> level_meter_enabled_{true};
     std::atomic<bool> clip_detection_enabled_{true};
     // Valid values are Q24 peak magnitudes; all-bits-one means that no PCM
@@ -200,10 +235,16 @@ private:
     std::atomic<std::uint64_t> pending_finished_generation_{0};
     std::atomic<std::uint64_t> pending_error_generation_{0};
     std::vector<std::uint64_t> logical_segment_offsets_;
+    // Serializes realtime scheduler acquisition and demotion for the published
+    // playback TID.  RTKit calls remain synchronous, but an older request can
+    // no longer complete after a newer disable request and leave the thread in
+    // a scheduler state that contradicts the user's final setting.
+    std::mutex realtime_transition_mutex_;
     mutable std::mutex runtime_mutex_;
-    std::string realtime_priority_status_ = "Realtime priority: disabled";
-    std::string last_realtime_priority_error_;
+    RealtimePriorityStatusSnapshot realtime_priority_status_{};
     std::string last_active_output_report_;
+    std::string source_codec_name_;
+    std::string decoded_codec_name_;
 };
 
 } // namespace pcmtp

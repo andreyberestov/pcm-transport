@@ -1,4 +1,4 @@
-# PCM Transport v0.9.115
+# PCM Transport v0.9.116
 
 **PCM Transport** is a Linux desktop audio player focused on direct PCM playback, predictable DSP, and clear signal-path reporting.
 
@@ -6,11 +6,11 @@
 
 ## Author and Maintainer
 
-[Andrey Berestov](https://github.com/andreyberestov)
+[Andrey Berestov (@andreyberestov)](https://github.com/andreyberestov)
 
 Contributors:
 
-[loki1368](https://github.com/loki1368)
+[Aleksandr Vysotskiy (@loki1368)](https://github.com/loki1368)
 
 Website: https://andreyberestov.github.io/pcm-transport/
 
@@ -34,13 +34,13 @@ Portions copyright © 2026 PCM Transport contributors.
 - GTK 3 desktop interface
 - Direct ALSA output
 - Native FLAC decoding through libFLAC
-- Direct FFmpeg library decoding for MP3, M4A, AAC, OGG, WAV, AIFF, APE, WV and other formats
+- Direct FFmpeg library decoding for MP3, M4A, OGG, WAV, AIFF, APE, WV and other formats
 - CUE support, including continuous CUE image playback
 - Local M3U / M3U8 playlist import
 - UTF-8 and Windows-1251 normalization for legacy metadata
 - Same-format gapless playback where possible
-- Optional SoXR resampling and bit-depth rules
-- Baxandall-style Bass/Treble controls and Deep Bass presets
+- Optional SoXR sample-rate conversion and configurable output precision
+- Baxandall-style Bass/Treble controls
 - MPRIS integration (media keys, cover art)
 
 ---
@@ -112,7 +112,7 @@ FFmpeg library build.
 ## Playback notes
 
 - For the cleanest ALSA path, select a direct `hw:X,Y` device and avoid forced conversion rules.
-- DSP is bypassed when Bass/Treble are neutral, volume is 100%, Pre-EQ Headroom is 0 dB, and Deep Bass is off.
+- DSP is bypassed when Bass/Treble are neutral, volume is 100%, and Pre-EQ Headroom is 0 dB.
 - Native FLAC is used when no Processing Rules are applied.
 - DSD sources (DSF/DFF) are played via PCM conversion; native DSD output is not available.
 

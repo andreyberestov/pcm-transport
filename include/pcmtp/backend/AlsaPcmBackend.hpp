@@ -57,6 +57,7 @@ private:
     Alsa24BitContainerPreference active_format_24bit_preference_ = Alsa24BitContainerPreference::Auto;
     std::string device_name_;
     unsigned accepted_sample_rate_ = 0;
+    int active_significant_bits_ = 0;
     std::vector<std::int32_t> scratch_s32_;
     std::vector<std::int16_t> scratch_s16_;
     std::vector<unsigned char> scratch_s24_;

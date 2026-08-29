@@ -466,7 +466,7 @@
       <figure class="shot">
         <img
           src="https://raw.githubusercontent.com/andreyberestov/pcm-transport/refs/heads/main/screenshots/dsp.png"
-          alt="PCM Transport DSP Studio window with bass, treble, Deep Bass and diagnostics"
+          alt="PCM Transport DSP Studio window with tone controls and diagnostics"
           loading="lazy">
         <figcaption>DSP Studio</figcaption>
       </figure>
@@ -497,8 +497,8 @@
             <path d="M11 9h2M19 9h2M11 14h2M19 14h2M11 19h2M19 19h2M11 24h2M19 24h2"/>
           </svg>
         </div>
-        <h3>Additional formats via FFmpeg libraries</h3>
-        <p>MP3, AAC, OGG, WAV, AIFF, APE, WV, DSF/DFF and more via FFmpeg</p>
+        <h3>Additional formats via FFmpeg API</h3>
+        <p>MP3, OGG, WAV, AIFF, APE, WV, DSF/DFF and more via the FFmpeg API</p>
       </div>
 
       <div class="card">
@@ -548,7 +548,7 @@
           </svg>
         </div>
         <h3>DSP Studio</h3>
-        <p>Bass/Treble controls, Deep Bass and optional processing rules.</p>
+        <p>Bass/Treble controls and optional processing rules.</p>
       </div>
 
     </div>
@@ -565,7 +565,7 @@
 
     <h2>Supported formats</h2>
     <p class="section-intro">
-      Native FLAC playback is handled through libFLAC. Additional formats use the FFmpeg libraries directly. The ffmpeg and ffprobe command-line tools are not required.
+      Native FLAC playback is handled through libFLAC. Additional formats use the FFmpeg API directly. The ffmpeg and ffprobe command-line tools are not required.
       DSF and DFF sources, including DST-compressed DFF, are converted to PCM; native DSD and DoP output are not used. Rare-format support depends on the local FFmpeg build.
     </p>
 
@@ -679,7 +679,7 @@ cmake --build build -j</code></pre>
       supported baseline.
 
       FLAC decoding remains native through libFLAC. Other formats,
-      metadata fallback and conversion paths use the FFmpeg libraries
+      metadata fallback and conversion paths use the FFmpeg API
       directly. The ffmpeg and ffprobe command-line tools are not used.
       Realtime audio priority is optional and can use RTKit or direct CAP_SYS_NICE scheduling.
     </p>
@@ -705,13 +705,13 @@ cmake --build build -j</code></pre>
      <section class="development-author">
       <h2>Author and Maintainer</h2>
       <p>
-        <a href="https://github.com/andreyberestov">Andrey Berestov</a>
+        <a href="https://github.com/andreyberestov">Andrey Berestov (@andreyberestov)</a>
       </p>
       <p>
         <b>Contributors</b>
       </p>
       <p>
-        <a href="https://github.com/loki1368">loki1368</a>
+        <a href="https://github.com/loki1368">Aleksandr Vysotskiy (@loki1368)</a>
       </p>
     </section>
 

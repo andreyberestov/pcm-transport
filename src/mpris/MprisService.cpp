@@ -13,6 +13,11 @@
 #include "pcmtp/util/Logger.hpp"
 
 namespace pcmtp {
+
+struct MprisService::BusOwnerContext {
+    MprisService* service = nullptr;
+};
+
 namespace {
 
 constexpr const char* kBusName = "org.mpris.MediaPlayer2.pcmtransport";
@@ -801,7 +806,8 @@ void MprisService::unregister_object() {
 }
 
 void MprisService::on_bus_acquired(GDBusConnection* connection, const gchar*, gpointer user_data) {
-    auto* service = static_cast<MprisService*>(user_data);
+    auto* context = static_cast<BusOwnerContext*>(user_data);
+    MprisService* service = context != nullptr ? context->service : nullptr;
     if (service == nullptr) {
         return;
     }
@@ -827,7 +833,8 @@ void MprisService::on_name_acquired(GDBusConnection*, const gchar*, gpointer) {
 }
 
 void MprisService::on_name_lost(GDBusConnection*, const gchar*, gpointer user_data) {
-    auto* service = static_cast<MprisService*>(user_data);
+    auto* context = static_cast<BusOwnerContext*>(user_data);
+    MprisService* service = context != nullptr ? context->service : nullptr;
     if (service == nullptr) {
         return;
     }
@@ -835,19 +842,24 @@ void MprisService::on_name_lost(GDBusConnection*, const gchar*, gpointer user_da
     service->disconnect_bus();
 }
 
+void MprisService::destroy_bus_owner_context(gpointer user_data) {
+    delete static_cast<BusOwnerContext*>(user_data);
+}
+
 void MprisService::start() {
     if (bus_owner_id_ != 0) {
         return;
     }
 
+    bus_owner_context_ = new BusOwnerContext{this};
     bus_owner_id_ = g_bus_own_name(G_BUS_TYPE_SESSION,
                                    kBusName,
                                    G_BUS_NAME_OWNER_FLAGS_NONE,
                                    on_bus_acquired,
                                    on_name_acquired,
                                    on_name_lost,
-                                   this,
-                                   nullptr);
+                                   bus_owner_context_,
+                                   destroy_bus_owner_context);
 }
 
 void MprisService::stop() {
@@ -859,6 +871,10 @@ void MprisService::stop() {
     if (bus_owner_id_ != 0) {
         const unsigned int owner_id = bus_owner_id_;
         bus_owner_id_ = 0;
+        if (bus_owner_context_ != nullptr) {
+            bus_owner_context_->service = nullptr;
+        }
+        bus_owner_context_ = nullptr;
         g_bus_unown_name(owner_id);
     }
 

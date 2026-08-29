@@ -37,7 +37,6 @@ struct GaplessTrackSpec {
     std::uint32_t forced_output_sample_rate = 0;
     std::uint16_t forced_output_bits_per_sample = 0;
     std::string resample_quality = "maximum";
-    std::string bitdepth_quality = "tpdf_hp";
     ExternalAudioInfo known_external_info{};
     bool has_known_external_info = false;
 };
@@ -58,6 +57,13 @@ public:
     DecoderSegmentPosition segment_position() const noexcept override;
     TransportTruncationKind transport_truncation_kind() const noexcept override;
     ResamplerRuntimeKind resampler_runtime_kind() const noexcept override;
+    Pcm16QuantizationRuntimeKind pcm16_quantization_runtime_kind() const noexcept override;
+    std::uint32_t pcm16_quantization_stage_count() const noexcept override;
+    std::string decoded_codec_name() const override;
+    DecoderPcmSampleKind decoded_pcm_sample_kind() const noexcept override;
+    std::uint16_t decoded_pcm_significant_bits() const noexcept override;
+    std::uint64_t runtime_state_generation() const noexcept override;
+    DecoderRuntimeStateSnapshot runtime_state_snapshot() const override;
     bool seek_to_sample(std::uint64_t sample_index) override;
     void request_abort() override;
     void request_stop_after_current_segment(std::uint64_t segment_end_sample) override;
@@ -68,8 +74,7 @@ private:
         std::size_t index = 0;
         std::unique_ptr<IAudioDecoder> decoder;
         PcmBuffer prebuffer;
-        ResamplerRuntimeKind resampler_runtime_kind =
-            ResamplerRuntimeKind::NotUsed;
+        DecoderRuntimeStateSnapshot runtime_state{};
         bool ready = false;
         bool failed = false;
     };
@@ -93,6 +98,7 @@ private:
     bool requested_segment_end_reached() const;
     std::uint64_t prepare_threshold_frames(std::size_t index) const;
     std::size_t prebuffer_samples(std::size_t index) const;
+    void publish_runtime_state(const DecoderRuntimeStateSnapshot& state);
 
     std::vector<GaplessTrackSpec> tracks_;
     std::vector<std::uint64_t> track_offsets_;
@@ -101,10 +107,22 @@ private:
     std::uint64_t first_track_offset_ = 0;
     std::uint64_t total_samples_per_channel_ = 0;
     AudioFormat format_{};
+    AudioFormat output_format_{};
     std::unique_ptr<IAudioDecoder> current_decoder_;
     mutable std::mutex decoder_mutex_;
     std::atomic<ResamplerRuntimeKind> resampler_runtime_kind_{
         ResamplerRuntimeKind::NotUsed};
+    std::atomic<Pcm16QuantizationRuntimeKind> pcm16_quantization_runtime_kind_{
+        Pcm16QuantizationRuntimeKind::NotUsed};
+    std::atomic<std::uint32_t> pcm16_quantization_stage_count_{0};
+    std::atomic<DecoderPcmSampleKind> decoded_pcm_sample_kind_{
+        DecoderPcmSampleKind::Unknown};
+    std::atomic<std::uint16_t> decoded_pcm_significant_bits_{0};
+    std::atomic<std::uint64_t> encoded_bitrate_bps_{0};
+    std::atomic<std::uint64_t> runtime_state_generation_{0};
+    std::uint64_t current_decoder_runtime_generation_ = 0;
+    std::string source_codec_name_;
+    std::string decoded_codec_name_;
     bool opened_ = false;
     bool reached_eof_ = false;
     std::atomic<std::uint64_t> requested_end_sample_{

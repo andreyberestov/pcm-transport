@@ -71,10 +71,13 @@ public:
     void notify_seeked(std::int64_t position_usec);
 
 private:
+    struct BusOwnerContext;
+
     void disconnect_bus();
     static void on_bus_acquired(GDBusConnection* connection, const gchar* name, gpointer user_data);
     static void on_name_acquired(GDBusConnection* connection, const gchar* name, gpointer user_data);
     static void on_name_lost(GDBusConnection* connection, const gchar* name, gpointer user_data);
+    static void destroy_bus_owner_context(gpointer user_data);
     static void handle_method_call(GDBusConnection* connection,
                                    const gchar* sender,
                                    const gchar* object_path,
@@ -105,6 +108,7 @@ private:
     GDBusConnection* connection_ = nullptr;
     std::vector<unsigned int> registration_ids_;
     unsigned int bus_owner_id_ = 0;
+    BusOwnerContext* bus_owner_context_ = nullptr;
     unsigned int state_notify_source_id_ = 0;
     std::string last_playback_status_;
     std::string last_metadata_signature_;

@@ -26,6 +26,13 @@ public:
     PresentationEndKind presentation_end_kind() const noexcept override;
     TransportTruncationKind transport_truncation_kind() const noexcept override;
     ResamplerRuntimeKind resampler_runtime_kind() const noexcept override;
+    Pcm16QuantizationRuntimeKind pcm16_quantization_runtime_kind() const noexcept override;
+    std::uint32_t pcm16_quantization_stage_count() const noexcept override;
+    std::string decoded_codec_name() const override;
+    DecoderPcmSampleKind decoded_pcm_sample_kind() const noexcept override;
+    std::uint16_t decoded_pcm_significant_bits() const noexcept override;
+    std::uint64_t runtime_state_generation() const noexcept override;
+    DecoderRuntimeStateSnapshot runtime_state_snapshot() const override;
     bool seek_to_sample(std::uint64_t sample_index) override;
     void request_abort() override;
     void request_stop_after_current_segment(std::uint64_t segment_end_sample) override;

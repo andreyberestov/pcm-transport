@@ -1,4 +1,4 @@
-# PCM Transport v0.9.116
+# PCM Transport v0.9.117
 
 **PCM Transport** is a Linux desktop audio player focused on direct PCM playback, predictable DSP, and clear signal-path reporting.
 
@@ -113,6 +113,7 @@ FFmpeg library build.
 
 - For the cleanest ALSA path, select a direct `hw:X,Y` device and avoid forced conversion rules.
 - DSP is bypassed when Bass/Treble are neutral, volume is 100%, and Pre-EQ Headroom is 0 dB.
+- The CLIP indicator reports DSP-path clipping only; it is not a full-chain detector.
 - Native FLAC is used when no Processing Rules are applied.
 - DSD sources (DSF/DFF) are played via PCM conversion; native DSD output is not available.
 

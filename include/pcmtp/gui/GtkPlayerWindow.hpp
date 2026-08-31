@@ -870,12 +870,13 @@ private:
     gulong playlist_selection_changed_handler_id_ = 0;
     gulong playlist_key_press_handler_id_ = 0;
     gulong playlist_focus_in_handler_id_ = 0;
-    std::string alsa_24bit_container_preference_ = "auto";
+    std::string alsa_24bit_container_mode_ = "auto";
     std::string output_precision_16bit_lossy_ = "auto";
     std::string output_precision_24bit_ = "auto";
     std::string output_precision_32bit_ = "auto";
     std::string dsd_output_precision_ = "auto";
     std::string quantization_16bit_ = "round";
+    std::string dither_16bit_ = "off";
     bool realtime_audio_priority_enabled_ = false;
     guint pending_seek_source_id_ = 0;
     bool pending_seek_valid_ = false;

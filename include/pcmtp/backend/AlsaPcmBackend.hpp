@@ -12,11 +12,11 @@
 
 namespace pcmtp {
 
-enum class Alsa24BitContainerPreference {
+enum class Alsa24BitContainerMode {
     Auto,
-    PreferS24LE,
-    PreferS24_3LE,
-    PreferS32LE
+    S24LE,
+    S24_3LE,
+    S32LE
 };
 
 struct AlsaProbeCell {
@@ -43,7 +43,7 @@ public:
     void close() override;
     std::string active_output_report() const override;
 
-    void set_24bit_container_preference(Alsa24BitContainerPreference preference);
+    void set_24bit_container_mode(Alsa24BitContainerMode mode);
 
     static AlsaProbeMatrix probe_device_format_matrix(const std::string& device_name);
 
@@ -53,8 +53,7 @@ private:
     snd_pcm_uframes_t period_frames_ = 588;
     snd_pcm_uframes_t buffer_frames_ = 2352;
     snd_pcm_format_t pcm_container_format_ = SND_PCM_FORMAT_UNKNOWN;
-    Alsa24BitContainerPreference format_24bit_preference_ = Alsa24BitContainerPreference::Auto;
-    Alsa24BitContainerPreference active_format_24bit_preference_ = Alsa24BitContainerPreference::Auto;
+    Alsa24BitContainerMode format_24bit_mode_ = Alsa24BitContainerMode::Auto;
     std::string device_name_;
     unsigned accepted_sample_rate_ = 0;
     int active_significant_bits_ = 0;

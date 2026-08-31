@@ -2,8 +2,11 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "pcmtp/core/PlaybackEngine.hpp"
+#include "pcmtp/core/Pcm16Quantizer.hpp"
+#include "pcmtp/core/Pcm16Dither.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cerrno>
@@ -58,20 +61,21 @@ double clamp_sample_to_bits(double sample, std::uint16_t bits_per_sample) {
 
 PcmSample quantize_processed_sample(double sample,
                                     std::uint16_t bits_per_sample,
-                                    Pcm16QuantizationMode pcm16_mode) {
-    const double clamped = clamp_sample_to_bits(sample, bits_per_sample);
-    if (bits_per_sample == 16 && pcm16_mode == Pcm16QuantizationMode::Truncate) {
-        // Dropping lower bits from signed two's-complement data is equivalent
-        // to flooring the value expressed in destination PCM code units.
-        return static_cast<PcmSample>(std::floor(clamped));
+                                    Pcm16QuantizationMode pcm16_mode,
+                                    double pcm16_dither_code_units = 0.0) {
+    if (bits_per_sample == 16) {
+        return quantize_pcm16_code_units(
+            sample + pcm16_dither_code_units, pcm16_mode);
     }
+    const double clamped = clamp_sample_to_bits(sample, bits_per_sample);
     return static_cast<PcmSample>(std::llround(clamped));
 }
 
 PcmSample quantize_working_sample_to_bits(double sample,
                                            std::uint16_t working_bits,
                                            std::uint16_t output_bits,
-                                           Pcm16QuantizationMode pcm16_mode) {
+                                           Pcm16QuantizationMode pcm16_mode,
+                                           double pcm16_dither_code_units = 0.0) {
     if (working_bits < output_bits || output_bits < 16 || output_bits > 32 ||
         working_bits > 32) {
         throw std::runtime_error("Unsupported PCM precision conversion");
@@ -79,16 +83,14 @@ PcmSample quantize_working_sample_to_bits(double sample,
     const unsigned shift = static_cast<unsigned>(working_bits - output_bits);
     const double divisor = static_cast<double>(std::uint64_t{1} << shift);
     double scaled = sample / divisor;
+    if (output_bits == 16) {
+        return quantize_pcm16_code_units(
+            scaled + pcm16_dither_code_units, pcm16_mode);
+    }
     const double maximum = static_cast<double>(pcm_full_scale(output_bits));
     const double minimum = static_cast<double>(pcm_minimum_sample(output_bits));
     if (scaled > maximum) scaled = maximum;
     if (scaled < minimum) scaled = minimum;
-    if (output_bits == 16 &&
-        pcm16_mode == Pcm16QuantizationMode::Truncate) {
-        // Hardware-style signed LSB truncation is arithmetic bit dropping,
-        // which is floor in destination PCM code units.
-        return static_cast<PcmSample>(std::floor(scaled));
-    }
     return static_cast<PcmSample>(std::llround(scaled));
 }
 
@@ -126,6 +128,14 @@ void widen_pcm_block_exact(PcmSample* samples,
         }
         samples[i] = static_cast<PcmSample>(value);
     }
+}
+
+std::uint64_t make_pcm16_dither_seed(std::uint64_t transport_generation) noexcept {
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    const std::uint64_t time_seed = static_cast<std::uint64_t>(now);
+    const std::uint64_t seed =
+        time_seed ^ (transport_generation << 32U) ^ transport_generation;
+    return seed != 0 ? seed : std::uint64_t{1};
 }
 
 double headroom_gain_from_tenths_db(int tenths_db) {
@@ -453,10 +463,13 @@ void PlaybackEngine::start(std::unique_ptr<IAudioDecoder> decoder,
                            const std::vector<std::uint16_t>& output_precision_candidates,
                            std::uint64_t initial_samples_per_channel,
                            std::vector<std::uint64_t> logical_segment_offsets,
-                           Pcm16QuantizationMode pcm16_quantization_mode) {
+                           Pcm16QuantizationMode pcm16_quantization_mode,
+                           Pcm16DitherMode pcm16_dither_mode) {
     stop();
     const std::uint64_t transport_generation =
         transport_generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    const std::uint64_t pcm16_dither_seed =
+        make_pcm16_dither_seed(transport_generation);
     if (!decoder || !backend) {
         throw std::invalid_argument("PlaybackEngine::start received null decoder/backend");
     }
@@ -528,6 +541,9 @@ void PlaybackEngine::start(std::unique_ptr<IAudioDecoder> decoder,
         format_ = working_format;
         output_format_ = opened_format;
         pcm16_quantization_mode_ = pcm16_quantization_mode;
+        pcm16_dither_mode_ = pcm16_dither_mode;
+        pcm16_dither_ = std::make_unique<Pcm16Dither>(
+            pcm16_dither_mode_, working_format.channels, pcm16_dither_seed);
         resampler_runtime_kind_.store(
             initial_decoder_runtime_state.resampler_runtime_kind,
             std::memory_order_release);
@@ -537,6 +553,8 @@ void PlaybackEngine::start(std::unique_ptr<IAudioDecoder> decoder,
         pcm16_quantization_stage_count_.store(
             initial_decoder_runtime_state.pcm16_quantization_stage_count,
             std::memory_order_release);
+        pcm16_dither_runtime_kind_.store(
+            Pcm16DitherRuntimeKind::NotUsed, std::memory_order_release);
         decoded_pcm_sample_kind_.store(
             initial_decoder_runtime_state.decoded_pcm_sample_kind,
             std::memory_order_release);
@@ -578,11 +596,15 @@ void PlaybackEngine::start(std::unique_ptr<IAudioDecoder> decoder,
         pcm16_quantization_runtime_kind_.store(
             Pcm16QuantizationRuntimeKind::NotUsed, std::memory_order_release);
         pcm16_quantization_stage_count_.store(0, std::memory_order_release);
+        pcm16_dither_runtime_kind_.store(
+            Pcm16DitherRuntimeKind::NotUsed, std::memory_order_release);
         decoded_pcm_sample_kind_.store(
             DecoderPcmSampleKind::Unknown, std::memory_order_release);
         decoded_pcm_significant_bits_.store(0, std::memory_order_release);
         encoded_bitrate_bps_.store(0, std::memory_order_release);
-        pcm16_quantization_mode_ = Pcm16QuantizationMode::RoundToNearest;
+        pcm16_quantization_mode_ = Pcm16QuantizationMode::RoundToNearestEven;
+        pcm16_dither_mode_ = Pcm16DitherMode::Off;
+        pcm16_dither_.reset();
         device_name_.clear();
         format_ = AudioFormat{};
         output_format_ = AudioFormat{};
@@ -639,11 +661,15 @@ void PlaybackEngine::stop() {
     pcm16_quantization_runtime_kind_.store(
         Pcm16QuantizationRuntimeKind::NotUsed, std::memory_order_release);
     pcm16_quantization_stage_count_.store(0, std::memory_order_release);
+    pcm16_dither_runtime_kind_.store(
+        Pcm16DitherRuntimeKind::NotUsed, std::memory_order_release);
     decoded_pcm_sample_kind_.store(
         DecoderPcmSampleKind::Unknown, std::memory_order_release);
     decoded_pcm_significant_bits_.store(0, std::memory_order_release);
     encoded_bitrate_bps_.store(0, std::memory_order_release);
-    pcm16_quantization_mode_ = Pcm16QuantizationMode::RoundToNearest;
+    pcm16_quantization_mode_ = Pcm16QuantizationMode::RoundToNearestEven;
+    pcm16_dither_mode_ = Pcm16DitherMode::Off;
+    pcm16_dither_.reset();
     format_ = AudioFormat{};
     output_format_ = AudioFormat{};
     logical_segment_offsets_.clear();
@@ -742,6 +768,10 @@ PlaybackEngine::pcm16_quantization_runtime_kind() const noexcept {
 
 std::uint32_t PlaybackEngine::pcm16_quantization_stage_count() const noexcept {
     return pcm16_quantization_stage_count_.load(std::memory_order_acquire);
+}
+
+Pcm16DitherRuntimeKind PlaybackEngine::pcm16_dither_runtime_kind() const noexcept {
+    return pcm16_dither_runtime_kind_.load(std::memory_order_acquire);
 }
 
 std::string PlaybackEngine::source_codec_name() const {
@@ -1694,6 +1724,12 @@ void PlaybackEngine::playback_loop(std::uint64_t transport_generation) {
             pcm16_quantization_runtime_kind_.load(std::memory_order_acquire);
         std::uint32_t last_published_pcm16_quantization_stage_count =
             pcm16_quantization_stage_count_.load(std::memory_order_acquire);
+        Pcm16DitherRuntimeKind last_published_pcm16_dither_runtime_kind =
+            pcm16_dither_runtime_kind_.load(std::memory_order_acquire);
+        if (pcm16_dither_ == nullptr) {
+            throw std::runtime_error("PCM16 dither state is unavailable");
+        }
+        Pcm16Dither& pcm16_dither = *pcm16_dither_;
         const ToneFilterTarget initial_tone_target{
             stereo_tonal_dsp_allowed
                 ? bass_db_.load(std::memory_order_relaxed)
@@ -1825,11 +1861,19 @@ void PlaybackEngine::playback_loop(std::uint64_t transport_generation) {
                 final_s16_quantization
                     ? (pcm16_quantization_mode_ == Pcm16QuantizationMode::Truncate
                            ? Pcm16QuantizationRuntimeKind::Truncate
-                           : Pcm16QuantizationRuntimeKind::RoundToNearest)
+                           : (pcm16_quantization_mode_ == Pcm16QuantizationMode::RoundHalfUp
+                                  ? Pcm16QuantizationRuntimeKind::RoundHalfUp
+                                  : Pcm16QuantizationRuntimeKind::RoundToNearestEven))
                     : decoder_runtime_state.pcm16_quantization_runtime_kind;
             const std::uint32_t current_pcm16_quantization_stage_count =
                 decoder_runtime_state.pcm16_quantization_stage_count +
                 (final_s16_quantization ? 1U : 0U);
+            const Pcm16DitherRuntimeKind current_pcm16_dither_runtime_kind =
+                pcmtp::pcm16_dither_runtime_kind(
+                    pcm16_dither_mode_, final_s16_quantization);
+            const bool final_s16_dither =
+                current_pcm16_dither_runtime_kind !=
+                Pcm16DitherRuntimeKind::NotUsed;
             const double user_volume =
                 static_cast<double>(current_soft_volume_percent) / 100.0;
             const bool measure_level =
@@ -1871,15 +1915,22 @@ void PlaybackEngine::playback_loop(std::uint64_t transport_generation) {
                         ++clipped_samples;
                     }
 
+                    const double pcm16_dither_code_units = final_s16_dither
+                        ? pcm16_dither.next_code_units(channel_index)
+                        : 0.0;
                     if (output_format_.bits_per_sample < format_.bits_per_sample) {
                         output_block[i] = quantize_working_sample_to_bits(
                             sample,
                             format_.bits_per_sample,
                             output_format_.bits_per_sample,
-                            pcm16_quantization_mode_);
+                            pcm16_quantization_mode_,
+                            pcm16_dither_code_units);
                     } else {
                         block[i] = quantize_processed_sample(
-                            sample, format_.bits_per_sample, pcm16_quantization_mode_);
+                            sample,
+                            format_.bits_per_sample,
+                            pcm16_quantization_mode_,
+                            pcm16_dither_code_units);
                     }
                 }
             } else {
@@ -1899,16 +1950,34 @@ void PlaybackEngine::playback_loop(std::uint64_t transport_generation) {
                 }
                 if (narrowing_required) {
                     for (std::size_t i = 0; i < got; ++i) {
-                        output_block[i] = exact_s16_repack
-                            ? narrow_exact_working_sample(
-                                  block[i],
-                                  format_.bits_per_sample,
-                                  output_format_.bits_per_sample)
-                            : quantize_working_sample_to_bits(
-                                  static_cast<double>(block[i]),
-                                  format_.bits_per_sample,
-                                  output_format_.bits_per_sample,
-                                  pcm16_quantization_mode_);
+                        if (exact_s16_repack) {
+                            output_block[i] = narrow_exact_working_sample(
+                                block[i],
+                                format_.bits_per_sample,
+                                output_format_.bits_per_sample);
+                        } else if (output_format_.bits_per_sample == 16) {
+                            if (final_s16_dither) {
+                                const double pcm16_dither_code_units =
+                                    pcm16_dither.next_code_units(i % ch);
+                                output_block[i] =
+                                    quantize_integer_working_sample_to_pcm16_with_dither(
+                                        block[i],
+                                        format_.bits_per_sample,
+                                        pcm16_quantization_mode_,
+                                        pcm16_dither_code_units);
+                            } else {
+                                output_block[i] = quantize_integer_working_sample_to_pcm16(
+                                    block[i],
+                                    format_.bits_per_sample,
+                                    pcm16_quantization_mode_);
+                            }
+                        } else {
+                            output_block[i] = quantize_working_sample_to_bits(
+                                static_cast<double>(block[i]),
+                                format_.bits_per_sample,
+                                output_format_.bits_per_sample,
+                                pcm16_quantization_mode_);
+                        }
                     }
                 }
             }
@@ -1916,6 +1985,7 @@ void PlaybackEngine::playback_loop(std::uint64_t transport_generation) {
             backend_->write_samples(
                 narrowing_required ? output_block.data() : block.data(),
                 got);
+
             // Publish visualization facts only after the PCM block has been
             // accepted by the output backend.  The GUI owns the display
             // ballistics; the playback thread only accumulates raw facts.
@@ -1968,9 +2038,20 @@ void PlaybackEngine::playback_loop(std::uint64_t transport_generation) {
                 last_published_pcm16_quantization_stage_count =
                     current_pcm16_quantization_stage_count;
             }
+            const bool pcm16_dither_state_changed =
+                current_pcm16_dither_runtime_kind !=
+                last_published_pcm16_dither_runtime_kind;
+            if (pcm16_dither_state_changed) {
+                pcm16_dither_runtime_kind_.store(
+                    current_pcm16_dither_runtime_kind,
+                    std::memory_order_release);
+                last_published_pcm16_dither_runtime_kind =
+                    current_pcm16_dither_runtime_kind;
+            }
             processing_state_changed = processing_state_changed ||
                 pcm16_quantization_state_changed ||
-                pcm16_quantization_stage_count_changed;
+                pcm16_quantization_stage_count_changed ||
+                pcm16_dither_state_changed;
 
             bool logical_segment_changed = false;
             while (next_logical_boundary + 1 < logical_segment_offsets_.size() &&

@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "pcmtp/gui/GtkPlayerWindow.hpp"
+#include "pcmtp/core/Pcm16Quantizer.hpp"
+#include "pcmtp/core/Pcm16Dither.hpp"
 #include <climits>
 #include <cmath>
 
@@ -262,13 +264,30 @@ std::string replace_output_conversion_runtime_line(
 const char* pcm16_quantization_runtime_label(
     Pcm16QuantizationRuntimeKind runtime_kind) {
     switch (runtime_kind) {
-    case Pcm16QuantizationRuntimeKind::RoundToNearest:
-        return "Round to nearest";
+    case Pcm16QuantizationRuntimeKind::RoundToNearestEven:
+        return "Round to nearest (even)";
+    case Pcm16QuantizationRuntimeKind::RoundHalfUp:
+        return "Round half up";
     case Pcm16QuantizationRuntimeKind::Truncate:
         return "Truncate";
     case Pcm16QuantizationRuntimeKind::Ffmpeg:
         return "FFmpeg";
     case Pcm16QuantizationRuntimeKind::NotUsed:
+    default:
+        return "inactive";
+    }
+}
+
+constexpr const char* kPcm16DitherLabelClassic = "High-pass TPDF (Classic)";
+constexpr const char* kPcm16DitherLabelMild = "High-pass TPDF (Mild)";
+
+const char* pcm16_dither_runtime_label(Pcm16DitherRuntimeKind runtime_kind) {
+    switch (runtime_kind) {
+    case Pcm16DitherRuntimeKind::HighPassClassic:
+        return kPcm16DitherLabelClassic;
+    case Pcm16DitherRuntimeKind::HighPassMild:
+        return kPcm16DitherLabelMild;
+    case Pcm16DitherRuntimeKind::NotUsed:
     default:
         return "inactive";
     }
@@ -1200,22 +1219,22 @@ void add_pcm_message_content(GtkWidget* content,
                              const std::string& message,
                              GtkMessageType type);
 
-Alsa24BitContainerPreference alsa_24bit_preference_from_id(const std::string& id) {
-    if (id == "s24le") return Alsa24BitContainerPreference::PreferS24LE;
-    if (id == "s24_3le") return Alsa24BitContainerPreference::PreferS24_3LE;
-    if (id == "s32le") return Alsa24BitContainerPreference::PreferS32LE;
-    return Alsa24BitContainerPreference::Auto;
+Alsa24BitContainerMode alsa_24bit_mode_from_id(const std::string& id) {
+    if (id == "s24le") return Alsa24BitContainerMode::S24LE;
+    if (id == "s24_3le") return Alsa24BitContainerMode::S24_3LE;
+    if (id == "s32le") return Alsa24BitContainerMode::S32LE;
+    return Alsa24BitContainerMode::Auto;
 }
 
-std::string normalize_alsa_24bit_preference_id(const std::string& id) {
+std::string normalize_alsa_24bit_mode_id(const std::string& id) {
     if (id == "s24le" || id == "s24_3le" || id == "s32le") {
         return id;
     }
     return "auto";
 }
 
-int alsa_24bit_preference_combo_index(const std::string& id) {
-    const std::string normalized = normalize_alsa_24bit_preference_id(id);
+int alsa_24bit_mode_combo_index(const std::string& id) {
+    const std::string normalized = normalize_alsa_24bit_mode_id(id);
     if (normalized == "s24le") return 1;
     if (normalized == "s24_3le") return 2;
     if (normalized == "s32le") return 3;
@@ -1258,17 +1277,41 @@ std::string output_precision_label(const std::string& id) {
 }
 
 std::string normalize_16bit_quantization_id(const std::string& id) {
-    return id == "truncate" ? "truncate" : "round";
+    if (id == "half_up" || id == "truncate") return id;
+    return "round";
 }
 
 int quantization_16bit_combo_index(const std::string& id) {
-    return normalize_16bit_quantization_id(id) == "truncate" ? 1 : 0;
+    const std::string normalized = normalize_16bit_quantization_id(id);
+    if (normalized == "half_up") return 1;
+    if (normalized == "truncate") return 2;
+    return 0;
 }
 
 Pcm16QuantizationMode pcm16_quantization_mode_from_id(const std::string& id) {
-    return normalize_16bit_quantization_id(id) == "truncate"
-        ? Pcm16QuantizationMode::Truncate
-        : Pcm16QuantizationMode::RoundToNearest;
+    const std::string normalized = normalize_16bit_quantization_id(id);
+    if (normalized == "half_up") return Pcm16QuantizationMode::RoundHalfUp;
+    if (normalized == "truncate") return Pcm16QuantizationMode::Truncate;
+    return Pcm16QuantizationMode::RoundToNearestEven;
+}
+
+std::string normalize_16bit_dither_id(const std::string& id) {
+    if (id == "classic" || id == "mild") return id;
+    return "off";
+}
+
+int dither_16bit_combo_index(const std::string& id) {
+    const std::string normalized = normalize_16bit_dither_id(id);
+    if (normalized == "classic") return 1;
+    if (normalized == "mild") return 2;
+    return 0;
+}
+
+Pcm16DitherMode pcm16_dither_mode_from_id(const std::string& id) {
+    const std::string normalized = normalize_16bit_dither_id(id);
+    if (normalized == "classic") return Pcm16DitherMode::HighPassClassic;
+    if (normalized == "mild") return Pcm16DitherMode::HighPassMild;
+    return Pcm16DitherMode::Off;
 }
 
 void show_runtime_message(GtkWindow* parent, const char* title, const std::string& message, GtkMessageType type = GTK_MESSAGE_INFO) {
@@ -1750,6 +1793,7 @@ DiagnosticRenderResult render_internal_path(const std::string& flac_path,
                                             int treble_hz,
                                             std::uint16_t output_precision_bits,
                                             Pcm16QuantizationMode pcm16_quantization_mode,
+                                            Pcm16DitherMode pcm16_dither_mode,
                                             const std::atomic<bool>* cancel_requested) {
     const std::uint16_t expected_bits =
         output_precision_bits == 24 || output_precision_bits == 32
@@ -1772,6 +1816,13 @@ DiagnosticRenderResult render_internal_path(const std::string& flac_path,
     const auto low = tone::make_low_shelf(fmt.sample_rate, static_cast<double>(bass_db), static_cast<double>(bass_hz));
     const auto high = tone::make_high_shelf(fmt.sample_rate, static_cast<double>(treble_db), static_cast<double>(treble_hz));
     const bool dsp_active = soft_volume_percent < 100 || bass_db != 0 || treble_db != 0 || pre_eq_headroom_tenths_db > 0;
+    const bool pcm16_dither_active =
+        dsp_active && fmt.bits_per_sample == 16 &&
+        pcm16_dither_mode != Pcm16DitherMode::Off;
+    Pcm16Dither pcm16_dither(
+        pcm16_dither_active ? pcm16_dither_mode : Pcm16DitherMode::Off,
+        fmt.channels,
+        UINT64_C(0x50434d5450444631));
     const double user_volume = static_cast<double>(soft_volume_percent) / 100.0;
     const double pre_eq_gain = std::pow(10.0, -(static_cast<double>(pre_eq_headroom_tenths_db) / 10.0) / 20.0);
     while (!decoder.eof()) {
@@ -1789,11 +1840,16 @@ DiagnosticRenderResult render_internal_path(const std::string& flac_path,
                 if (bass_db != 0) sample = diagnostic_process_sample(sample, low, left ? low_l : low_r);
                 if (treble_db != 0) sample = diagnostic_process_sample(sample, high, left ? high_l : high_r);
                 sample *= user_volume;
-                sample = diagnostic_clamp_to_bits(sample, fmt.bits_per_sample);
-                if (fmt.bits_per_sample == 16 &&
-                    pcm16_quantization_mode == Pcm16QuantizationMode::Truncate) {
-                    sample = std::floor(sample);
+                if (fmt.bits_per_sample == 16) {
+                    const double dither_code_units = pcm16_dither_active
+                        ? pcm16_dither.next_code_units(i % fmt.channels)
+                        : 0.0;
+                    sample = static_cast<double>(
+                        quantize_pcm16_code_units(
+                            sample + dither_code_units,
+                            pcm16_quantization_mode));
                 } else {
+                    sample = diagnostic_clamp_to_bits(sample, fmt.bits_per_sample);
                     sample = std::llround(sample);
                 }
             }
@@ -3637,7 +3693,7 @@ void GtkPlayerWindow::build_ui(GtkApplication* app) {
     start_metadata_worker();
     window_ = gtk_application_window_new(app);
     gtk_window_set_icon_name(GTK_WINDOW(window_), kApplicationId);
-    gtk_window_set_title(GTK_WINDOW(window_), "PCM Transport v0.9.116");
+    gtk_window_set_title(GTK_WINDOW(window_), "PCM Transport v0.9.117");
     gtk_window_set_default_size(GTK_WINDOW(window_), kDefaultWindowWidth, kDefaultWindowHeight);
     gtk_container_set_border_width(GTK_CONTAINER(window_), 16);
 
@@ -7017,6 +7073,8 @@ std::string GtkPlayerWindow::current_decoder_processing_report() const {
     const bool gapless_active =
         gapless_chain_active_ && gapless_chain_playlist_indices_.size() > 1;
     std::size_t report_index = gapless_active ? gapless_chain_active_segment_ : 0;
+    std::string output_precision_line = "Output precision: inactive\n";
+    std::string output_conversion_line = "Output conversion: inactive\n";
     if (transport.playing &&
         report_index < active_track_transport_states_.size() &&
         !active_track_transport_states_[report_index].processing_report.empty()) {
@@ -7031,16 +7089,37 @@ std::string GtkPlayerWindow::current_decoder_processing_report() const {
                 engine_.resampler_runtime_kind(),
                 state.soxr_runtime_description);
         }
+        const auto take_processing_line = [](std::string& report, const char* prefix) {
+            const std::size_t line_start = report.find(prefix);
+            if (line_start == std::string::npos) {
+                return std::string{};
+            }
+            const std::size_t line_end = report.find('\n', line_start);
+            const std::size_t erase_end =
+                line_end == std::string::npos ? report.size() : line_end + 1U;
+            const std::string line = report.substr(line_start, erase_end - line_start);
+            report.erase(line_start, erase_end - line_start);
+            return line;
+        };
+        const std::string extracted_output_precision_line =
+            take_processing_line(processing_report, "Output precision: ");
+        const std::string extracted_output_conversion_line =
+            take_processing_line(processing_report, "Output conversion: ");
+        if (!extracted_output_precision_line.empty()) {
+            output_precision_line = extracted_output_precision_line;
+        }
+        if (!extracted_output_conversion_line.empty()) {
+            output_conversion_line = extracted_output_conversion_line;
+        }
+
         out << processing_report;
         if (processing_report.empty() || processing_report.back() != '\n') {
             out << '\n';
         }
     } else {
         out << "Processing rules: inactive\n";
-        out << "Output precision: inactive\n";
         out << "Resampling: inactive\n";
         out << "Resampler: inactive\n";
-        out << "Output conversion: inactive\n";
     }
 
     if (transport.playing && channels > 0) {
@@ -7060,18 +7139,32 @@ std::string GtkPlayerWindow::current_decoder_processing_report() const {
             out << " (" << soft_volume_percent << "%)";
         }
         out << '\n';
+    } else {
+        out << "Tonal DSP: inactive\n";
+        out << "Soft volume: inactive\n";
+    }
+
+    out << "DSP clip detection: "
+        << (clip_detection_enabled_ ? "enabled" : "disabled") << '\n';
+
+    out << output_precision_line;
+    out << output_conversion_line;
+
+    if (transport.playing && channels > 0) {
         out << "16-bit quantization: "
             << pcm16_quantization_runtime_label(
                    engine_.pcm16_quantization_runtime_kind())
             << '\n';
         out << "16-bit quantization stages: "
-            << engine_.pcm16_quantization_stage_count();
+            << engine_.pcm16_quantization_stage_count() << '\n';
+        out << "16-bit dither: "
+            << pcm16_dither_runtime_label(engine_.pcm16_dither_runtime_kind());
     } else {
-        out << "Tonal DSP: inactive\n";
-        out << "Soft volume: inactive\n";
         out << "16-bit quantization: inactive\n";
-        out << "16-bit quantization stages: 0";
+        out << "16-bit quantization stages: 0\n";
+        out << "16-bit dither: inactive";
     }
+
     return out.str();
 }
 
@@ -9521,8 +9614,8 @@ void GtkPlayerWindow::play_track_index_at_offset(std::size_t index,
             logical_segment_offsets.push_back(gapless_chain_total_samples_);
         }
         auto alsa_backend = std::make_unique<AlsaPcmBackend>();
-        alsa_backend->set_24bit_container_preference(
-            alsa_24bit_preference_from_id(alsa_24bit_container_preference_));
+        alsa_backend->set_24bit_container_mode(
+            alsa_24bit_mode_from_id(alsa_24bit_container_mode_));
         engine_.set_realtime_priority_enabled(realtime_audio_priority_enabled_);
         engine_.start(std::move(decoder),
                       std::move(alsa_backend),
@@ -9530,7 +9623,8 @@ void GtkPlayerWindow::play_track_index_at_offset(std::size_t index,
                       output_precision_candidates_for_entry(track),
                       initial_offset,
                       std::move(logical_segment_offsets),
-                      pcm16_quantization_mode_from_id(quantization_16bit_));
+                      pcm16_quantization_mode_from_id(quantization_16bit_),
+                      pcm16_dither_mode_from_id(dither_16bit_));
         const AudioFormat negotiated_output_format =
             engine_.transport_snapshot().format;
         if (gapless_chain_active_) {
@@ -9852,7 +9946,9 @@ void GtkPlayerWindow::open_settings_dialog() {
     gtk_widget_set_valign(lbl_16bit_quantization, GTK_ALIGN_CENTER);
     GtkWidget* quantization_16bit_combo = gtk_combo_box_text_new();
     gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(quantization_16bit_combo),
-                              "round", "Round to nearest");
+                              "round", "Round to nearest (even)");
+    gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(quantization_16bit_combo),
+                              "half_up", "Round half up");
     gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(quantization_16bit_combo),
                               "truncate", "Truncate");
     gtk_combo_box_set_active(
@@ -9861,9 +9957,28 @@ void GtkPlayerWindow::open_settings_dialog() {
     gtk_widget_set_halign(quantization_16bit_combo, GTK_ALIGN_START);
     gtk_widget_set_tooltip_text(
         quantization_16bit_combo,
-        "Sets final 16-bit quantization. Applies on next playback start.\n"
-        "Round to nearest: rounds to nearest 16-bit code.\n"
+        "Round to nearest (even): ties to even.\n"
+        "Round half up: ties toward +infinity.\n"
         "Truncate: discards low bits.");
+
+    GtkWidget* lbl_16bit_dither = gtk_label_new("16-bit dither:");
+    gtk_label_set_xalign(GTK_LABEL(lbl_16bit_dither), 0.0f);
+    gtk_widget_set_valign(lbl_16bit_dither, GTK_ALIGN_CENTER);
+    GtkWidget* dither_16bit_combo = gtk_combo_box_text_new();
+    gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(dither_16bit_combo),
+                              "off", "Off");
+    gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(dither_16bit_combo),
+                              "classic", kPcm16DitherLabelClassic);
+    gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(dither_16bit_combo),
+                              "mild", kPcm16DitherLabelMild);
+    gtk_combo_box_set_active(
+        GTK_COMBO_BOX(dither_16bit_combo),
+        dither_16bit_combo_index(dither_16bit_));
+    gtk_widget_set_halign(dither_16bit_combo, GTK_ALIGN_START);
+    gtk_widget_set_tooltip_text(
+        dither_16bit_combo,
+        "Classic: first-difference high-pass TPDF.\n"
+        "Mild: mild high-pass TPDF.");
 
     GtkWidget* lbl_alsa_24 = gtk_label_new("24-bit ALSA container:");
     gtk_label_set_xalign(GTK_LABEL(lbl_alsa_24), 0.0f);
@@ -9875,7 +9990,7 @@ void GtkPlayerWindow::open_settings_dialog() {
     gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(alsa_24_combo), "s32le", "S32_LE");
     gtk_combo_box_set_active(
         GTK_COMBO_BOX(alsa_24_combo),
-        alsa_24bit_preference_combo_index(alsa_24bit_container_preference_));
+        alsa_24bit_mode_combo_index(alsa_24bit_container_mode_));
     gtk_widget_set_halign(alsa_24_combo, GTK_ALIGN_START);
     gtk_widget_set_tooltip_text(
         alsa_24_combo,
@@ -9931,8 +10046,10 @@ void GtkPlayerWindow::open_settings_dialog() {
     gtk_grid_attach(GTK_GRID(precision_grid), precision_32bit_combo, 1, 2, 1, 1);
     gtk_grid_attach(GTK_GRID(precision_grid), lbl_16bit_quantization, 0, 3, 1, 1);
     gtk_grid_attach(GTK_GRID(precision_grid), quantization_16bit_combo, 1, 3, 1, 1);
-    gtk_grid_attach(GTK_GRID(precision_grid), lbl_alsa_24, 0, 4, 1, 1);
-    gtk_grid_attach(GTK_GRID(precision_grid), alsa_24_combo, 1, 4, 1, 1);
+    gtk_grid_attach(GTK_GRID(precision_grid), lbl_16bit_dither, 0, 4, 1, 1);
+    gtk_grid_attach(GTK_GRID(precision_grid), dither_16bit_combo, 1, 4, 1, 1);
+    gtk_grid_attach(GTK_GRID(precision_grid), lbl_alsa_24, 0, 5, 1, 1);
+    gtk_grid_attach(GTK_GRID(precision_grid), alsa_24_combo, 1, 5, 1, 1);
 
     GtkWidget* rt_row = gtk_grid_new();
     gtk_grid_attach(GTK_GRID(rt_row), rt_check, 0, 0, 1, 1);
@@ -9954,8 +10071,11 @@ void GtkPlayerWindow::open_settings_dialog() {
     gtk_label_set_xalign(GTK_LABEL(ui_title), 0.0f);
     GtkWidget* level_meter_check = gtk_check_button_new_with_label("Enable level meter");
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(level_meter_check), level_meter_enabled_ ? TRUE : FALSE);
-    GtkWidget* clip_detect_check = gtk_check_button_new_with_label("Enable clip detection");
+    GtkWidget* clip_detect_check = gtk_check_button_new_with_label("Enable DSP clip detection");
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(clip_detect_check), clip_detection_enabled_ ? TRUE : FALSE);
+    gtk_widget_set_tooltip_text(
+        clip_detect_check,
+        "Monitors clipping in the DSP path only.");
     GtkWidget* progress_blink_check = gtk_check_button_new_with_label("Animate progress indicator");
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(progress_blink_check), progress_blink_enabled_ ? TRUE : FALSE);
     GtkWidget* playlist_search_check =
@@ -10208,7 +10328,7 @@ void GtkPlayerWindow::open_settings_dialog() {
             current_device_ = std::string(selected);
         }
         const gchar* alsa24_id = gtk_combo_box_get_active_id(GTK_COMBO_BOX(alsa_24_combo));
-        alsa_24bit_container_preference_ = normalize_alsa_24bit_preference_id(alsa24_id != nullptr ? std::string(alsa24_id) : std::string("auto"));
+        alsa_24bit_container_mode_ = normalize_alsa_24bit_mode_id(alsa24_id != nullptr ? std::string(alsa24_id) : std::string("auto"));
         const auto selected_precision = [](GtkWidget* combo_box) {
             const gchar* id = gtk_combo_box_get_active_id(GTK_COMBO_BOX(combo_box));
             return normalize_output_precision_id(
@@ -10234,6 +10354,12 @@ void GtkPlayerWindow::open_settings_dialog() {
             quantization_16bit_id != nullptr
                 ? std::string(quantization_16bit_id)
                 : std::string("round"));
+        const gchar* dither_16bit_id =
+            gtk_combo_box_get_active_id(GTK_COMBO_BOX(dither_16bit_combo));
+        dither_16bit_ = normalize_16bit_dither_id(
+            dither_16bit_id != nullptr
+                ? std::string(dither_16bit_id)
+                : std::string("off"));
         realtime_audio_priority_enabled_ = (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(rt_check)) != 0);
         engine_.set_realtime_priority(60);
         if (realtime_audio_priority_enabled_) {
@@ -10356,7 +10482,7 @@ void GtkPlayerWindow::open_about_dialog() {
     }
 
     GtkWidget* title = gtk_label_new(nullptr);
-    gtk_label_set_markup(GTK_LABEL(title), "<b>PCM Transport 0.9.116</b>");
+    gtk_label_set_markup(GTK_LABEL(title), "<b>PCM Transport 0.9.117</b>");
     gtk_label_set_xalign(GTK_LABEL(title), 0.5f);
     GtkWidget* subtitle = gtk_label_new("Digital Audio Player");
     gtk_label_set_xalign(GTK_LABEL(subtitle), 0.5f);
@@ -10604,7 +10730,7 @@ void GtkPlayerWindow::open_bitperfect_test_dialog(GtkWidget* parent_dialog, int 
         gtk_box_new(GTK_ORIENTATION_VERTICAL, kGuiHeaderSpacing);
     gtk_box_pack_start(GTK_BOX(bitperfect_header), title, FALSE, FALSE, 0);
 
-    GtkWidget* note = gtk_label_new("libFLAC / flac CLI only. The FFmpeg API is not used. The comparison is made before ALSA output.");
+    GtkWidget* note = gtk_label_new("Native libFLAC path only; resampling and ALSA output are not tested.");
     gtk_label_set_xalign(GTK_LABEL(note), 0.0f);
     gtk_label_set_line_wrap(GTK_LABEL(note), TRUE);
     gtk_label_set_line_wrap_mode(GTK_LABEL(note), PANGO_WRAP_WORD_CHAR);
@@ -10640,6 +10766,8 @@ void GtkPlayerWindow::open_bitperfect_test_dialog(GtkWidget* parent_dialog, int 
             : (diagnostic_precision_setting == "24" ? 24 : 32);
     const Pcm16QuantizationMode diagnostic_pcm16_quantization_mode =
         pcm16_quantization_mode_from_id(quantization_16bit_);
+    const Pcm16DitherMode diagnostic_pcm16_dither_mode =
+        pcm16_dither_mode_from_id(dither_16bit_);
     const bool level_meter = level_meter_enabled_;
     const bool clip_detection = clip_detection_enabled_;
 
@@ -10659,6 +10787,7 @@ void GtkPlayerWindow::open_bitperfect_test_dialog(GtkWidget* parent_dialog, int 
         treble_hz,
         diagnostic_precision_bits,
         diagnostic_pcm16_quantization_mode,
+        diagnostic_pcm16_dither_mode,
         level_meter,
         clip_detection,
         text_view,
@@ -10757,7 +10886,7 @@ void GtkPlayerWindow::open_bitperfect_test_dialog(GtkWidget* parent_dialog, int 
                 return;
             }
             post_diagnostics_update(text_view, progress, close_button,
-                "PCM Transport FLAC bit-perfect test\nVersion: 0.9.116\nMode: current player processing path before ALSA\nFFmpeg API: not used\n", 0.02, false);
+                "PCM Transport FLAC bit-perfect test\nVersion: 0.9.117\nScope: native libFLAC path before ALSA; resampling excluded\nFFmpeg API: not used\n", 0.02, false);
             std::ostringstream ctx;
             ctx << "Duration: " << duration_seconds << " sec\n"
                 << "Generated signal: deterministic 16-bit / 44.1 kHz / stereo stress pattern\n"
@@ -10767,7 +10896,15 @@ void GtkPlayerWindow::open_bitperfect_test_dialog(GtkWidget* parent_dialog, int 
                 << "  Treble: " << treble_db << " dB @ " << treble_hz << " Hz\n"
                 << "  Pre-EQ headroom: " << (static_cast<double>(headroom) / 10.0) << " dB\n"
                 << "  Level meter: " << (level_meter ? "enabled" : "disabled") << "\n"
-                << "  Clip detection: " << (clip_detection ? "enabled" : "disabled") << "\n\n";
+                << "  DSP clip detection: " << (clip_detection ? "enabled" : "disabled") << "\n"
+                << "  16-bit dither: "
+                << pcm16_dither_runtime_label(
+                       pcmtp::pcm16_dither_runtime_kind(
+                           diagnostic_pcm16_dither_mode,
+                           diagnostic_precision_bits == 16 &&
+                               (soft_volume < 100 || bass_db != 0 ||
+                                treble_db != 0 || headroom > 0)))
+                << "\n\n";
             post_diagnostics_update(text_view, progress, close_button, ctx.str(), 0.05, false);
 
             char tmpl[] = "/tmp/pcm_transport_bitperfect_XXXXXX";
@@ -10819,7 +10956,9 @@ void GtkPlayerWindow::open_bitperfect_test_dialog(GtkWidget* parent_dialog, int 
             const DiagnosticRenderResult internal = render_internal_path(
                 test_flac, soft_volume, bass_db, treble_db, headroom,
                 bass_hz, treble_hz, diagnostic_precision_bits,
-                diagnostic_pcm16_quantization_mode, cancel_requested.get());
+                diagnostic_pcm16_quantization_mode,
+                diagnostic_pcm16_dither_mode,
+                cancel_requested.get());
             if (cancelled()) {
                 cleanup();
                 return;
@@ -10848,7 +10987,7 @@ void GtkPlayerWindow::open_bitperfect_test_dialog(GtkWidget* parent_dialog, int 
                     << "  Actual: " << result.actual << "\n"
                     << "  Difference: " << (result.actual - result.expected) << "\n";
                 if (soft_volume < 100 || bass_db != 0 || treble_db != 0 || headroom > 0) {
-                    out << "Note: FAIL can be expected when DSP, soft volume or headroom is enabled.\n";
+                    out << "Note: FAIL can be expected when DSP, soft volume, headroom or final dither is active.\n";
                 } else {
                     out << "Warning: pure path differs from reference. This should be investigated.\n";
                 }
@@ -13589,7 +13728,7 @@ void GtkPlayerWindow::load_preferences() {
         } else if (key == "resample_quality") {
             resample_quality_ = value;
         } else if (key == "alsa_24bit_container_preference") {
-            alsa_24bit_container_preference_ = normalize_alsa_24bit_preference_id(value);
+            alsa_24bit_container_mode_ = normalize_alsa_24bit_mode_id(value);
         } else if (key == "output_precision_16bit_lossy") {
             output_precision_16bit_lossy_ = normalize_output_precision_id(value);
         } else if (key == "output_precision_24bit") {
@@ -13600,6 +13739,8 @@ void GtkPlayerWindow::load_preferences() {
             dsd_output_precision_ = normalize_output_precision_id(value);
         } else if (key == "quantization_16bit") {
             quantization_16bit_ = normalize_16bit_quantization_id(value);
+        } else if (key == "dither_16bit") {
+            dither_16bit_ = normalize_16bit_dither_id(value);
         } else if (key == "realtime_audio_priority_enabled") {
             realtime_audio_priority_enabled_ = (value == "1" || value == "true" || value == "yes");
         }
@@ -13636,8 +13777,8 @@ void GtkPlayerWindow::load_preferences() {
     saved_last_open_directory_ = last_open_directory_;
     current_loaded_sources_initialized_ = false;
 
-    alsa_24bit_container_preference_ =
-        normalize_alsa_24bit_preference_id(alsa_24bit_container_preference_);
+    alsa_24bit_container_mode_ =
+        normalize_alsa_24bit_mode_id(alsa_24bit_container_mode_);
     output_precision_16bit_lossy_ =
         normalize_output_precision_id(output_precision_16bit_lossy_);
     output_precision_24bit_ =
@@ -13647,6 +13788,7 @@ void GtkPlayerWindow::load_preferences() {
     dsd_output_precision_ =
         normalize_output_precision_id(dsd_output_precision_);
     quantization_16bit_ = normalize_16bit_quantization_id(quantization_16bit_);
+    dither_16bit_ = normalize_16bit_dither_id(dither_16bit_);
     engine_.set_level_meter_enabled(level_meter_enabled_);
     engine_.set_clip_detection_enabled(clip_detection_enabled_);
     engine_.set_realtime_priority_enabled(realtime_audio_priority_enabled_);
@@ -13709,7 +13851,7 @@ std::string GtkPlayerWindow::serialize_preferences() const {
     out << "treble_shelf_hz=" << treble_shelf_hz_ << '\n';
     out << "resample_quality=" << resample_quality_ << '\n';
     out << "alsa_24bit_container_preference="
-        << normalize_alsa_24bit_preference_id(alsa_24bit_container_preference_) << '\n';
+        << normalize_alsa_24bit_mode_id(alsa_24bit_container_mode_) << '\n';
     out << "output_precision_16bit_lossy="
         << normalize_output_precision_id(output_precision_16bit_lossy_) << '\n';
     out << "output_precision_24bit="
@@ -13720,6 +13862,8 @@ std::string GtkPlayerWindow::serialize_preferences() const {
         << normalize_output_precision_id(dsd_output_precision_) << '\n';
     out << "quantization_16bit="
         << normalize_16bit_quantization_id(quantization_16bit_) << '\n';
+    out << "dither_16bit="
+        << normalize_16bit_dither_id(dither_16bit_) << '\n';
     out << "realtime_audio_priority_enabled=" << (realtime_audio_priority_enabled_ ? 1 : 0) << '\n';
     return out.str();
 }

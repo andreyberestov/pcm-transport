@@ -21,6 +21,8 @@
 
 namespace pcmtp {
 
+class Pcm16Dither;
+
 struct PlaybackStatusSnapshot {
     bool playing = false;
     bool paused = false;
@@ -58,6 +60,7 @@ struct PlaybackMeterSnapshot {
     std::uint32_t clipped_samples = 0;
     bool transport_active = false;
 };
+
 
 enum class RealtimePrioritySource {
     None,
@@ -100,7 +103,8 @@ public:
                std::uint64_t initial_samples_per_channel = 0,
                std::vector<std::uint64_t> logical_segment_offsets = {},
                Pcm16QuantizationMode pcm16_quantization_mode =
-                   Pcm16QuantizationMode::RoundToNearest);
+                   Pcm16QuantizationMode::RoundToNearestEven,
+               Pcm16DitherMode pcm16_dither_mode = Pcm16DitherMode::Off);
 
     void stop();
     void pause();
@@ -123,6 +127,7 @@ public:
     ResamplerRuntimeKind resampler_runtime_kind() const noexcept;
     Pcm16QuantizationRuntimeKind pcm16_quantization_runtime_kind() const noexcept;
     std::uint32_t pcm16_quantization_stage_count() const noexcept;
+    Pcm16DitherRuntimeKind pcm16_dither_runtime_kind() const noexcept;
     std::string source_codec_name() const;
     std::uint64_t encoded_bitrate_bps() const noexcept;
     std::string decoded_codec_name() const;
@@ -192,6 +197,8 @@ private:
     std::atomic<Pcm16QuantizationRuntimeKind> pcm16_quantization_runtime_kind_{
         Pcm16QuantizationRuntimeKind::NotUsed};
     std::atomic<std::uint32_t> pcm16_quantization_stage_count_{0};
+    std::atomic<Pcm16DitherRuntimeKind> pcm16_dither_runtime_kind_{
+        Pcm16DitherRuntimeKind::NotUsed};
     std::atomic<DecoderPcmSampleKind> decoded_pcm_sample_kind_{
         DecoderPcmSampleKind::Unknown};
     std::atomic<std::uint16_t> decoded_pcm_significant_bits_{0};
@@ -203,7 +210,9 @@ private:
     AudioFormat output_format_{};
     std::string device_name_;
     Pcm16QuantizationMode pcm16_quantization_mode_ =
-        Pcm16QuantizationMode::RoundToNearest;
+        Pcm16QuantizationMode::RoundToNearestEven;
+    Pcm16DitherMode pcm16_dither_mode_ = Pcm16DitherMode::Off;
+    std::unique_ptr<Pcm16Dither> pcm16_dither_;
 
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> pause_requested_{false};

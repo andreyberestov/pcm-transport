@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.117
+
+- Changed final 16-bit nearest rounding to deterministic ties-to-even and added Round half up; Truncate behavior remains unchanged.
+- Added optional final 16-bit high-pass TPDF dither with Classic and Mild profiles. Dither is disabled by default and is applied only when a real final S16 quantization is required.
+- Documented U. Zölzer, Digital Audio Signal Processing, 3rd ed., Wiley, 2022 as mathematical background for Round half up and classic high-pass TPDF; PCM Transport implementations are independently written.
+- Made explicit 24-bit ALSA container selections strict. Auto retains S24_LE → S24_3LE → S32_LE fallback.
+- Updated GUI and project documentation.
+
 ## 0.9.116
 
 - Reworked output precision around a single final PCM conversion boundary after resampling and DSP.

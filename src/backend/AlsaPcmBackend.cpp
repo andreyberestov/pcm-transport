@@ -70,39 +70,30 @@ struct PcmHandleDeleter {
 
 using UniquePcmHandle = std::unique_ptr<snd_pcm_t, PcmHandleDeleter>;
 
-void push_unique_format(std::vector<snd_pcm_format_t>& candidates, snd_pcm_format_t fmt) {
-    for (std::size_t i = 0; i < candidates.size(); ++i) {
-        if (candidates[i] == fmt) {
-            return;
-        }
-    }
-    candidates.push_back(fmt);
-}
-
 std::vector<snd_pcm_format_t> format_candidates_for_bits(
     std::uint16_t bits_per_sample,
-    Alsa24BitContainerPreference preference) {
+    Alsa24BitContainerMode mode) {
     std::vector<snd_pcm_format_t> candidates;
     if (bits_per_sample <= 16) {
         candidates.push_back(SND_PCM_FORMAT_S16_LE);
     } else if (bits_per_sample <= 24) {
-        switch (preference) {
-            case Alsa24BitContainerPreference::PreferS24LE:
-                push_unique_format(candidates, SND_PCM_FORMAT_S24_LE);
-                break;
-            case Alsa24BitContainerPreference::PreferS24_3LE:
-                push_unique_format(candidates, SND_PCM_FORMAT_S24_3LE);
-                break;
-            case Alsa24BitContainerPreference::PreferS32LE:
-                push_unique_format(candidates, SND_PCM_FORMAT_S32_LE);
-                break;
-            case Alsa24BitContainerPreference::Auto:
-            default:
-                break;
+        switch (mode) {
+        case Alsa24BitContainerMode::S24LE:
+            candidates.push_back(SND_PCM_FORMAT_S24_LE);
+            break;
+        case Alsa24BitContainerMode::S24_3LE:
+            candidates.push_back(SND_PCM_FORMAT_S24_3LE);
+            break;
+        case Alsa24BitContainerMode::S32LE:
+            candidates.push_back(SND_PCM_FORMAT_S32_LE);
+            break;
+        case Alsa24BitContainerMode::Auto:
+        default:
+            candidates.push_back(SND_PCM_FORMAT_S24_LE);
+            candidates.push_back(SND_PCM_FORMAT_S24_3LE);
+            candidates.push_back(SND_PCM_FORMAT_S32_LE);
+            break;
         }
-        push_unique_format(candidates, SND_PCM_FORMAT_S24_LE);
-        push_unique_format(candidates, SND_PCM_FORMAT_S24_3LE);
-        push_unique_format(candidates, SND_PCM_FORMAT_S32_LE);
     } else {
         candidates.push_back(SND_PCM_FORMAT_S32_LE);
     }
@@ -114,12 +105,12 @@ const char* format_name_or_unknown(snd_pcm_format_t fmt) {
     return name != nullptr ? name : "unknown";
 }
 
-std::string preference_name(Alsa24BitContainerPreference preference) {
-    switch (preference) {
-        case Alsa24BitContainerPreference::PreferS24LE: return "Prefer S24_LE";
-        case Alsa24BitContainerPreference::PreferS24_3LE: return "Prefer S24_3LE";
-        case Alsa24BitContainerPreference::PreferS32LE: return "Prefer S32_LE";
-        case Alsa24BitContainerPreference::Auto:
+std::string container_mode_name(Alsa24BitContainerMode mode) {
+    switch (mode) {
+        case Alsa24BitContainerMode::S24LE: return "S24_LE";
+        case Alsa24BitContainerMode::S24_3LE: return "S24_3LE";
+        case Alsa24BitContainerMode::S32LE: return "S32_LE";
+        case Alsa24BitContainerMode::Auto:
         default:
             return "Auto";
     }
@@ -371,17 +362,17 @@ void AlsaPcmBackend::open(const std::string& device_name, const AudioFormat& for
     Logger::instance().info("Opening ALSA device: " + device_name +
                             " format=" + format.to_string());
 
-    const Alsa24BitContainerPreference active_preference =
-        format_24bit_preference_;
+    const Alsa24BitContainerMode active_mode =
+        format_24bit_mode_;
     const std::vector<snd_pcm_format_t> candidates =
         format_candidates_for_bits(format.bits_per_sample,
-                                   active_preference);
+                                   active_mode);
     const AlsaBufferPolicy target_buffer_policy =
         alsa_buffer_policy_for_sample_rate(format.sample_rate);
 
     Logger::instance().debug(
-        "ALSA 24-bit container preference: " +
-        preference_name(active_preference));
+        "ALSA 24-bit container mode: " +
+        container_mode_name(active_mode));
 
     PcmCandidateResult negotiated;
     std::string last_unsupported_message;
@@ -402,7 +393,7 @@ void AlsaPcmBackend::open(const std::string& device_name, const AudioFormat& for
             Logger::instance().info(
                 std::string("ALSA format negotiation: requested bits=") +
                 std::to_string(format.bits_per_sample) +
-                " preference=" + preference_name(active_preference) +
+                " container_mode=" + container_mode_name(active_mode) +
                 " accepted=" +
                 format_name_or_unknown(attempt.container_format));
             negotiated = std::move(attempt);
@@ -426,6 +417,11 @@ void AlsaPcmBackend::open(const std::string& device_name, const AudioFormat& for
                 "ALSA device does not support S32_LE required for 32-bit precision");
         }
         if (format.bits_per_sample > 16) {
+            if (active_mode != Alsa24BitContainerMode::Auto) {
+                throw AudioFormatUnsupportedError(
+                    std::string("ALSA device does not support selected 24-bit container ") +
+                    container_mode_name(active_mode));
+            }
             throw AudioFormatUnsupportedError(
                 "ALSA device does not support any permitted 24-bit container "
                 "(S24_LE, S24_3LE, S32_LE)");
@@ -439,7 +435,6 @@ void AlsaPcmBackend::open(const std::string& device_name, const AudioFormat& for
     handle_ = negotiated.handle.release();
     format_ = format;
     pcm_container_format_ = negotiated.container_format;
-    active_format_24bit_preference_ = active_preference;
     device_name_ = device_name;
     accepted_sample_rate_ = negotiated.sample_rate;
     active_significant_bits_ = negotiated.significant_bits;
@@ -598,8 +593,8 @@ void AlsaPcmBackend::close() {
     }
 }
 
-void AlsaPcmBackend::set_24bit_container_preference(Alsa24BitContainerPreference preference) {
-    format_24bit_preference_ = preference;
+void AlsaPcmBackend::set_24bit_container_mode(Alsa24BitContainerMode mode) {
+    format_24bit_mode_ = mode;
 }
 
 std::string AlsaPcmBackend::active_output_report() const {
@@ -610,12 +605,7 @@ std::string AlsaPcmBackend::active_output_report() const {
     ss << "Device: " << (device_name_.empty() ? std::string("unknown") : device_name_) << '\n';
     ss << "Requested PCM: " << format_.bits_per_sample << "-bit / "
        << format_.sample_rate << " Hz / " << static_cast<unsigned>(format_.channels) << " ch" << '\n';
-    ss << "Container: " << format_name_or_unknown(pcm_container_format_);
-    if (format_.bits_per_sample > 16 && format_.bits_per_sample <= 24) {
-        ss << " (24-bit preference: "
-           << preference_name(active_format_24bit_preference_) << ")";
-    }
-    ss << '\n';
+    ss << "Container: " << format_name_or_unknown(pcm_container_format_) << '\n';
     if (active_significant_bits_ > 0) {
         ss << "ALSA significant bits: " << active_significant_bits_ << "-bit\n";
     }

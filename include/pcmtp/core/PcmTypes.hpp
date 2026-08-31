@@ -26,15 +26,29 @@ struct AudioFormat {
 };
 
 enum class Pcm16QuantizationMode {
-    RoundToNearest,
+    RoundToNearestEven,
+    RoundHalfUp,
     Truncate
 };
 
 enum class Pcm16QuantizationRuntimeKind {
     NotUsed,
-    RoundToNearest,
+    RoundToNearestEven,
+    RoundHalfUp,
     Truncate,
     Ffmpeg
+};
+
+enum class Pcm16DitherMode {
+    Off,
+    HighPassClassic,
+    HighPassMild
+};
+
+enum class Pcm16DitherRuntimeKind {
+    NotUsed,
+    HighPassClassic,
+    HighPassMild
 };
 
 enum class DecoderPcmSampleKind {

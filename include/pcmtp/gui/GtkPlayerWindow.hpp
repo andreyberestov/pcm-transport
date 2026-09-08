@@ -279,6 +279,9 @@ private:
     static gboolean on_window_configure_event(GtkWidget* widget,
                                               GdkEventConfigure* event,
                                               gpointer user_data);
+    static void on_playlist_panel_size_allocate(GtkWidget* widget,
+                                                GtkAllocation* allocation,
+                                                gpointer user_data);
     static gboolean on_window_state_event(GtkWidget* widget,
                                           GdkEventWindowState* event,
                                           gpointer user_data);
@@ -499,7 +502,7 @@ private:
     void play_filtered_track_index(std::size_t index);
     void apply_playlist_search_handler_connections();
     void apply_playlist_search_ui_state();
-    void adjust_playlist_search_window_height(bool enabled);
+    void arm_playlist_search_geometry_trace();
     void queue_playlist_layout_reflow();
     bool main_window_has_normal_size_state() const;
     void remember_normal_window_size(int width, int height);
@@ -511,6 +514,9 @@ private:
     void begin_programmatic_window_resize(int width, int height);
     void cancel_window_geometry_tracking_sources();
     void reset_window_size_to_default();
+    void log_playlist_search_geometry_snapshot(const char* stage,
+                                               int reported_width,
+                                               int reported_height);
 
     std::unique_ptr<IAudioDecoder> create_decoder_for_entry(const PlaylistEntry& entry) const;
     GaplessTrackSpec gapless_spec_for_entry(const PlaylistEntry& entry) const;
@@ -567,6 +573,8 @@ private:
     void apply_soft_eq_with_auto_headroom();
     void apply_soft_eq_profile_with_auto_headroom();
     void draw_tone_response_graph(cairo_t* cr, int width, int height) const;
+    void refresh_tone_dsp_signal_path_state(const PlaybackStatusSnapshot& status);
+    void draw_tone_dsp_signal_path(cairo_t* cr, int width, int height) const;
     std::uint32_t current_tone_control_sample_rate() const;
     std::string processing_rules_report_for_entry(
         const PlaylistEntry& entry,
@@ -696,6 +704,12 @@ private:
     bool diagnostics_page_active_ = false;
     std::vector<GtkWidget*> stereo_tonal_dsp_controls_;
     std::optional<bool> applied_stereo_tonal_dsp_controls_enabled_;
+    GtkWidget* tone_dsp_signal_path_ = nullptr;
+    bool tone_dsp_signal_path_state_valid_ = false;
+    bool tone_dsp_signal_path_flowing_ = false;
+    bool tone_dsp_signal_path_headroom_active_ = false;
+    bool tone_dsp_signal_path_tone_active_ = false;
+    bool tone_dsp_signal_path_volume_active_ = false;
 
     PlaybackEngine engine_;
     std::vector<PlaylistEntry> playlist_;
@@ -862,8 +876,9 @@ private:
     bool window_geometry_restore_guard_ = false;
     guint window_geometry_tracking_ready_idle_id_ = 0;
     guint window_geometry_restore_guard_idle_id_ = 0;
-    bool playlist_search_window_height_adjusted_ = false;
-    int playlist_search_runtime_height_compensation_ = 0;
+    bool playlist_search_geometry_trace_active_ = false;
+    unsigned int playlist_search_geometry_trace_serial_ = 0;
+    gulong playlist_search_geometry_size_allocate_handler_id_ = 0;
     bool playlist_selection_syncing_ = false;
     bool playlist_selection_handler_blocked_ = false;
     unsigned int playlist_selection_sync_depth_ = 0;

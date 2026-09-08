@@ -485,6 +485,8 @@ int interrupt_callback(void* opaque) {
     return state != nullptr && state->interrupted() ? 1 : 0;
 }
 
+#if PCMTP_FFMPEG_HAS_MOV_AAC_INDEX_API
+
 void throw_if_global_probe_interrupted(const InterruptState* interrupt) {
     if (interrupt != nullptr &&
         (interrupt->cancelled() || interrupt->global_timed_out())) {
@@ -528,6 +530,8 @@ ScopedAvFormatInput open_bounded_input_context(const std::string& path,
     }
     return ScopedAvFormatInput(context);
 }
+
+#endif
 
 AVFormatContext* open_input_context(const std::string& path,
                                     InterruptState* interrupt,

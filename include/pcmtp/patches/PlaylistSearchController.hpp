@@ -33,6 +33,9 @@ public:
     void install_in_panel(GtkBox* playlist_panel);
     GtkTreeModelFilter* filter_model() const { return filter_; }
     int search_entry_natural_height() const;
+    void search_entry_height_metrics(int& minimum_height,
+                                     int& natural_height,
+                                     int& allocated_height) const;
     void set_search_entry_visible(bool visible);
 
     void cancel_search();

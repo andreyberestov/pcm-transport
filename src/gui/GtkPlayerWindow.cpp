@@ -68,6 +68,7 @@ namespace {
 
 constexpr int kClipIndicatorHoldMs = 700;
 constexpr guint kPreferencesSaveDebounceMs = 350;
+constexpr int kPreEqHeadroomPreferenceRevision = 2;
 constexpr int kDefaultWindowWidth = 900;
 constexpr int kDefaultWindowHeight = 660;
 constexpr int kDefaultPlaylistRows = 12;
@@ -686,7 +687,7 @@ constexpr double kMeterReleaseDbPerSecond = 24.0;
 constexpr double kMeterInactiveReleaseDbPerSecond = 48.0;
 constexpr double kMeterFloorDb = -80.0;
 constexpr double kMeterMaximumLevel = 1.18;
-constexpr int kUiPreEqHeadroomMaxTenthsDb = 150;
+constexpr int kUiPreEqHeadroomMaxTenthsDb = 320;
 
 struct AsyncUiDispatch {
     GtkPlayerWindow* window = nullptr;
@@ -744,6 +745,59 @@ void update_log_path_tooltip(GtkWidget* entry) {
     const std::string path = text != nullptr ? std::string(text) : std::string();
     const std::string tip = "Current path: " + effective_log_path_for_display(path);
     gtk_widget_set_tooltip_text(entry, tip.c_str());
+}
+
+std::string selected_local_folder(GtkFileChooser* chooser,
+                                  std::string* filename_debug,
+                                  std::string* uri_debug) {
+    if (filename_debug != nullptr) {
+        filename_debug->clear();
+    }
+    if (uri_debug != nullptr) {
+        uri_debug->clear();
+    }
+    if (chooser == nullptr) {
+        return {};
+    }
+
+    std::string filename_result;
+    gchar* filename = gtk_file_chooser_get_filename(chooser);
+    if (filename != nullptr) {
+        filename_result = filename;
+        g_free(filename);
+    }
+    if (filename_debug != nullptr) {
+        *filename_debug = filename_result;
+    }
+
+    std::string uri_result;
+    gchar* uri = gtk_file_chooser_get_uri(chooser);
+    if (uri != nullptr) {
+        uri_result = uri;
+        g_free(uri);
+    }
+    if (uri_debug != nullptr) {
+        *uri_debug = uri_result;
+    }
+
+    if (!filename_result.empty()) {
+        return filename_result;
+    }
+    if (uri_result.empty() || !g_str_has_prefix(uri_result.c_str(), "file://")) {
+        return {};
+    }
+
+    std::string result;
+    GError* error = nullptr;
+    gchar* path = g_filename_from_uri(uri_result.c_str(), nullptr, &error);
+    if (path != nullptr && *path != '\0') {
+        result = path;
+    }
+    g_free(path);
+    if (error != nullptr) {
+        g_error_free(error);
+    }
+    return result;
 }
 
 GtkWidget* create_symbolic_button(const char* primary_icon,
@@ -3058,8 +3112,6 @@ void GtkPlayerWindow::apply_playlist_search_handler_connections() {
 }
 
 void GtkPlayerWindow::queue_playlist_layout_reflow() {
-    // Search changes the vertical allocation of the playlist panel. Queue one
-    // normal GTK layout pass after the direct top-level resize.
     if (playlist_view_ != nullptr) {
         gtk_widget_queue_resize(playlist_view_);
     }
@@ -3186,6 +3238,62 @@ void GtkPlayerWindow::begin_programmatic_window_resize(int width, int height) {
         nullptr);
 }
 
+void GtkPlayerWindow::log_playlist_search_geometry_snapshot(const char* stage,
+                                                            int reported_width,
+                                                            int reported_height) {
+    if (!playlist_search_geometry_trace_active_ ||
+        !Logger::instance().debug_enabled()) {
+        return;
+    }
+
+    int window_width = 0;
+    int window_height = 0;
+    if (window_ != nullptr && GTK_IS_WINDOW(window_)) {
+        gtk_window_get_size(GTK_WINDOW(window_), &window_width, &window_height);
+    }
+
+    int search_minimum_height = 0;
+    int search_natural_height = 0;
+    int search_allocated_height = 0;
+    if (search_controller_ != nullptr) {
+        search_controller_->search_entry_height_metrics(search_minimum_height,
+                                                        search_natural_height,
+                                                        search_allocated_height);
+    }
+
+    const auto widget_allocation = [](GtkWidget* widget) {
+        GtkAllocation allocation = {0, 0, 0, 0};
+        if (widget != nullptr) {
+            gtk_widget_get_allocation(widget, &allocation);
+        }
+        return allocation;
+    };
+    const GtkAllocation window_allocation = widget_allocation(window_);
+    const GtkAllocation panel_allocation = widget_allocation(playlist_panel_);
+    const GtkAllocation scrolled_allocation = widget_allocation(playlist_scrolled_);
+    const GtkAllocation view_allocation = widget_allocation(playlist_view_);
+
+    std::ostringstream message;
+    message << "Playlist search geometry #" << playlist_search_geometry_trace_serial_
+            << ' ' << (stage != nullptr ? stage : "snapshot")
+            << ": reported=" << reported_width << 'x' << reported_height
+            << ", window_get=" << window_width << 'x' << window_height
+            << ", window_alloc=" << window_allocation.width << 'x'
+            << window_allocation.height
+            << ", runtime_normal=";
+    if (runtime_normal_window_size_valid_) {
+        message << runtime_normal_window_width_ << 'x' << runtime_normal_window_height_;
+    } else {
+        message << "invalid";
+    }
+    message << ", search_h=" << search_minimum_height << '/'
+            << search_natural_height << '/' << search_allocated_height
+            << ", panel_h=" << panel_allocation.height
+            << ", scrolled_h=" << scrolled_allocation.height
+            << ", view_h=" << view_allocation.height;
+    Logger::instance().debug(message.str());
+}
+
 void GtkPlayerWindow::cancel_window_geometry_tracking_sources() {
     if (window_geometry_tracking_ready_idle_id_ != 0) {
         g_source_remove(window_geometry_tracking_ready_idle_id_);
@@ -3205,9 +3313,6 @@ void GtkPlayerWindow::reset_window_size_to_default() {
     const int base_height = default_window_height_without_search_ > 0
         ? default_window_height_without_search_
         : kDefaultWindowHeight;
-    const int applied_base_height =
-        clamp_window_height_to_workarea(window_, base_height);
-
     int search_delta = 0;
     const bool search_visible = playlist_search_enabled_ && search_controller_ != nullptr;
     if (search_visible) {
@@ -3222,12 +3327,6 @@ void GtkPlayerWindow::reset_window_size_to_default() {
         clamp_window_width_to_workarea(window_, kDefaultWindowWidth);
     const int target_height = clamp_window_height_to_workarea(
         window_, base_height + search_delta);
-    const int applied_search_delta = search_visible
-        ? std::max(0, target_height - applied_base_height)
-        : 0;
-
-    playlist_search_window_height_adjusted_ = search_visible;
-    playlist_search_runtime_height_compensation_ = applied_search_delta;
 
     runtime_window_size_user_defined_ = false;
     remember_normal_window_size(target_width, target_height);
@@ -3269,26 +3368,32 @@ gboolean GtkPlayerWindow::on_window_configure_event(
         return FALSE;
     }
 
-    const bool valid_size =
-        event != nullptr && event->width > 0 && event->height > 0;
+    int logical_width = 0;
+    int logical_height = 0;
+    if (self->window_ != nullptr && GTK_IS_WINDOW(self->window_)) {
+        gtk_window_get_size(
+            GTK_WINDOW(self->window_), &logical_width, &logical_height);
+    }
+
+    const bool valid_size = logical_width > 0 && logical_height > 0;
     const bool normal_state = valid_size && self->main_window_has_normal_size_state();
 
     if (normal_state) {
         const bool changed =
             !self->runtime_normal_window_size_valid_ ||
-            event->width != self->runtime_normal_window_width_ ||
-            event->height != self->runtime_normal_window_height_;
+            logical_width != self->runtime_normal_window_width_ ||
+            logical_height != self->runtime_normal_window_height_;
 
         if (!self->window_geometry_tracking_enabled_) {
-            self->remember_normal_window_size(event->width, event->height);
+            self->remember_normal_window_size(logical_width, logical_height);
         } else if (self->window_geometry_programmatic_resize_pending_) {
-            self->remember_normal_window_size(event->width, event->height);
+            self->remember_normal_window_size(logical_width, logical_height);
             if (self->runtime_window_size_user_defined_) {
                 self->update_window_geometry_dirty_state();
             }
             const bool expected_size =
-                std::abs(event->width - self->window_geometry_programmatic_width_) <= 2 &&
-                std::abs(event->height - self->window_geometry_programmatic_height_) <= 2;
+                std::abs(logical_width - self->window_geometry_programmatic_width_) <= 2 &&
+                std::abs(logical_height - self->window_geometry_programmatic_height_) <= 2;
             if (expected_size) {
                 self->window_geometry_programmatic_resize_pending_ = false;
                 self->window_geometry_programmatic_width_ = 0;
@@ -3300,18 +3405,45 @@ gboolean GtkPlayerWindow::on_window_configure_event(
                 }
             }
         } else if (self->window_geometry_restore_guard_) {
-            self->remember_normal_window_size(event->width, event->height);
+            self->remember_normal_window_size(logical_width, logical_height);
             self->window_geometry_restore_guard_ = false;
             if (self->window_geometry_restore_guard_idle_id_ != 0) {
                 g_source_remove(self->window_geometry_restore_guard_idle_id_);
                 self->window_geometry_restore_guard_idle_id_ = 0;
             }
         } else if (changed) {
-            self->remember_user_window_size(event->width, event->height);
+            self->remember_user_window_size(logical_width, logical_height);
         }
     }
 
+    if (self->playlist_search_geometry_trace_active_ && event != nullptr) {
+        self->log_playlist_search_geometry_snapshot(
+            "CONFIGURE", event->width, event->height);
+    }
+
     return FALSE;
+}
+
+void GtkPlayerWindow::on_playlist_panel_size_allocate(
+    GtkWidget*,
+    GtkAllocation*,
+    gpointer user_data) {
+    auto* self = static_cast<GtkPlayerWindow*>(user_data);
+    if (self == nullptr || !self->playlist_search_geometry_trace_active_) {
+        return;
+    }
+
+    if (Logger::instance().debug_enabled()) {
+        self->log_playlist_search_geometry_snapshot("ALLOCATE", -1, -1);
+    }
+    self->playlist_search_geometry_trace_active_ = false;
+    if (self->playlist_search_geometry_size_allocate_handler_id_ != 0 &&
+        self->playlist_panel_ != nullptr) {
+        g_signal_handler_disconnect(
+            self->playlist_panel_,
+            self->playlist_search_geometry_size_allocate_handler_id_);
+        self->playlist_search_geometry_size_allocate_handler_id_ = 0;
+    }
 }
 
 gboolean GtkPlayerWindow::on_window_state_event(
@@ -3374,61 +3506,32 @@ gboolean GtkPlayerWindow::on_window_geometry_restore_guard_idle(gpointer user_da
     return G_SOURCE_REMOVE;
 }
 
-void GtkPlayerWindow::adjust_playlist_search_window_height(bool enabled) {
-    if (window_ == nullptr || playlist_search_window_height_adjusted_ == enabled) {
+void GtkPlayerWindow::arm_playlist_search_geometry_trace() {
+    if (!playlist_search_geometry_trace_active_) {
         return;
     }
 
-    int width = 0;
-    int height = 0;
-    if (gtk_widget_get_realized(window_)) {
-        gtk_window_get_size(GTK_WINDOW(window_), &width, &height);
-    } else {
-        gtk_window_get_default_size(GTK_WINDOW(window_), &width, &height);
+    if (playlist_search_geometry_size_allocate_handler_id_ != 0 &&
+        playlist_panel_ != nullptr) {
+        g_signal_handler_disconnect(
+            playlist_panel_, playlist_search_geometry_size_allocate_handler_id_);
+        playlist_search_geometry_size_allocate_handler_id_ = 0;
     }
-    if (width <= 0) {
-        width = kDefaultWindowWidth;
-    }
-    if (height <= 0) {
-        height = kDefaultWindowHeight;
+    if (playlist_panel_ == nullptr) {
+        playlist_search_geometry_trace_active_ = false;
+        return;
     }
 
-    int target_height = height;
-    if (enabled) {
-        const int entry_height = search_controller_ != nullptr
-            ? search_controller_->search_entry_natural_height()
-            : 0;
-        const int spacing = playlist_panel_ != nullptr
-            ? gtk_box_get_spacing(GTK_BOX(playlist_panel_))
-            : 0;
-        const int requested_delta = std::max(0, entry_height + spacing);
-        const std::int64_t requested_height_value =
-            static_cast<std::int64_t>(height) + static_cast<std::int64_t>(requested_delta);
-        const int requested_height = static_cast<int>(std::max<std::int64_t>(
-            1,
-            std::min<std::int64_t>(requested_height_value,
-                                   std::numeric_limits<int>::max())));
-        const int clamped_height = clamp_window_height_to_workarea(window_, requested_height);
-        target_height = std::max(height, clamped_height);
-        playlist_search_runtime_height_compensation_ =
-            std::max(0, target_height - height);
-    } else {
-        target_height = std::max(
-            1,
-            height - std::max(0, playlist_search_runtime_height_compensation_));
-        playlist_search_runtime_height_compensation_ = 0;
+    log_playlist_search_geometry_snapshot("LAYOUT_PENDING", -1, -1);
+    playlist_search_geometry_size_allocate_handler_id_ =
+        g_signal_connect_after(
+            playlist_panel_,
+            "size-allocate",
+            G_CALLBACK(GtkPlayerWindow::on_playlist_panel_size_allocate),
+            this);
+    if (playlist_search_geometry_size_allocate_handler_id_ == 0) {
+        playlist_search_geometry_trace_active_ = false;
     }
-
-    playlist_search_window_height_adjusted_ = enabled;
-    if (target_height != height) {
-        if (gtk_widget_get_realized(window_)) {
-            begin_programmatic_window_resize(width, target_height);
-            gtk_window_resize(GTK_WINDOW(window_), width, target_height);
-        } else {
-            gtk_window_set_default_size(GTK_WINDOW(window_), width, target_height);
-        }
-    }
-    queue_playlist_layout_reflow();
 }
 
 void GtkPlayerWindow::apply_playlist_search_ui_state() {
@@ -3436,6 +3539,34 @@ void GtkPlayerWindow::apply_playlist_search_ui_state() {
         apply_playlist_search_handler_connections();
         update_playlist_sort_headers();
         return;
+    }
+
+    if (playlist_search_geometry_size_allocate_handler_id_ != 0 &&
+        playlist_panel_ != nullptr) {
+        g_signal_handler_disconnect(
+            playlist_panel_, playlist_search_geometry_size_allocate_handler_id_);
+        playlist_search_geometry_size_allocate_handler_id_ = 0;
+    }
+    playlist_search_geometry_trace_active_ = false;
+
+    if (Logger::instance().debug_enabled()) {
+        ++playlist_search_geometry_trace_serial_;
+        playlist_search_geometry_trace_active_ = true;
+
+        GdkDisplay* display = gdk_display_get_default();
+        const char* backend = display != nullptr
+            ? G_OBJECT_TYPE_NAME(display)
+            : "unknown";
+        std::ostringstream message;
+        message << "Playlist search geometry #" << playlist_search_geometry_trace_serial_
+                << " BEGIN target=" << (playlist_search_enabled_ ? "enabled" : "disabled")
+                << ": GTK=" << gtk_get_major_version() << '.'
+                << gtk_get_minor_version() << '.' << gtk_get_micro_version()
+                << ", GDK=" << backend
+                << ", realized=" << (gtk_widget_get_realized(window_) ? 1 : 0)
+                << ", normal_state=" << (main_window_has_normal_size_state() ? 1 : 0);
+        Logger::instance().debug(message.str());
+        log_playlist_search_geometry_snapshot("TOGGLE_BEGIN", -1, -1);
     }
 
     GtkTreeView* view = GTK_TREE_VIEW(playlist_view_);
@@ -3482,8 +3613,6 @@ void GtkPlayerWindow::apply_playlist_search_ui_state() {
             search_controller_->install_in_panel(GTK_BOX(playlist_panel_));
         }
 
-        adjust_playlist_search_window_height(true);
-
         if (search_controller_ != nullptr && search_controller_->filter_model() != nullptr &&
             gtk_tree_view_get_model(view) != GTK_TREE_MODEL(search_controller_->filter_model())) {
             PlaylistSelectionSignalBlocker selection_blocker(*this);
@@ -3514,7 +3643,6 @@ void GtkPlayerWindow::apply_playlist_search_ui_state() {
         gtk_tree_view_set_enable_search(view, TRUE);
         search_controller_.reset();
         search_delegate_.reset();
-        adjust_playlist_search_window_height(false);
 
         if (had_filter_session) {
             finish_playlist_filter_session();
@@ -3538,6 +3666,7 @@ void GtkPlayerWindow::apply_playlist_search_ui_state() {
             }
         }
     }
+    arm_playlist_search_geometry_trace();
     end_playlist_filter_mpris_transaction();
     update_playlist_sort_headers();
 }
@@ -3693,7 +3822,7 @@ void GtkPlayerWindow::build_ui(GtkApplication* app) {
     start_metadata_worker();
     window_ = gtk_application_window_new(app);
     gtk_window_set_icon_name(GTK_WINDOW(window_), kApplicationId);
-    gtk_window_set_title(GTK_WINDOW(window_), "PCM Transport v0.9.117");
+    gtk_window_set_title(GTK_WINDOW(window_), "PCM Transport v0.9.118");
     gtk_window_set_default_size(GTK_WINDOW(window_), kDefaultWindowWidth, kDefaultWindowHeight);
     gtk_container_set_border_width(GTK_CONTAINER(window_), 16);
 
@@ -3907,7 +4036,6 @@ void GtkPlayerWindow::build_ui(GtkApplication* app) {
     GtkWidget* playlist_panel = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
     playlist_panel_ = playlist_panel;
     gtk_box_pack_start(GTK_BOX(content_row), playlist_panel, TRUE, TRUE, 0);
-
     playlist_store_ = gtk_list_store_new(COL_COUNT,
                                           G_TYPE_INT,
                                           G_TYPE_STRING,
@@ -4259,9 +4387,6 @@ void GtkPlayerWindow::build_ui(GtkApplication* app) {
     gtk_widget_queue_resize(scrolled);
     gtk_widget_queue_resize(softvol_box);
     gtk_widget_queue_resize(outer);
-    const int applied_default_height_without_search =
-        clamp_window_height_to_workarea(window_, default_window_height_without_search_);
-
     if (startup_search_visible) {
         search_controller_->set_search_entry_visible(true);
     }
@@ -4286,13 +4411,6 @@ void GtkPlayerWindow::build_ui(GtkApplication* app) {
         initial_window_height =
             clamp_window_height_to_workarea(window_, saved_window_height_);
     }
-
-    playlist_search_window_height_adjusted_ = startup_search_visible;
-    playlist_search_runtime_height_compensation_ = startup_search_visible
-        ? (saved_window_size_valid_
-            ? requested_search_delta
-            : std::max(0, factory_default_height - applied_default_height_without_search))
-        : 0;
 
     initial_window_width =
         clamp_window_width_to_workarea(window_, initial_window_width);
@@ -4330,9 +4448,6 @@ void GtkPlayerWindow::build_ui(GtkApplication* app) {
     setup_mpris();
 
     gtk_widget_show_all(window_);
-    if (playlist_search_enabled_) {
-        adjust_playlist_search_window_height(true);
-    }
     window_geometry_tracking_ready_idle_id_ = g_idle_add_full(
         G_PRIORITY_LOW,
         GtkPlayerWindow::on_window_geometry_tracking_ready_idle,
@@ -6997,13 +7112,16 @@ int GtkPlayerWindow::compute_auto_pre_eq_headroom_tenths_db() const {
     if (bass_db_ == 0 && treble_db_ == 0) {
         return 0;
     }
-    const double reserve_db = tone::estimate_cascaded_shelf_max_gain_db(
+    const double reserve_db = tone::estimate_cascaded_shelf_peak_bound_db(
         current_tone_control_sample_rate(),
         bass_db_,
         bass_shelf_hz_,
         treble_db_,
         treble_shelf_hz_);
-    int tenths = static_cast<int>(std::lround(reserve_db * 10.0));
+    if (!std::isfinite(reserve_db)) {
+        return kUiPreEqHeadroomMaxTenthsDb;
+    }
+    int tenths = static_cast<int>(std::ceil(std::max(0.0, reserve_db) * 10.0));
     if (tenths > kUiPreEqHeadroomMaxTenthsDb) tenths = kUiPreEqHeadroomMaxTenthsDb;
     return tenths;
 }
@@ -7427,6 +7545,162 @@ void GtkPlayerWindow::draw_tone_response_graph(cairo_t* cr, int width, int heigh
         if (!started) { cairo_move_to(cr, x, y); started = true; }
         else { cairo_line_to(cr, x, y); }
     }
+    cairo_stroke(cr);
+}
+
+void GtkPlayerWindow::refresh_tone_dsp_signal_path_state(
+    const PlaybackStatusSnapshot& status) {
+    if (tone_dsp_signal_path_ == nullptr) {
+        tone_dsp_signal_path_state_valid_ = false;
+        return;
+    }
+
+    const bool flowing = status.playing && !status.paused;
+    const bool tonal_path_applicable =
+        !status.playing || status.format.channels == 0 || status.format.channels <= 2;
+    const bool headroom_active =
+        tonal_path_applicable && effective_pre_eq_headroom_tenths_db() > 0;
+    const bool tone_active =
+        tonal_path_applicable && (bass_db_ != 0 || treble_db_ != 0);
+    const bool volume_active = soft_volume_percent_ != 100;
+
+    if (tone_dsp_signal_path_state_valid_ &&
+        tone_dsp_signal_path_flowing_ == flowing &&
+        tone_dsp_signal_path_headroom_active_ == headroom_active &&
+        tone_dsp_signal_path_tone_active_ == tone_active &&
+        tone_dsp_signal_path_volume_active_ == volume_active) {
+        return;
+    }
+
+    tone_dsp_signal_path_flowing_ = flowing;
+    tone_dsp_signal_path_headroom_active_ = headroom_active;
+    tone_dsp_signal_path_tone_active_ = tone_active;
+    tone_dsp_signal_path_volume_active_ = volume_active;
+    tone_dsp_signal_path_state_valid_ = true;
+    gtk_widget_queue_draw(tone_dsp_signal_path_);
+}
+
+void GtkPlayerWindow::draw_tone_dsp_signal_path(cairo_t* cr,
+                                                int width,
+                                                int height) const {
+    cairo_set_source_rgb(cr, 0.09, 0.09, 0.10);
+    cairo_paint(cr);
+
+    const double outer = 18.0;
+    const double title_y = 17.0;
+    const double box_y = 34.0;
+    const double box_h = std::max(24.0, static_cast<double>(height) - box_y - 16.0);
+    const double gap = 10.0;
+    const double usable_w = std::max(
+        5.0, static_cast<double>(width) - (outer * 2.0) - (gap * 4.0));
+    const double box_w = usable_w / 5.0;
+
+    cairo_select_font_face(
+        cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+    cairo_set_font_size(cr, 10.0);
+    cairo_set_source_rgba(cr, 0.88, 0.90, 0.92, 0.72);
+    cairo_move_to(cr, outer, title_y);
+    cairo_show_text(cr, "Signal path");
+
+    auto draw_rounded_rect = [&](double x, double y, double w, double h) {
+        const double radius = std::min(4.0, std::min(w, h) * 0.25);
+        const double x2 = x + w;
+        const double y2 = y + h;
+        cairo_new_sub_path(cr);
+        cairo_arc(cr, x2 - radius, y + radius, radius, -M_PI / 2.0, 0.0);
+        cairo_arc(cr, x2 - radius, y2 - radius, radius, 0.0, M_PI / 2.0);
+        cairo_arc(cr, x + radius, y2 - radius, radius, M_PI / 2.0, M_PI);
+        cairo_arc(cr, x + radius, y + radius, radius, M_PI, M_PI + M_PI / 2.0);
+        cairo_close_path(cr);
+    };
+
+    auto draw_centered_text = [&](const char* text, double cx, double cy) {
+        cairo_text_extents_t ext{};
+        cairo_text_extents(cr, text, &ext);
+        cairo_move_to(
+            cr,
+            cx - (ext.width * 0.5) - ext.x_bearing,
+            cy - (ext.height * 0.5) - ext.y_bearing);
+        cairo_show_text(cr, text);
+    };
+
+    const char* line1[] = {
+        "Working PCM", "Pre-EQ", "Bass / Treble", "DSP Volume", "Output path"
+    };
+    const char* line2[] = {
+        nullptr, "Headroom", nullptr, nullptr, nullptr
+    };
+
+    const bool processor_active[] = {
+        false,
+        tone_dsp_signal_path_headroom_active_,
+        tone_dsp_signal_path_tone_active_,
+        tone_dsp_signal_path_volume_active_,
+        false
+    };
+
+    cairo_set_font_size(cr, 9.0);
+    for (int i = 0; i < 5; ++i) {
+        const bool active_processor = processor_active[i];
+        const double x = outer + static_cast<double>(i) * (box_w + gap);
+        draw_rounded_rect(x, box_y, box_w, box_h);
+        cairo_set_source_rgba(
+            cr, 1.0, 1.0, 1.0, active_processor ? 0.065 : 0.045);
+        cairo_fill_preserve(cr);
+        cairo_set_line_width(cr, 1.0);
+        cairo_set_source_rgba(
+            cr, 0.88, 0.90, 0.92, active_processor ? 0.52 : 0.30);
+        cairo_stroke(cr);
+
+        cairo_set_source_rgba(
+            cr, 0.92, 0.93, 0.95, active_processor ? 0.96 : 0.84);
+        const double cx = x + box_w * 0.5;
+        const double cy = box_y + box_h * 0.5;
+        if (line2[i] != nullptr) {
+            draw_centered_text(line1[i], cx, cy - 6.0);
+            draw_centered_text(line2[i], cx, cy + 6.0);
+        } else {
+            draw_centered_text(line1[i], cx, cy);
+        }
+
+        if (active_processor) {
+            cairo_set_line_width(cr, 2.0);
+            cairo_set_source_rgba(cr, 0.98, 0.38, 0.18, 0.90);
+            cairo_move_to(cr, x + 6.0, box_y + box_h - 3.0);
+            cairo_line_to(cr, x + box_w - 6.0, box_y + box_h - 3.0);
+            cairo_stroke(cr);
+        }
+
+        if (i == 4) {
+            continue;
+        }
+        const double x1 = x + box_w + 2.0;
+        const double x2 = x + box_w + gap - 2.0;
+        const double y = box_y + box_h * 0.5;
+        cairo_set_line_width(cr, 1.3);
+        if (tone_dsp_signal_path_flowing_) {
+            cairo_set_source_rgba(cr, 0.98, 0.38, 0.18, 0.90);
+        } else {
+            cairo_set_source_rgba(cr, 0.88, 0.90, 0.92, 0.28);
+        }
+        cairo_move_to(cr, x1, y);
+        cairo_line_to(cr, x2, y);
+        cairo_stroke(cr);
+        cairo_move_to(cr, x2, y);
+        cairo_line_to(cr, x2 - 4.0, y - 3.0);
+        cairo_line_to(cr, x2 - 4.0, y + 3.0);
+        cairo_close_path(cr);
+        cairo_fill(cr);
+    }
+
+    cairo_set_line_width(cr, 1.0);
+    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.14);
+    cairo_rectangle(
+        cr,
+        0.5,
+        0.5,
+        std::max(0.0, static_cast<double>(width) - 1.0),
+        std::max(0.0, static_cast<double>(height) - 1.0));
     cairo_stroke(cr);
 }
 
@@ -10265,8 +10539,14 @@ void GtkPlayerWindow::open_settings_dialog() {
             return;
         }
         GtkWidget* entry = GTK_WIDGET(g_object_get_data(G_OBJECT(button), "log-path-entry"));
+        GtkWidget* toplevel = gtk_widget_get_toplevel(GTK_WIDGET(button));
+        GtkWindow* parent_window = GTK_IS_WINDOW(toplevel)
+            ? GTK_WINDOW(toplevel)
+            : (self->window_ != nullptr && GTK_IS_WINDOW(self->window_)
+                   ? GTK_WINDOW(self->window_)
+                   : nullptr);
         GtkWidget* chooser = gtk_file_chooser_dialog_new("Select log folder",
-                                                         GTK_WINDOW(self->window_),
+                                                         parent_window,
                                                          GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER,
                                                          "_Cancel", GTK_RESPONSE_CANCEL,
                                                          "_Select", GTK_RESPONSE_ACCEPT,
@@ -10276,18 +10556,53 @@ void GtkPlayerWindow::open_settings_dialog() {
         const std::string current_path = effective_log_path_for_display(current_text);
         gtk_file_chooser_set_current_folder(GTK_FILE_CHOOSER(chooser), directory_name(current_path).c_str());
         const int response = gtk_dialog_run(GTK_DIALOG(chooser));
+        bool local_folder_unavailable = false;
+        std::string browse_filename;
+        std::string browse_uri;
+        std::string folder;
         if (response == GTK_RESPONSE_ACCEPT) {
-            char* folder = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(chooser));
-            if (folder != nullptr) {
+            folder = selected_local_folder(
+                GTK_FILE_CHOOSER(chooser), &browse_filename, &browse_uri);
+            if (!folder.empty()) {
                 if (entry != nullptr) {
                     const std::string name = base_name(current_text.empty() ? std::string("pcm_transport.log") : current_text);
-                    const std::string selected = std::string(folder) + "/" + (name.empty() ? std::string("pcm_transport.log") : name);
+                    const std::string log_name = name.empty() ? std::string("pcm_transport.log") : name;
+                    const std::string selected =
+                        folder.back() == '/' ? folder + log_name : folder + "/" + log_name;
                     gtk_entry_set_text(GTK_ENTRY(entry), selected.c_str());
                 }
-                g_free(folder);
+            } else {
+                local_folder_unavailable = true;
             }
         }
+        if (Logger::instance().debug_enabled()) {
+            std::ostringstream message;
+            message << "Log folder browse: response=";
+            if (response == GTK_RESPONSE_ACCEPT) {
+                message << "accept";
+            } else if (response == GTK_RESPONSE_CANCEL ||
+                       response == GTK_RESPONSE_DELETE_EVENT) {
+                message << "cancel";
+            } else {
+                message << response;
+            }
+            message << ", filename="
+                    << (browse_filename.empty() ? "<none>" : browse_filename)
+                    << ", uri="
+                    << (browse_uri.empty() ? "<none>" : browse_uri)
+                    << ", resolved="
+                    << (folder.empty() ? "<none>" : folder);
+            Logger::instance().debug(message.str());
+        }
         gtk_widget_destroy(chooser);
+        if (local_folder_unavailable) {
+            show_runtime_message(
+                parent_window,
+                "Log folder",
+                "The selected folder could not be resolved to a local filesystem path. "
+                "Choose a local folder or enter the log path manually.",
+                GTK_MESSAGE_WARNING);
+        }
     }), this);
 
     g_object_set_data(G_OBJECT(rt_grant_button), "rt-permission-status", rt_permission_status);
@@ -10321,6 +10636,7 @@ void GtkPlayerWindow::open_settings_dialog() {
     }), this);
 
     gtk_widget_show_all(dialog);
+
 
     auto apply_settings_from_dialog = [&]() {
         const gchar* selected = gtk_combo_box_get_active_id(GTK_COMBO_BOX(combo));
@@ -10482,7 +10798,7 @@ void GtkPlayerWindow::open_about_dialog() {
     }
 
     GtkWidget* title = gtk_label_new(nullptr);
-    gtk_label_set_markup(GTK_LABEL(title), "<b>PCM Transport 0.9.117</b>");
+    gtk_label_set_markup(GTK_LABEL(title), "<b>PCM Transport 0.9.118</b>");
     gtk_label_set_xalign(GTK_LABEL(title), 0.5f);
     GtkWidget* subtitle = gtk_label_new("Digital Audio Player");
     gtk_label_set_xalign(GTK_LABEL(subtitle), 0.5f);
@@ -10886,7 +11202,7 @@ void GtkPlayerWindow::open_bitperfect_test_dialog(GtkWidget* parent_dialog, int 
                 return;
             }
             post_diagnostics_update(text_view, progress, close_button,
-                "PCM Transport FLAC bit-perfect test\nVersion: 0.9.117\nScope: native libFLAC path before ALSA; resampling excluded\nFFmpeg API: not used\n", 0.02, false);
+                "PCM Transport FLAC bit-perfect test\nVersion: 0.9.118\nScope: native libFLAC path before ALSA; resampling excluded\nFFmpeg API: not used\n", 0.02, false);
             std::ostringstream ctx;
             ctx << "Duration: " << duration_seconds << " sec\n"
                 << "Generated signal: deterministic 16-bit / 44.1 kHz / stereo stress pattern\n"
@@ -11332,7 +11648,7 @@ void GtkPlayerWindow::open_eq_dialog() {
     gtk_label_set_xalign(GTK_LABEL(volume_label), 0.0f);
     gtk_size_group_add_widget(tone_label_size_group, volume_label);
     GtkWidget* volume_scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0, 100, 1);
-    GtkWidget* pre_eq_headroom_scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0.0, 15.0, 0.1);
+    GtkWidget* pre_eq_headroom_scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0.0, 32.0, 0.1);
     gtk_scale_set_draw_value(GTK_SCALE(volume_scale), TRUE);
     gtk_widget_set_hexpand(volume_scale, TRUE);
     gtk_range_set_value(GTK_RANGE(volume_scale), static_cast<double>(soft_volume_percent_));
@@ -11340,7 +11656,7 @@ void GtkPlayerWindow::open_eq_dialog() {
     gtk_scale_set_digits(GTK_SCALE(pre_eq_headroom_scale), 1);
     gtk_widget_set_hexpand(pre_eq_headroom_scale, TRUE);
     gtk_range_set_value(GTK_RANGE(pre_eq_headroom_scale), static_cast<double>(effective_pre_eq_headroom_tenths_db()) / 10.0);
-    gtk_widget_set_tooltip_text(pre_eq_headroom_scale, "Auto-set from Bass/Treble.\nManual adjustment resets when Bass or Treble changes.");
+    gtk_widget_set_tooltip_text(pre_eq_headroom_scale, "Auto-set from the Bass/Treble worst-case peak bound.\nManual adjustment resets when Bass or Treble changes.");
     gtk_grid_attach(GTK_GRID(volume_grid), volume_label, 0, 0, 1, 1);
     gtk_grid_attach(GTK_GRID(volume_grid), volume_scale, 1, 0, 1, 1);
     gtk_box_pack_start(GTK_BOX(volume_section), volume_grid, FALSE, FALSE, 0);
@@ -11352,7 +11668,7 @@ void GtkPlayerWindow::open_eq_dialog() {
     gtk_widget_set_valign(headroom_label, GTK_ALIGN_CENTER);
     gtk_label_set_xalign(GTK_LABEL(headroom_label), 0.0f);
     gtk_size_group_add_widget(tone_label_size_group, headroom_label);
-    gtk_widget_set_tooltip_text(headroom_label, "Auto-set from Bass/Treble.\nManual adjustment resets when Bass or Treble changes.");
+    gtk_widget_set_tooltip_text(headroom_label, "Auto-set from the Bass/Treble worst-case peak bound.\nManual adjustment resets when Bass or Treble changes.");
     gtk_grid_attach(GTK_GRID(headroom_grid), headroom_label, 0, 0, 1, 1);
     gtk_grid_attach(GTK_GRID(headroom_grid), pre_eq_headroom_scale, 1, 0, 1, 1);
     gtk_widget_set_margin_start(headroom_grid, section_indent);
@@ -11440,6 +11756,40 @@ data->self->draw_tone_response_graph(cr, alloc.width, alloc.height);
     gtk_container_set_border_width(GTK_CONTAINER(tone_graph_area), kGuiRowSpacing);
     gtk_box_pack_start(GTK_BOX(tone_graph_area), tone_graph, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(tone_group), tone_graph_area, FALSE, FALSE, 0);
+
+    GtkWidget* tone_signal_path = gtk_drawing_area_new();
+    tone_dsp_signal_path_ = tone_signal_path;
+    tone_dsp_signal_path_state_valid_ = false;
+    gtk_widget_set_size_request(tone_signal_path, 520, 92);
+    gtk_widget_set_hexpand(tone_signal_path, TRUE);
+    gtk_widget_set_vexpand(tone_signal_path, FALSE);
+    g_signal_connect(
+        tone_signal_path,
+        "draw",
+        G_CALLBACK(+[](GtkWidget* widget, cairo_t* cr, gpointer user_data) -> gboolean {
+            auto* self = static_cast<GtkPlayerWindow*>(user_data);
+            if (self == nullptr) {
+                return FALSE;
+            }
+            GtkAllocation alloc{};
+            gtk_widget_get_allocation(widget, &alloc);
+            self->draw_tone_dsp_signal_path(cr, alloc.width, alloc.height);
+            return FALSE;
+        }),
+        this);
+
+    GtkWidget* tone_signal_path_area =
+        gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_set_hexpand(tone_signal_path_area, TRUE);
+    gtk_widget_set_vexpand(tone_signal_path_area, FALSE);
+    gtk_widget_set_margin_start(tone_signal_path_area, section_indent);
+    gtk_widget_set_margin_end(tone_signal_path_area, section_indent);
+    gtk_container_set_border_width(
+        GTK_CONTAINER(tone_signal_path_area), kGuiRowSpacing);
+    gtk_box_pack_start(
+        GTK_BOX(tone_signal_path_area), tone_signal_path, FALSE, FALSE, 0);
+    gtk_box_pack_start(
+        GTK_BOX(tone_group), tone_signal_path_area, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(root), tone_group, FALSE, FALSE, 0);
     g_object_set_data(G_OBJECT(bass_scale), "tone-graph", tone_graph);
     g_object_set_data(G_OBJECT(treble_scale), "tone-graph", tone_graph);
@@ -11453,8 +11803,9 @@ data->self->draw_tone_response_graph(cr, alloc.width, alloc.height);
         tone_graph
     };
     {
-        const PlaybackTransportSnapshot transport = engine_.transport_snapshot();
-        refresh_stereo_tonal_dsp_controls(transport.playing, transport.format.channels);
+        const PlaybackStatusSnapshot status = engine_.snapshot();
+        refresh_stereo_tonal_dsp_controls(status.playing, status.format.channels);
+        refresh_tone_dsp_signal_path_state(status);
     }
 
     GtkWidget* processing_policy_section =
@@ -11918,19 +12269,19 @@ data->self->draw_tone_response_graph(cr, alloc.width, alloc.height);
             std::max(max_page_natural_height, page_natural_height);
     }
 
-    gint dialog_minimum_height = 0;
-    gint dialog_natural_height = 0;
+    gint layout_minimum_height = 0;
+    gint layout_natural_height = 0;
     gtk_widget_get_preferred_height(
-        dialog, &dialog_minimum_height, &dialog_natural_height);
+        layout.root, &layout_minimum_height, &layout_natural_height);
 
     const gint notebook_chrome_height = std::max(
         0, notebook_natural_height - max_page_natural_height);
-    const gint dialog_chrome_height = std::max(
-        0, dialog_natural_height - notebook_natural_height);
-    const gint dsd_dialog_natural_height =
-        dialog_chrome_height + notebook_chrome_height + dsd_natural_height;
+    const gint layout_chrome_height = std::max(
+        0, layout_natural_height - notebook_natural_height);
+    const gint dsd_layout_natural_height =
+        layout_chrome_height + notebook_chrome_height + dsd_natural_height;
     const gint target_dialog_height = clamp_window_height_to_workarea(
-        window_, std::max(dialog_natural_height, dsd_dialog_natural_height));
+        window_, std::max(layout_natural_height, dsd_layout_natural_height));
     gtk_window_set_default_size(GTK_WINDOW(dialog), -1, target_dialog_height);
 
     gtk_widget_show_all(dialog);
@@ -12002,6 +12353,8 @@ data->self->draw_tone_response_graph(cr, alloc.width, alloc.height);
     diagnostics_page_active_ = false;
     stereo_tonal_dsp_controls_.clear();
     applied_stereo_tonal_dsp_controls_enabled_.reset();
+    tone_dsp_signal_path_ = nullptr;
+    tone_dsp_signal_path_state_valid_ = false;
     gtk_widget_destroy(dialog);
 }
 
@@ -12053,6 +12406,7 @@ void GtkPlayerWindow::refresh_display(const PlaybackStatusSnapshot& status,
     }
 
     refresh_stereo_tonal_dsp_controls(status.playing, status.format.channels);
+    refresh_tone_dsp_signal_path_state(status);
 
     if (update_progress) {
         refresh_progress_display(status);
@@ -13591,6 +13945,9 @@ void GtkPlayerWindow::load_preferences() {
     bool have_window_width = false;
     bool have_window_height = false;
     bool have_explicit_user_window_geometry = false;
+    bool have_current_pre_eq_headroom_revision = false;
+    bool have_loaded_pre_eq_headroom = false;
+    int loaded_pre_eq_headroom_tenths_db = 0;
     std::string line;
     while (std::getline(parsed_preferences, line)) {
         const std::size_t eq = line.find('=');
@@ -13661,10 +14018,22 @@ void GtkPlayerWindow::load_preferences() {
             try { treble_db_ = std::stoi(value); } catch (...) {}
             if (treble_db_ < -12) treble_db_ = -12;
             if (treble_db_ > 12) treble_db_ = 12;
+        } else if (key == "pre_eq_headroom_revision") {
+            try {
+                have_current_pre_eq_headroom_revision =
+                    std::stoi(value) == kPreEqHeadroomPreferenceRevision;
+            } catch (...) {
+                have_current_pre_eq_headroom_revision = false;
+            }
         } else if (key == "pre_eq_headroom_tenths_db") {
-            try { pre_eq_headroom_tenths_db_ = std::stoi(value); } catch (...) {}
-            if (pre_eq_headroom_tenths_db_ < 0) pre_eq_headroom_tenths_db_ = 0;
-            if (pre_eq_headroom_tenths_db_ > kUiPreEqHeadroomMaxTenthsDb) pre_eq_headroom_tenths_db_ = kUiPreEqHeadroomMaxTenthsDb;
+            try {
+                loaded_pre_eq_headroom_tenths_db = std::stoi(value);
+                loaded_pre_eq_headroom_tenths_db = std::max(
+                    0, std::min(
+                        kUiPreEqHeadroomMaxTenthsDb,
+                        loaded_pre_eq_headroom_tenths_db));
+                have_loaded_pre_eq_headroom = true;
+            } catch (...) {}
         } else if (key == "progress_blink_enabled") {
             progress_blink_enabled_ = (value == "1" || value == "true" || value == "yes");
         } else if (key == "playlist_search_enabled") {
@@ -13745,6 +14114,11 @@ void GtkPlayerWindow::load_preferences() {
             realtime_audio_priority_enabled_ = (value == "1" || value == "true" || value == "yes");
         }
     }
+    pre_eq_headroom_tenths_db_ =
+        have_current_pre_eq_headroom_revision && have_loaded_pre_eq_headroom
+            ? loaded_pre_eq_headroom_tenths_db
+            : 0;
+
     const bool complete_window_size = have_window_width && have_window_height;
     saved_window_size_valid_ =
         complete_window_size && have_explicit_user_window_geometry;
@@ -13830,6 +14204,7 @@ std::string GtkPlayerWindow::serialize_preferences() const {
     out << "soft_volume_percent=" << soft_volume_percent_ << '\n';
     out << "bass_db=" << bass_db_ << '\n';
     out << "treble_db=" << treble_db_ << '\n';
+    out << "pre_eq_headroom_revision=" << kPreEqHeadroomPreferenceRevision << '\n';
     out << "pre_eq_headroom_tenths_db=" << effective_pre_eq_headroom_tenths_db() << '\n';
     out << "progress_blink_enabled=" << (progress_blink_enabled_ ? 1 : 0) << '\n';
     out << "playlist_search_enabled=" << (playlist_search_enabled_ ? 1 : 0) << '\n';

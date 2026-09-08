@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.9.118
+
+- Changed Bass and Treble shelving to S=1.0, providing monotonic shelf response without transition-band overshoot.
+- Reworked automatic Pre-EQ Headroom around a conservative worst-case sample-peak bound for the complete Bass/Treble cascade, including bounded handling of the infinite IIR tail, upward 0.1 dB rounding, and a 32.0 dB adjustment range.
+- Documented A. V. Oppenheim and R. W. Schafer, Discrete-Time Signal Processing, 3rd ed., as mathematical background for the LTI bounded-input/bounded-output peak bound; PCM Transport implementation is independently written.
+- Changed runtime playlist Search to use normal GtkBox allocation without resizing the top-level window; factory/reset sizing and saved user window geometry remain unchanged.
+- Added full-debug Search geometry diagnostics and corrected logical window-size tracking for CSD and Wayland configure events.
+- Improved Logging folder selection in AppImage and GTK/GIO environments with local file URI fallback and correct Settings-dialog ownership.
+- Guarded optional MOV/AAC boundary-probe helpers by public FFmpeg capability so supported older FFmpeg builds retain conservative fallback behavior without unused-function warnings.
+- Added an event-driven Tone Controls signal-path diagram with processor-state indication and no additional timers.
+- Based DSP Studio default height on the application-owned dialog layout rather than the GtkWindow preferred height, excluding client-side window decorations from content sizing.
+
 ## 0.9.117
 
 - Changed final 16-bit nearest rounding to deterministic ties-to-even and added Round half up; Truncate behavior remains unchanged.

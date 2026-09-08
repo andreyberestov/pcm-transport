@@ -395,7 +395,7 @@ private:
 };
 
 
-constexpr int kPreEqHeadroomMaxTenthsDb = 150;
+constexpr int kPreEqHeadroomMaxTenthsDb = 320;
 constexpr std::uint32_t kNoMeterMeasurement = ~std::uint32_t{0};
 constexpr std::uint32_t kMaxMeterPeakUnits = kNoMeterMeasurement - 1;
 constexpr float kMeterPeakScale = 16777216.0f;

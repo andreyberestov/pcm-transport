@@ -4,16 +4,22 @@
 #include "pcmtp/dsp/ToneControlDesign.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <complex>
+#include <cstddef>
+#include <limits>
 
 namespace pcmtp {
 namespace tone {
 namespace {
 
 constexpr double kTwoPi = 6.283185307179586476925286766559;
-constexpr double kMinAuditedHz = 10.0;
-constexpr int kResponseAuditPoints = 2048;
+constexpr std::size_t kMaximumPoles = 4;
+constexpr std::size_t kMaximumNumeratorDegree = 4;
+constexpr std::size_t kPeakBoundMaximumIterations = 32768;
+constexpr double kPeakBoundRelativeTailTolerance = 1.0e-12;
+constexpr double kPeakBoundRelativeSafetyMargin = 1.0e-8;
 
 ShelfCoefficients make_identity() {
     return ShelfCoefficients{};
@@ -36,6 +42,11 @@ ShelfCoefficients normalize_coefficients(double b0,
     c.a1 = a1 / a0;
     c.a2 = a2 / a0;
     return c;
+}
+
+bool is_identity(const ShelfCoefficients& c) {
+    return c.b0 == 1.0 && c.b1 == 0.0 && c.b2 == 0.0 &&
+           c.a1 == 0.0 && c.a2 == 0.0;
 }
 
 std::complex<double> frequency_response(const ShelfCoefficients& c, double w) {
@@ -89,6 +100,133 @@ ShelfCoefficients make_shelf(bool high,
     return normalize_coefficients(b0, b1, b2, a0, a1, a2);
 }
 
+void append_numerator_section(const ShelfCoefficients& c,
+                              std::array<double, kMaximumNumeratorDegree + 1>& coefficients,
+                              std::size_t& degree) {
+    std::array<double, kMaximumNumeratorDegree + 1> next{};
+    for (std::size_t i = 0; i <= degree; ++i) {
+        next[i] += coefficients[i] * c.b0;
+        next[i + 1] += coefficients[i] * c.b1;
+        next[i + 2] += coefficients[i] * c.b2;
+    }
+    coefficients = next;
+    degree += 2;
+}
+
+bool append_denominator_poles(const ShelfCoefficients& c,
+                              std::array<std::complex<double>, kMaximumPoles>& poles,
+                              std::size_t& pole_count) {
+    if (pole_count + 2 > poles.size()) {
+        return false;
+    }
+
+    const std::complex<double> discriminant(c.a1 * c.a1 - 4.0 * c.a2, 0.0);
+    const std::complex<double> root = std::sqrt(discriminant);
+    poles[pole_count++] = (-c.a1 + root) * 0.5;
+    poles[pole_count++] = (-c.a1 - root) * 0.5;
+    return true;
+}
+
+std::complex<double> evaluate_polynomial(
+    const std::array<double, kMaximumNumeratorDegree + 1>& coefficients,
+    std::size_t degree,
+    const std::complex<double>& z) {
+    std::complex<double> value(coefficients[0], 0.0);
+    for (std::size_t i = 1; i <= degree; ++i) {
+        value = value * z + coefficients[i];
+    }
+    return value;
+}
+
+// Mathematical background for the LTI bounded-input/bounded-output peak bound:
+// A. V. Oppenheim and R. W. Schafer, Discrete-Time Signal Processing,
+// 3rd ed., Section 2.4.
+// PCM Transport implementation in this module is independently written.
+double cascaded_impulse_l1_upper_bound(const ShelfCoefficients& low,
+                                        const ShelfCoefficients& high) {
+    std::array<double, kMaximumNumeratorDegree + 1> numerator{};
+    numerator[0] = 1.0;
+    std::size_t numerator_degree = 0;
+
+    std::array<std::complex<double>, kMaximumPoles> poles{};
+    std::size_t pole_count = 0;
+
+    if (!is_identity(low)) {
+        append_numerator_section(low, numerator, numerator_degree);
+        if (!append_denominator_poles(low, poles, pole_count)) {
+            return std::numeric_limits<double>::infinity();
+        }
+    }
+    if (!is_identity(high)) {
+        append_numerator_section(high, numerator, numerator_degree);
+        if (!append_denominator_poles(high, poles, pole_count)) {
+            return std::numeric_limits<double>::infinity();
+        }
+    }
+
+    if (pole_count == 0) {
+        return 1.0;
+    }
+
+    std::array<std::complex<double>, kMaximumPoles> residues{};
+    std::array<std::complex<double>, kMaximumPoles> powers{};
+    std::array<double, kMaximumPoles> pole_radii{};
+
+    for (std::size_t i = 0; i < pole_count; ++i) {
+        const double radius = std::abs(poles[i]);
+        if (!std::isfinite(radius) || radius >= 1.0) {
+            return std::numeric_limits<double>::infinity();
+        }
+        pole_radii[i] = radius;
+
+        std::complex<double> derivative(1.0, 0.0);
+        for (std::size_t j = 0; j < pole_count; ++j) {
+            if (i != j) {
+                derivative *= poles[i] - poles[j];
+            }
+        }
+        if (!std::isfinite(std::abs(derivative)) || std::abs(derivative) <= 1.0e-18) {
+            return std::numeric_limits<double>::infinity();
+        }
+
+        residues[i] = evaluate_polynomial(numerator, numerator_degree, poles[i]) / derivative;
+        if (!std::isfinite(std::abs(residues[i]))) {
+            return std::numeric_limits<double>::infinity();
+        }
+        powers[i] = std::complex<double>(1.0, 0.0);
+    }
+
+    double prefix_sum = std::fabs(numerator[0]);
+    double tail_bound = std::numeric_limits<double>::infinity();
+
+    for (std::size_t n = 1; n <= kPeakBoundMaximumIterations; ++n) {
+        std::complex<double> sample(0.0, 0.0);
+        for (std::size_t i = 0; i < pole_count; ++i) {
+            sample += residues[i] * powers[i];
+        }
+        prefix_sum += std::abs(sample);
+
+        tail_bound = 0.0;
+        for (std::size_t i = 0; i < pole_count; ++i) {
+            powers[i] *= poles[i];
+            tail_bound += std::abs(residues[i]) * std::abs(powers[i]) /
+                          (1.0 - pole_radii[i]);
+        }
+
+        if (!std::isfinite(prefix_sum) || !std::isfinite(tail_bound)) {
+            return std::numeric_limits<double>::infinity();
+        }
+        if (tail_bound <= std::max(1.0e-15,
+                                   prefix_sum * kPeakBoundRelativeTailTolerance)) {
+            break;
+        }
+    }
+
+    const double bound = (prefix_sum + tail_bound) *
+                         (1.0 + kPeakBoundRelativeSafetyMargin);
+    return std::max(1.0, bound);
+}
+
 } // namespace
 
 int clamp_bass_hz(int hz) {
@@ -123,35 +261,32 @@ double cascaded_shelf_response_db(std::uint32_t sample_rate,
     return 20.0 * std::log10(std::max(mag, 1.0e-12));
 }
 
-double estimate_cascaded_shelf_max_gain_db(std::uint32_t sample_rate,
-                                           int bass_db,
-                                           int bass_hz,
-                                           int treble_db,
-                                           int treble_hz) {
+double estimate_cascaded_shelf_peak_bound_db(std::uint32_t sample_rate,
+                                              int bass_db,
+                                              int bass_hz,
+                                              int treble_db,
+                                              int treble_hz) {
     if (sample_rate == 0 || (bass_db == 0 && treble_db == 0)) {
         return 0.0;
     }
 
-    const double nyquist_hz = static_cast<double>(sample_rate) * 0.5;
-    if (nyquist_hz <= kMinAuditedHz) {
-        return 0.0;
-    }
-
-    double max_db = 0.0;
-    const double log_min = std::log(kMinAuditedHz);
-    const double log_max = std::log(nyquist_hz);
-    for (int i = 0; i < kResponseAuditPoints; ++i) {
-        const double t = static_cast<double>(i) / static_cast<double>(kResponseAuditPoints - 1);
-        const double hz = std::exp(log_min + (log_max - log_min) * t);
-        const double gain_db = cascaded_shelf_response_db(sample_rate, bass_db, bass_hz, treble_db, treble_hz, hz);
-        if (gain_db > max_db) {
-            max_db = gain_db;
+    const ShelfCoefficients low = make_low_shelf(
+        sample_rate, static_cast<double>(bass_db), static_cast<double>(bass_hz));
+    const ShelfCoefficients high = make_high_shelf(
+        sample_rate, static_cast<double>(treble_db), static_cast<double>(treble_hz));
+    double l1_bound = cascaded_impulse_l1_upper_bound(low, high);
+    if (!std::isfinite(l1_bound)) {
+        const ShelfCoefficients identity = make_identity();
+        const double low_bound = cascaded_impulse_l1_upper_bound(low, identity);
+        const double high_bound = cascaded_impulse_l1_upper_bound(identity, high);
+        if (!std::isfinite(low_bound) || !std::isfinite(high_bound) ||
+            low_bound > std::numeric_limits<double>::max() / high_bound) {
+            return std::numeric_limits<double>::infinity();
         }
+        l1_bound = low_bound * high_bound;
     }
-
-    return max_db;
+    return 20.0 * std::log10(std::max(1.0, l1_bound));
 }
-
 
 } // namespace tone
 } // namespace pcmtp

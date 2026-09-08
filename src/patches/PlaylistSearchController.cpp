@@ -81,6 +81,22 @@ int PlaylistSearchController::search_entry_natural_height() const {
     return natural_height > 0 ? natural_height : minimum_height;
 }
 
+void PlaylistSearchController::search_entry_height_metrics(int& minimum_height,
+                                                           int& natural_height,
+                                                           int& allocated_height) const {
+    minimum_height = 0;
+    natural_height = 0;
+    allocated_height = 0;
+    if (search_entry_ == nullptr) {
+        return;
+    }
+
+    gtk_widget_get_preferred_height(search_entry_, &minimum_height, &natural_height);
+    GtkAllocation allocation;
+    gtk_widget_get_allocation(search_entry_, &allocation);
+    allocated_height = allocation.height;
+}
+
 void PlaylistSearchController::set_search_entry_visible(bool visible) {
     if (search_entry_ == nullptr) {
         return;

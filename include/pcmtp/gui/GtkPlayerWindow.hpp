@@ -745,8 +745,8 @@ private:
     int pre_eq_headroom_tenths_db_ = 0;
     bool level_meter_enabled_ = true;
     bool clip_detection_enabled_ = true;
-    int bass_shelf_hz_ = 110;
-    int treble_shelf_hz_ = 10000;
+    int bass_shelf_hz_ = 0;
+    int treble_shelf_hz_ = 0;
     std::string resample_quality_ = "maximum";
     std::vector<ResampleRule> resample_rules_;
     std::vector<DsdPcmRule> dsd_pcm_rules_;

@@ -36,6 +36,7 @@
 #include <vector>
 
 #include <pango/pango.h>
+#include <pango/pangocairo.h>
 #include <gdk/gdkkeysyms.h>
 #include <gio/gio.h>
 #include <glib-unix.h>
@@ -66,6 +67,8 @@ namespace pcmtp {
 
 namespace {
 
+constexpr double kPi =
+    3.141592653589793238462643383279502884;
 constexpr int kClipIndicatorHoldMs = 700;
 constexpr guint kPreferencesSaveDebounceMs = 350;
 constexpr int kPreEqHeadroomPreferenceRevision = 2;
@@ -92,6 +95,45 @@ constexpr std::array<const char*, 4> kEmbeddedApplicationIconResources = {{
     "/org/berestov/pcmtransport/icons/hicolor/48x48/apps/org.berestov.pcmtransport.png",
     "/org/berestov/pcmtransport/icons/hicolor/128x128/apps/org.berestov.pcmtransport.png"
 }};
+
+struct ToneShelfProfile {
+    const char* label;
+    int bass_hz;
+    int treble_hz;
+};
+
+constexpr std::array<ToneShelfProfile, 4> kToneShelfProfiles = {{
+    {"Classic Hi-Fi (100 Hz / 3 kHz)", 100, 3000},
+    {"Balanced Tone (100 Hz / 5 kHz)", 100, 5000},
+    {"High Treble (100 Hz / 8 kHz)", 100, 8000},
+    {"Air (100 Hz / 10 kHz)", 100, 10000}
+}};
+constexpr std::size_t kDefaultToneShelfProfileIndex = 1;
+
+int tone_shelf_profile_index(int bass_hz, int treble_hz) {
+    for (std::size_t i = 0; i < kToneShelfProfiles.size(); ++i) {
+        const ToneShelfProfile& profile = kToneShelfProfiles[i];
+        if (profile.bass_hz == bass_hz && profile.treble_hz == treble_hz) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+const ToneShelfProfile& default_tone_shelf_profile() {
+    return kToneShelfProfiles[kDefaultToneShelfProfileIndex];
+}
+
+bool normalize_tone_shelf_profile(int& bass_hz, int& treble_hz) {
+    if (tone_shelf_profile_index(bass_hz, treble_hz) >= 0) {
+        return false;
+    }
+
+    const ToneShelfProfile& profile = default_tone_shelf_profile();
+    bass_hz = profile.bass_hz;
+    treble_hz = profile.treble_hz;
+    return true;
+}
 
 int playlist_column_header_min_width(GtkTreeViewColumn* column) {
     if (column == nullptr) {
@@ -1750,8 +1792,8 @@ bool write_test_wav(const std::string& path,
                 break;
             case 6: {
                 const double t = static_cast<double>(i) / static_cast<double>(sample_rate);
-                left = clamp_i16(static_cast<int>(std::lrint(std::sin(2.0 * M_PI * 37.0 * t) * 18000.0)));
-                right = clamp_i16(static_cast<int>(std::lrint(std::sin(2.0 * M_PI * 53.0 * t + 0.35) * 12000.0)));
+                left = clamp_i16(static_cast<int>(std::lrint(std::sin(2.0 * kPi * 37.0 * t) * 18000.0)));
+                right = clamp_i16(static_cast<int>(std::lrint(std::sin(2.0 * kPi * 53.0 * t + 0.35) * 12000.0)));
                 break;
             }
             default:
@@ -3697,7 +3739,13 @@ GtkPlayerWindow::GtkPlayerWindow()
       random_generator_(static_cast<std::uint64_t>(
           std::chrono::steady_clock::now().time_since_epoch().count())) {
     reset_dsd_pcm_defaults();
+    const ToneShelfProfile& default_tone_profile = default_tone_shelf_profile();
+    bass_shelf_hz_ = default_tone_profile.bass_hz;
+    treble_shelf_hz_ = default_tone_profile.treble_hz;
     load_preferences();
+    if (normalize_tone_shelf_profile(bass_shelf_hz_, treble_shelf_hz_)) {
+        pre_eq_headroom_tenths_db_ = compute_auto_pre_eq_headroom_tenths_db();
+    }
     repeat_enabled_ = false;
     random_enabled_ = false;
     Logger::instance().configure(logging_enabled_, log_path_, log_errors_only_);
@@ -3822,7 +3870,7 @@ void GtkPlayerWindow::build_ui(GtkApplication* app) {
     start_metadata_worker();
     window_ = gtk_application_window_new(app);
     gtk_window_set_icon_name(GTK_WINDOW(window_), kApplicationId);
-    gtk_window_set_title(GTK_WINDOW(window_), "PCM Transport v0.9.118");
+    gtk_window_set_title(GTK_WINDOW(window_), "PCM Transport v0.9.119");
     gtk_window_set_default_size(GTK_WINDOW(window_), kDefaultWindowWidth, kDefaultWindowHeight);
     gtk_container_set_border_width(GTK_CONTAINER(window_), 16);
 
@@ -5970,9 +6018,9 @@ gboolean GtkPlayerWindow::on_softvol_draw(GtkWidget* widget, cairo_t* cr, gpoint
     cairo_move_to(cr, rail_x, rail_y);
     cairo_line_to(cr, rail_x + rail_w, rail_y);
     cairo_line_to(cr, rail_x + rail_w, rail_y + rail_h - rail_r);
-    cairo_arc(cr, rail_x + rail_w - rail_r, rail_y + rail_h - rail_r, rail_r, 0.0, M_PI / 2.0);
+    cairo_arc(cr, rail_x + rail_w - rail_r, rail_y + rail_h - rail_r, rail_r, 0.0, kPi / 2.0);
     cairo_line_to(cr, rail_x + rail_r, rail_y + rail_h);
-    cairo_arc(cr, rail_x + rail_r, rail_y + rail_h - rail_r, rail_r, M_PI / 2.0, M_PI);
+    cairo_arc(cr, rail_x + rail_r, rail_y + rail_h - rail_r, rail_r, kPi / 2.0, kPi);
     cairo_line_to(cr, rail_x, rail_y);
     cairo_close_path(cr);
     cairo_set_source_rgb(cr, 0.18, 0.18, 0.19);
@@ -5982,9 +6030,9 @@ gboolean GtkPlayerWindow::on_softvol_draw(GtkWidget* widget, cairo_t* cr, gpoint
     cairo_move_to(cr, rail_x + 1.0, rail_y + 1.0);
     cairo_line_to(cr, rail_x + rail_w - 1.0, rail_y + 1.0);
     cairo_line_to(cr, rail_x + rail_w - 1.0, rail_y + rail_h - rail_r - 1.0);
-    cairo_arc(cr, rail_x + rail_w - 1.0 - rail_r, rail_y + rail_h - 1.0 - rail_r, rail_r, 0.0, M_PI / 2.0);
+    cairo_arc(cr, rail_x + rail_w - 1.0 - rail_r, rail_y + rail_h - 1.0 - rail_r, rail_r, 0.0, kPi / 2.0);
     cairo_line_to(cr, rail_x + 1.0 + rail_r, rail_y + rail_h - 1.0);
-    cairo_arc(cr, rail_x + 1.0 + rail_r, rail_y + rail_h - 1.0 - rail_r, rail_r, M_PI / 2.0, M_PI);
+    cairo_arc(cr, rail_x + 1.0 + rail_r, rail_y + rail_h - 1.0 - rail_r, rail_r, kPi / 2.0, kPi);
     cairo_line_to(cr, rail_x + 1.0, rail_y + 1.0);
     cairo_close_path(cr);
     cairo_set_source_rgb(cr, 0.08, 0.08, 0.09);
@@ -6013,10 +6061,10 @@ gboolean GtkPlayerWindow::on_softvol_draw(GtkWidget* widget, cairo_t* cr, gpoint
     const double r = 5.0;
 
     cairo_new_path(cr);
-    cairo_arc(cr, knob_x + knob_w - r, knob_y + r, r, -M_PI / 2.0, 0.0);
-    cairo_arc(cr, knob_x + knob_w - r, knob_y + knob_h - r, r, 0.0, M_PI / 2.0);
-    cairo_arc(cr, knob_x + r, knob_y + knob_h - r, r, M_PI / 2.0, M_PI);
-    cairo_arc(cr, knob_x + r, knob_y + r, r, M_PI, 3.0 * M_PI / 2.0);
+    cairo_arc(cr, knob_x + knob_w - r, knob_y + r, r, -kPi / 2.0, 0.0);
+    cairo_arc(cr, knob_x + knob_w - r, knob_y + knob_h - r, r, 0.0, kPi / 2.0);
+    cairo_arc(cr, knob_x + r, knob_y + knob_h - r, r, kPi / 2.0, kPi);
+    cairo_arc(cr, knob_x + r, knob_y + r, r, kPi, 3.0 * kPi / 2.0);
     cairo_close_path(cr);
 
     cairo_pattern_t* pat = cairo_pattern_create_linear(0, knob_y, 0, knob_y + knob_h);
@@ -7269,18 +7317,19 @@ std::string GtkPlayerWindow::current_decoder_processing_report() const {
     out << output_conversion_line;
 
     if (transport.playing && channels > 0) {
+        out << "16-bit dither: "
+            << pcm16_dither_runtime_label(engine_.pcm16_dither_runtime_kind())
+            << '\n';
         out << "16-bit quantization: "
             << pcm16_quantization_runtime_label(
                    engine_.pcm16_quantization_runtime_kind())
             << '\n';
         out << "16-bit quantization stages: "
-            << engine_.pcm16_quantization_stage_count() << '\n';
-        out << "16-bit dither: "
-            << pcm16_dither_runtime_label(engine_.pcm16_dither_runtime_kind());
+            << engine_.pcm16_quantization_stage_count();
     } else {
+        out << "16-bit dither: inactive\n";
         out << "16-bit quantization: inactive\n";
-        out << "16-bit quantization stages: 0\n";
-        out << "16-bit dither: inactive";
+        out << "16-bit quantization stages: 0";
     }
 
     return out.str();
@@ -7587,7 +7636,6 @@ void GtkPlayerWindow::draw_tone_dsp_signal_path(cairo_t* cr,
     cairo_paint(cr);
 
     const double outer = 18.0;
-    const double title_y = 17.0;
     const double box_y = 34.0;
     const double box_h = std::max(24.0, static_cast<double>(height) - box_y - 16.0);
     const double gap = 10.0;
@@ -7595,40 +7643,56 @@ void GtkPlayerWindow::draw_tone_dsp_signal_path(cairo_t* cr,
         5.0, static_cast<double>(width) - (outer * 2.0) - (gap * 4.0));
     const double box_w = usable_w / 5.0;
 
-    cairo_select_font_face(
-        cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-    cairo_set_font_size(cr, 10.0);
+    PangoLayout* text_layout = pango_cairo_create_layout(cr);
+    PangoFontDescription* title_font = pango_font_description_new();
+    PangoFontDescription* label_font = pango_font_description_new();
+    pango_font_description_set_family(title_font, "Sans");
+    pango_font_description_set_weight(title_font, PANGO_WEIGHT_NORMAL);
+    pango_font_description_set_absolute_size(title_font, 10.0 * PANGO_SCALE);
+    pango_font_description_set_family(label_font, "Sans");
+    pango_font_description_set_weight(label_font, PANGO_WEIGHT_NORMAL);
+    pango_font_description_set_absolute_size(label_font, 10.0 * PANGO_SCALE);
+
+    auto draw_pango_text = [&](const char* text,
+                               const PangoFontDescription* font,
+                               double x,
+                               double y) {
+        pango_layout_set_font_description(text_layout, font);
+        pango_layout_set_text(text_layout, text, -1);
+        cairo_move_to(cr, std::round(x), std::round(y));
+        pango_cairo_show_layout(cr, text_layout);
+    };
+
+    auto draw_centered_text = [&](const char* text, double cx, double cy) {
+        pango_layout_set_font_description(text_layout, label_font);
+        pango_layout_set_text(text_layout, text, -1);
+        PangoRectangle logical{};
+        pango_layout_get_pixel_extents(text_layout, nullptr, &logical);
+        const double x = cx -
+            (static_cast<double>(logical.x) + static_cast<double>(logical.width) * 0.5);
+        const double y = cy -
+            (static_cast<double>(logical.y) + static_cast<double>(logical.height) * 0.5);
+        cairo_move_to(cr, std::round(x), std::round(y));
+        pango_cairo_show_layout(cr, text_layout);
+    };
+
     cairo_set_source_rgba(cr, 0.88, 0.90, 0.92, 0.72);
-    cairo_move_to(cr, outer, title_y);
-    cairo_show_text(cr, "Signal path");
+    draw_pango_text("Signal path", title_font, outer, 8.0);
 
     auto draw_rounded_rect = [&](double x, double y, double w, double h) {
         const double radius = std::min(4.0, std::min(w, h) * 0.25);
         const double x2 = x + w;
         const double y2 = y + h;
         cairo_new_sub_path(cr);
-        cairo_arc(cr, x2 - radius, y + radius, radius, -M_PI / 2.0, 0.0);
-        cairo_arc(cr, x2 - radius, y2 - radius, radius, 0.0, M_PI / 2.0);
-        cairo_arc(cr, x + radius, y2 - radius, radius, M_PI / 2.0, M_PI);
-        cairo_arc(cr, x + radius, y + radius, radius, M_PI, M_PI + M_PI / 2.0);
+        cairo_arc(cr, x2 - radius, y + radius, radius, -kPi / 2.0, 0.0);
+        cairo_arc(cr, x2 - radius, y2 - radius, radius, 0.0, kPi / 2.0);
+        cairo_arc(cr, x + radius, y2 - radius, radius, kPi / 2.0, kPi);
+        cairo_arc(cr, x + radius, y + radius, radius, kPi, kPi + kPi / 2.0);
         cairo_close_path(cr);
     };
 
-    auto draw_centered_text = [&](const char* text, double cx, double cy) {
-        cairo_text_extents_t ext{};
-        cairo_text_extents(cr, text, &ext);
-        cairo_move_to(
-            cr,
-            cx - (ext.width * 0.5) - ext.x_bearing,
-            cy - (ext.height * 0.5) - ext.y_bearing);
-        cairo_show_text(cr, text);
-    };
-
-    const char* line1[] = {
-        "Working PCM", "Pre-EQ", "Bass / Treble", "DSP Volume", "Output path"
-    };
-    const char* line2[] = {
-        nullptr, "Headroom", nullptr, nullptr, nullptr
+    const char* labels[] = {
+        "Working PCM", "Headroom", "Tone", "Volume", "Output"
     };
 
     const bool processor_active[] = {
@@ -7639,7 +7703,6 @@ void GtkPlayerWindow::draw_tone_dsp_signal_path(cairo_t* cr,
         false
     };
 
-    cairo_set_font_size(cr, 9.0);
     for (int i = 0; i < 5; ++i) {
         const bool active_processor = processor_active[i];
         const double x = outer + static_cast<double>(i) * (box_w + gap);
@@ -7654,14 +7717,10 @@ void GtkPlayerWindow::draw_tone_dsp_signal_path(cairo_t* cr,
 
         cairo_set_source_rgba(
             cr, 0.92, 0.93, 0.95, active_processor ? 0.96 : 0.84);
-        const double cx = x + box_w * 0.5;
-        const double cy = box_y + box_h * 0.5;
-        if (line2[i] != nullptr) {
-            draw_centered_text(line1[i], cx, cy - 6.0);
-            draw_centered_text(line2[i], cx, cy + 6.0);
-        } else {
-            draw_centered_text(line1[i], cx, cy);
-        }
+        draw_centered_text(
+            labels[i],
+            x + box_w * 0.5,
+            box_y + box_h * 0.5);
 
         if (active_processor) {
             cairo_set_line_width(cr, 2.0);
@@ -7692,6 +7751,10 @@ void GtkPlayerWindow::draw_tone_dsp_signal_path(cairo_t* cr,
         cairo_close_path(cr);
         cairo_fill(cr);
     }
+
+    pango_font_description_free(label_font);
+    pango_font_description_free(title_font);
+    g_object_unref(text_layout);
 
     cairo_set_line_width(cr, 1.0);
     cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.14);
@@ -10798,7 +10861,7 @@ void GtkPlayerWindow::open_about_dialog() {
     }
 
     GtkWidget* title = gtk_label_new(nullptr);
-    gtk_label_set_markup(GTK_LABEL(title), "<b>PCM Transport 0.9.118</b>");
+    gtk_label_set_markup(GTK_LABEL(title), "<b>PCM Transport 0.9.119</b>");
     gtk_label_set_xalign(GTK_LABEL(title), 0.5f);
     GtkWidget* subtitle = gtk_label_new("Digital Audio Player");
     gtk_label_set_xalign(GTK_LABEL(subtitle), 0.5f);
@@ -11202,7 +11265,7 @@ void GtkPlayerWindow::open_bitperfect_test_dialog(GtkWidget* parent_dialog, int 
                 return;
             }
             post_diagnostics_update(text_view, progress, close_button,
-                "PCM Transport FLAC bit-perfect test\nVersion: 0.9.118\nScope: native libFLAC path before ALSA; resampling excluded\nFFmpeg API: not used\n", 0.02, false);
+                "PCM Transport FLAC bit-perfect test\nVersion: 0.9.119\nScope: native libFLAC path before ALSA; resampling excluded\nFFmpeg API: not used\n", 0.02, false);
             std::ostringstream ctx;
             ctx << "Duration: " << duration_seconds << " sec\n"
                 << "Generated signal: deterministic 16-bit / 44.1 kHz / stereo stress pattern\n"
@@ -11697,14 +11760,13 @@ void GtkPlayerWindow::open_eq_dialog() {
     gtk_range_set_value(GTK_RANGE(bass_scale), static_cast<double>(bass_db_));
     gtk_range_set_value(GTK_RANGE(treble_scale), static_cast<double>(treble_db_));
     GtkWidget* preset_combo = gtk_combo_box_text_new();
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(preset_combo), "Reference Baxandall (100 Hz / 10 kHz)");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(preset_combo), "Console Tone (85 Hz / 8 kHz)");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(preset_combo), "Broadcast Sweetening (120 Hz / 6.5 kHz)");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(preset_combo), "Air & Weight (70 Hz / 12 kHz)");
-    int preset_index = 0;
-    if (bass_shelf_hz_ == 85 && treble_shelf_hz_ == 8000) preset_index = 1;
-    else if (bass_shelf_hz_ == 120 && treble_shelf_hz_ == 6500) preset_index = 2;
-    else if (bass_shelf_hz_ == 70 && treble_shelf_hz_ == 12000) preset_index = 3;
+    for (const ToneShelfProfile& profile : kToneShelfProfiles) {
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(preset_combo), profile.label);
+    }
+    int preset_index = tone_shelf_profile_index(bass_shelf_hz_, treble_shelf_hz_);
+    if (preset_index < 0) {
+        preset_index = static_cast<int>(kDefaultToneShelfProfileIndex);
+    }
     gtk_combo_box_set_active(GTK_COMBO_BOX(preset_combo), preset_index);
     g_object_set_data(G_OBJECT(bass_scale), "pre-eq-headroom-scale", pre_eq_headroom_scale);
     g_object_set_data(G_OBJECT(treble_scale), "pre-eq-headroom-scale", pre_eq_headroom_scale);
@@ -12050,10 +12112,13 @@ data->self->draw_tone_response_graph(cr, alloc.width, alloc.height);
     g_signal_connect(preset_combo, "changed", G_CALLBACK(+[](GtkComboBox* combo, gpointer user_data) {
         auto* self = static_cast<GtkPlayerWindow*>(user_data);
         const int idx = gtk_combo_box_get_active(combo);
-        self->bass_shelf_hz_ = 100; self->treble_shelf_hz_ = 10000;
-        if (idx == 1) { self->bass_shelf_hz_ = 85; self->treble_shelf_hz_ = 8000; }
-        else if (idx == 2) { self->bass_shelf_hz_ = 120; self->treble_shelf_hz_ = 6500; }
-        else if (idx == 3) { self->bass_shelf_hz_ = 70; self->treble_shelf_hz_ = 12000; }
+        const std::size_t profile_index =
+            idx >= 0 && static_cast<std::size_t>(idx) < kToneShelfProfiles.size()
+                ? static_cast<std::size_t>(idx)
+                : kDefaultToneShelfProfileIndex;
+        const ToneShelfProfile& profile = kToneShelfProfiles[profile_index];
+        self->bass_shelf_hz_ = profile.bass_hz;
+        self->treble_shelf_hz_ = profile.treble_hz;
         self->apply_soft_eq_profile_with_auto_headroom();
         GtkWidget* graph = GTK_WIDGET(g_object_get_data(G_OBJECT(combo), "tone-graph"));
         GtkWidget* slider = GTK_WIDGET(g_object_get_data(G_OBJECT(combo), "pre-eq-headroom-scale"));
@@ -12300,7 +12365,8 @@ data->self->draw_tone_response_graph(cr, alloc.width, alloc.height);
             gtk_range_set_value(GTK_RANGE(volume_scale), 100.0);
             gtk_range_set_value(GTK_RANGE(bass_scale), 0.0);
             gtk_range_set_value(GTK_RANGE(treble_scale), 0.0);
-            gtk_combo_box_set_active(GTK_COMBO_BOX(preset_combo), 0);
+            gtk_combo_box_set_active(GTK_COMBO_BOX(preset_combo),
+                                     static_cast<gint>(kDefaultToneShelfProfileIndex));
             gtk_range_set_value(GTK_RANGE(pre_eq_headroom_scale), 0.0);
 
             resample_rules_.clear();
@@ -12485,8 +12551,10 @@ void GtkPlayerWindow::refresh_display(const PlaybackStatusSnapshot& status,
         const bool dsp_active = path_soft_volume < 100 || tonal_dsp_active;
         if (dsp_active) {
             std::vector<std::string> dsp_parts;
-            if (path_soft_volume < 100) {
-                dsp_parts.push_back("Vol " + std::to_string(path_soft_volume) + "%");
+            if (shown_channels <= 2 && path_headroom_tenths > 0) {
+                dsp_parts.push_back(
+                    "HR " + format_headroom_db_text(
+                        static_cast<double>(path_headroom_tenths) / 10.0) + " dB");
             }
             if (shown_channels <= 2 && path_bass_db != 0) {
                 dsp_parts.push_back("B " + format_signed_step(path_bass_db) + " dB");
@@ -12494,10 +12562,8 @@ void GtkPlayerWindow::refresh_display(const PlaybackStatusSnapshot& status,
             if (shown_channels <= 2 && path_treble_db != 0) {
                 dsp_parts.push_back("T " + format_signed_step(path_treble_db) + " dB");
             }
-            if (shown_channels <= 2 && path_headroom_tenths > 0) {
-                dsp_parts.push_back(
-                    "HR " + format_headroom_db_text(
-                        static_cast<double>(path_headroom_tenths) / 10.0) + " dB");
+            if (path_soft_volume < 100) {
+                dsp_parts.push_back("Vol " + std::to_string(path_soft_volume) + "%");
             }
 
             path_text += " → DSP [";

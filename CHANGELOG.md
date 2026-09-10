@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.119
+
+- Replaced non-standard `M_PI` use in the GUI implementation with a file-local C++17 `constexpr` π constant.
+- Ordered 16-bit dither before 16-bit quantization in ALSA processing diagnostics to match the actual final S16 signal path.
+- Rendered the DSP Studio signal-path labels with PangoCairo and shortened the node labels without changing the signal-path widget geometry.
+- Ordered the main display DSP summary by processing sequence: Pre-EQ headroom, Bass/Treble, then DSP volume.
+- Reworked Bass / Treble shelf profiles around a fixed 100 Hz bass turnover with 3, 5, 8 and 10 kHz treble turnovers.
+- Set Balanced Tone (100 Hz / 5 kHz) as the default shelf profile. Stored shelf pairs outside the current profile set fall back to the default.
+- Centralized shelf profile labels and frequencies in one definition used by the DSP Studio selector.
+
 ## 0.9.118
 
 - Changed Bass and Treble shelving to S=1.0, providing monotonic shelf response without transition-band overshoot.

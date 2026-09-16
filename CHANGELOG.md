@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.120
+
+- Added typed NativeInt32, Float32 and selective Float64 PCM paths while preserving exact native integer playback.
+- Preserved floating-point headroom through decode, resampling and DSP until output conversion.
+- Added selective Float64 processing for decoded double PCM and >24-bit high-quality SoXR resampling.
+- Unified DSP processing in normalized double precision while preserving PCM16 quantization, dither and exact S16 repack behavior.
+- Added explicit Float32/Float64 ALSA output and selectable Direct (`hw:X,Y`) / Plug (`plughw:X,Y`) paths; Auto remains integer-only.
+- Extended ALSA capability probing and diagnostics for Float32/Float64.
+- Refined gapless block compatibility while preserving RangeLimitedDecoder exact-range transport and decoder-EOF handling.
+- Updated playback diagnostics and related settings wording.
+
 ## 0.9.119
 
 - Replaced non-standard `M_PI` use in the GUI implementation with a file-local C++17 `constexpr` π constant.

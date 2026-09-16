@@ -560,7 +560,7 @@ private:
         std::uint64_t decoder_total_samples,
         const PlaylistEntry& entry) const;
     const ActiveTrackTransportState* active_track_transport_state() const;
-    std::vector<std::uint16_t> output_precision_candidates_for_entry(
+    std::vector<PcmOutputFormat> output_precision_candidates_for_entry(
         const PlaylistEntry& entry) const;
     std::string output_precision_setting_for_entry(
         const PlaylistEntry& entry) const;
@@ -578,7 +578,8 @@ private:
     std::uint32_t current_tone_control_sample_rate() const;
     std::string processing_rules_report_for_entry(
         const PlaylistEntry& entry,
-        const AudioFormat& active_output_format) const;
+        const AudioFormat& active_output_format,
+        PcmOutputFormat active_output_sample_format) const;
     std::string processing_path_for_entry(const PlaylistEntry& entry) const;
     std::string current_decoder_processing_report() const;
     std::string current_transport_report() const;
@@ -735,6 +736,7 @@ private:
     unsigned playlist_filter_mpris_transaction_depth_ = 0;
     std::size_t playlist_filter_mpris_transaction_old_index_ = 0;
     std::string current_device_ = "default";
+    std::string alsa_path_mode_ = "direct";
     std::vector<CardProfileInfo> cards_;
     bool logging_enabled_ = false;
     bool log_errors_only_ = false;
@@ -744,7 +746,7 @@ private:
     int treble_db_ = 0;
     int pre_eq_headroom_tenths_db_ = 0;
     bool level_meter_enabled_ = true;
-    bool clip_detection_enabled_ = true;
+    bool clip_detection_enabled_ = false;
     int bass_shelf_hz_ = 0;
     int treble_shelf_hz_ = 0;
     std::string resample_quality_ = "maximum";

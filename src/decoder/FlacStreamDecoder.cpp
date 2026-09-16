@@ -106,7 +106,8 @@ const AudioFormat& FlacStreamDecoder::format() const {
     return format_;
 }
 
-std::size_t FlacStreamDecoder::read_samples(PcmSample* destination, std::size_t max_samples) {
+std::size_t FlacStreamDecoder::read_samples(PcmBlock& destination,
+                                            std::size_t max_samples) {
     if (!opened_) {
         throw std::runtime_error("Decoder not opened");
     }
@@ -117,6 +118,7 @@ std::size_t FlacStreamDecoder::read_samples(PcmSample* destination, std::size_t 
         return 0;
     }
 
+    destination.ensure_storage(PcmStorageFormat::NativeInt32);
     fill_queue_if_needed();
 
     std::lock_guard<std::mutex> lock(mutex_);
@@ -138,7 +140,7 @@ std::size_t FlacStreamDecoder::read_samples(PcmSample* destination, std::size_t 
         if (take == 0) {
             break;
         }
-        std::copy(front.data() + block_offset_, front.data() + block_offset_ + take, destination + copied);
+        destination.append(front.data() + block_offset_, take);
         copied += take;
         block_offset_ += take;
         queued_samples_ -= take;

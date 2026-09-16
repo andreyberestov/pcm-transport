@@ -50,53 +50,100 @@ std::int64_t pcm_minimum_sample(std::uint16_t bits_per_sample) {
     return -(1LL << (bits_per_sample - 1));
 }
 
-double clamp_sample_to_bits(double sample, std::uint16_t bits_per_sample) {
-    const double maximum = static_cast<double>(pcm_full_scale(bits_per_sample));
-    const double minimum = static_cast<double>(pcm_minimum_sample(bits_per_sample));
-    if (maximum <= 0.0 || minimum >= 0.0) return sample;
-    if (sample > maximum) return maximum;
-    if (sample < minimum) return minimum;
-    return sample;
+double native_pcm_units_per_unity(std::uint16_t bits_per_sample) {
+    if (bits_per_sample < 2 || bits_per_sample > 32) {
+        throw std::runtime_error("Unsupported PCM precision");
+    }
+    return std::ldexp(1.0, static_cast<int>(bits_per_sample) - 1);
 }
 
-PcmSample quantize_processed_sample(double sample,
-                                    std::uint16_t bits_per_sample,
-                                    Pcm16QuantizationMode pcm16_mode,
-                                    double pcm16_dither_code_units = 0.0) {
-    if (bits_per_sample == 16) {
-        return quantize_pcm16_code_units(
-            sample + pcm16_dither_code_units, pcm16_mode);
+struct NormalizedIntegerQuantizer {
+    std::uint16_t output_bits = 0;
+    double scale = 1.0;
+    double minimum = 0.0;
+    double maximum = 0.0;
+};
+
+NormalizedIntegerQuantizer make_normalized_integer_quantizer(
+    std::uint16_t output_bits) {
+    if (output_bits < 16 || output_bits > 32) {
+        throw std::runtime_error("Unsupported PCM output precision");
     }
-    const double clamped = clamp_sample_to_bits(sample, bits_per_sample);
+    NormalizedIntegerQuantizer quantizer;
+    quantizer.output_bits = output_bits;
+    quantizer.scale = native_pcm_units_per_unity(output_bits);
+    quantizer.minimum = static_cast<double>(pcm_minimum_sample(output_bits));
+    quantizer.maximum = static_cast<double>(pcm_full_scale(output_bits));
+    return quantizer;
+}
+
+PcmSample quantize_normalized_sample_to_bits(
+    double sample,
+    const NormalizedIntegerQuantizer& quantizer,
+    Pcm16QuantizationMode pcm16_mode,
+    double pcm16_dither_code_units = 0.0) {
+    if (!std::isfinite(sample)) {
+        throw std::runtime_error("Invalid floating PCM sample");
+    }
+    const double code_units = sample * quantizer.scale;
+    if (quantizer.output_bits == 16) {
+        return quantize_pcm16_code_units(
+            code_units + pcm16_dither_code_units, pcm16_mode);
+    }
+    const double clamped = std::max(
+        quantizer.minimum, std::min(quantizer.maximum, code_units));
     return static_cast<PcmSample>(std::llround(clamped));
 }
 
-PcmSample quantize_working_sample_to_bits(double sample,
-                                           std::uint16_t working_bits,
-                                           std::uint16_t output_bits,
-                                           Pcm16QuantizationMode pcm16_mode,
-                                           double pcm16_dither_code_units = 0.0) {
-    if (working_bits < output_bits || output_bits < 16 || output_bits > 32 ||
-        working_bits > 32) {
+struct NativeNarrowingQuantizer {
+    std::uint16_t output_bits = 0;
+    Pcm16IntegerQuantizer pcm16{};
+    double divisor_double = 1.0;
+    double minimum = 0.0;
+    double maximum = 0.0;
+};
+
+NativeNarrowingQuantizer make_native_narrowing_quantizer(
+    std::uint16_t working_bits,
+    std::uint16_t output_bits,
+    Pcm16QuantizationMode pcm16_mode) {
+    if (working_bits <= output_bits || output_bits < 16 || working_bits > 32) {
         throw std::runtime_error("Unsupported PCM precision conversion");
     }
     const unsigned shift = static_cast<unsigned>(working_bits - output_bits);
-    const double divisor = static_cast<double>(std::uint64_t{1} << shift);
-    double scaled = sample / divisor;
+    NativeNarrowingQuantizer quantizer;
+    quantizer.output_bits = output_bits;
     if (output_bits == 16) {
-        return quantize_pcm16_code_units(
-            scaled + pcm16_dither_code_units, pcm16_mode);
+        quantizer.pcm16 = make_pcm16_integer_quantizer(
+            working_bits, pcm16_mode);
     }
-    const double maximum = static_cast<double>(pcm_full_scale(output_bits));
-    const double minimum = static_cast<double>(pcm_minimum_sample(output_bits));
-    if (scaled > maximum) scaled = maximum;
-    if (scaled < minimum) scaled = minimum;
+    quantizer.divisor_double = static_cast<double>(std::uint64_t{1} << shift);
+    quantizer.minimum = static_cast<double>(pcm_minimum_sample(output_bits));
+    quantizer.maximum = static_cast<double>(pcm_full_scale(output_bits));
+    return quantizer;
+}
+
+PcmSample quantize_native_sample_to_bits(
+    PcmSample sample,
+    const NativeNarrowingQuantizer& quantizer,
+    double pcm16_dither_code_units = 0.0) {
+    if (quantizer.output_bits == 16) {
+        if (pcm16_dither_code_units != 0.0) {
+            return quantize_integer_working_sample_to_pcm16_with_dither(
+                sample, quantizer.pcm16, pcm16_dither_code_units);
+        }
+        return quantize_integer_working_sample_to_pcm16(
+            sample, quantizer.pcm16);
+    }
+
+    double scaled = static_cast<double>(sample) / quantizer.divisor_double;
+    scaled = std::max(quantizer.minimum, std::min(quantizer.maximum, scaled));
     return static_cast<PcmSample>(std::llround(scaled));
 }
 
-PcmSample narrow_exact_working_sample(PcmSample sample,
-                                      std::uint16_t working_bits,
-                                      std::uint16_t output_bits) {
+PcmSample narrow_exact_native_sample(PcmSample sample,
+                                     std::uint16_t working_bits,
+                                     std::uint16_t output_bits) {
     if (working_bits <= output_bits || output_bits < 16 || working_bits > 32) {
         throw std::runtime_error("Unsupported exact PCM precision conversion");
     }
@@ -128,6 +175,28 @@ void widen_pcm_block_exact(PcmSample* samples,
         }
         samples[i] = static_cast<PcmSample>(value);
     }
+}
+
+double normalized_sample(const PcmBlock& block,
+                         std::size_t index,
+                         double native_to_normalized_scale) {
+    double sample = 0.0;
+    switch (block.storage_format()) {
+    case PcmStorageFormat::NativeInt32:
+        sample = static_cast<double>(block.native()[index]) *
+                 native_to_normalized_scale;
+        break;
+    case PcmStorageFormat::Float32:
+        sample = static_cast<double>(block.float32()[index]);
+        break;
+    case PcmStorageFormat::Float64:
+        sample = block.float64()[index];
+        break;
+    }
+    if (!std::isfinite(sample)) {
+        throw std::runtime_error("Decoder produced a non-finite floating PCM sample");
+    }
+    return sample;
 }
 
 std::uint64_t make_pcm16_dither_seed(std::uint64_t transport_generation) noexcept {
@@ -206,18 +275,6 @@ double process_tone_filter_path(double input,
         sample = process_sample(sample, path.high, left ? path.high_l : path.high_r);
     }
     return sample;
-}
-
-void rescale_shelf_state(ShelfState& state, double factor) {
-    state.z1 *= factor;
-    state.z2 *= factor;
-}
-
-void rescale_tone_filter_path(ToneFilterPath& path, double factor) {
-    rescale_shelf_state(path.low_l, factor);
-    rescale_shelf_state(path.low_r, factor);
-    rescale_shelf_state(path.high_l, factor);
-    rescale_shelf_state(path.high_r, factor);
 }
 
 class ToneFilterCrossfade {
@@ -325,16 +382,6 @@ public:
             return true;
         }
         return pending_valid_ && tone_target_has_processing(pending_target_);
-    }
-
-    void rescale_state(double factor) {
-        if (std::fabs(factor - 1.0) < 1.0e-15) {
-            return;
-        }
-        rescale_tone_filter_path(active_, factor);
-        if (transitioning_) {
-            rescale_tone_filter_path(incoming_, factor);
-        }
     }
 
 private:
@@ -460,7 +507,7 @@ PlaybackEngine::~PlaybackEngine() {
 void PlaybackEngine::start(std::unique_ptr<IAudioDecoder> decoder,
                            std::unique_ptr<IAudioBackend> backend,
                            const std::string& device_name,
-                           const std::vector<std::uint16_t>& output_precision_candidates,
+                           const std::vector<PcmOutputFormat>& output_format_candidates,
                            std::uint64_t initial_samples_per_channel,
                            std::vector<std::uint64_t> logical_segment_offsets,
                            Pcm16QuantizationMode pcm16_quantization_mode,
@@ -496,11 +543,17 @@ void PlaybackEngine::start(std::unique_ptr<IAudioDecoder> decoder,
             "PlaybackEngine::start received an invalid working PCM format");
     }
     AudioFormat output_base_format = decoder_working_format;
-    const AudioFormat opened_format = backend->open_with_precision_candidates(
-        device_name, output_base_format, output_precision_candidates);
+    const PcmOutputFormat opened_output_format = backend->open_with_format_candidates(
+        device_name, output_base_format, output_format_candidates);
+    AudioFormat opened_format = output_base_format;
+    const std::uint16_t opened_integer_bits =
+        pcm_output_integer_bits(opened_output_format);
+    opened_format.bits_per_sample = opened_integer_bits > 0 ? opened_integer_bits : 32;
     AudioFormat working_format = decoder_working_format;
-    working_format.bits_per_sample = std::max(
-        decoder_working_format.bits_per_sample, opened_format.bits_per_sample);
+    if (opened_integer_bits > 0) {
+        working_format.bits_per_sample = std::max(
+            decoder_working_format.bits_per_sample, opened_integer_bits);
+    }
     const std::string opened_report = backend->active_output_report();
     const std::uint64_t total_samples_per_channel =
         decoder->total_samples_per_channel();
@@ -540,10 +593,14 @@ void PlaybackEngine::start(std::unique_ptr<IAudioDecoder> decoder,
         logical_segment_offsets_ = std::move(logical_segment_offsets);
         format_ = working_format;
         output_format_ = opened_format;
+        output_sample_format_.store(opened_output_format, std::memory_order_release);
         pcm16_quantization_mode_ = pcm16_quantization_mode;
         pcm16_dither_mode_ = pcm16_dither_mode;
         pcm16_dither_ = std::make_unique<Pcm16Dither>(
             pcm16_dither_mode_, working_format.channels, pcm16_dither_seed);
+        pcm_storage_format_.store(
+            initial_decoder_runtime_state.pcm_storage_format,
+            std::memory_order_release);
         resampler_runtime_kind_.store(
             initial_decoder_runtime_state.resampler_runtime_kind,
             std::memory_order_release);
@@ -591,6 +648,9 @@ void PlaybackEngine::start(std::unique_ptr<IAudioDecoder> decoder,
         }
         decoder_.reset();
         backend_.reset();
+        pcm_storage_format_.store(
+            PcmStorageFormat::NativeInt32, std::memory_order_release);
+        output_sample_format_.store(PcmOutputFormat::S16, std::memory_order_release);
         resampler_runtime_kind_.store(
             ResamplerRuntimeKind::NotUsed, std::memory_order_release);
         pcm16_quantization_runtime_kind_.store(
@@ -656,6 +716,9 @@ void PlaybackEngine::stop() {
     }
     decoder_.reset();
     backend_.reset();
+    pcm_storage_format_.store(
+        PcmStorageFormat::NativeInt32, std::memory_order_release);
+    output_sample_format_.store(PcmOutputFormat::S16, std::memory_order_release);
     resampler_runtime_kind_.store(
         ResamplerRuntimeKind::NotUsed, std::memory_order_release);
     pcm16_quantization_runtime_kind_.store(
@@ -757,6 +820,12 @@ void PlaybackEngine::set_clip_detection_enabled(bool enabled) {
 }
 int PlaybackEngine::bass_db() const { return bass_db_.load(std::memory_order_relaxed); }
 int PlaybackEngine::treble_db() const { return treble_db_.load(std::memory_order_relaxed); }
+PcmStorageFormat PlaybackEngine::pcm_storage_format() const noexcept {
+    return pcm_storage_format_.load(std::memory_order_acquire);
+}
+PcmOutputFormat PlaybackEngine::output_format() const noexcept {
+    return output_sample_format_.load(std::memory_order_acquire);
+}
 ResamplerRuntimeKind PlaybackEngine::resampler_runtime_kind() const noexcept {
     return resampler_runtime_kind_.load(std::memory_order_acquire);
 }
@@ -1704,8 +1773,9 @@ void PlaybackEngine::playback_loop(std::uint64_t transport_generation) {
         const bool stereo_tonal_dsp_allowed = ch <= 2;
         const std::size_t block_samples = std::max<std::size_t>(
             ch, (static_cast<std::size_t>(4096) / ch) * ch);
-        std::vector<PcmSample> block(block_samples);
-        std::vector<PcmSample> output_block(block_samples);
+        PcmBlock block;
+        block.reserve(block_samples);
+        PcmBlock output_block;
         std::uint64_t played_samples_per_channel = initial_samples_per_channel_;
         std::size_t next_logical_boundary = logical_segment_offsets_.size();
         if (logical_segment_offsets_.size() >= 2) {
@@ -1720,6 +1790,8 @@ void PlaybackEngine::playback_loop(std::uint64_t transport_generation) {
             decoder_->runtime_state_snapshot();
         std::uint64_t last_decoder_runtime_generation =
             decoder_runtime_state.generation;
+        PcmStorageFormat working_storage =
+            decoder_runtime_state.pcm_storage_format;
         Pcm16QuantizationRuntimeKind last_published_pcm16_quantization_runtime_kind =
             pcm16_quantization_runtime_kind_.load(std::memory_order_acquire);
         std::uint32_t last_published_pcm16_quantization_stage_count =
@@ -1747,13 +1819,18 @@ void PlaybackEngine::playback_loop(std::uint64_t transport_generation) {
             wait_if_paused();
             if (stop_requested_) break;
 
-            const std::size_t got = decoder_->read_samples(block.data(), block.size());
+            block.clear();
+            block.ensure_storage(decoder_->pcm_storage_format());
+            const std::size_t got = decoder_->read_samples(block, block_samples);
             bool processing_state_changed = false;
             const std::uint64_t decoder_runtime_generation =
                 decoder_->runtime_state_generation();
             if (decoder_runtime_generation != last_decoder_runtime_generation) {
                 decoder_runtime_state = decoder_->runtime_state_snapshot();
                 last_decoder_runtime_generation = decoder_runtime_state.generation;
+                pcm_storage_format_.store(
+                    decoder_runtime_state.pcm_storage_format,
+                    std::memory_order_release);
                 resampler_runtime_kind_.store(
                     decoder_runtime_state.resampler_runtime_kind,
                     std::memory_order_release);
@@ -1774,8 +1851,9 @@ void PlaybackEngine::playback_loop(std::uint64_t transport_generation) {
                 }
                 processing_state_changed = true;
             }
-            if (got > block.size()) {
-                throw std::runtime_error("Decoder returned more PCM samples than requested");
+            if (got != block.size() || got > block_samples) {
+                throw std::runtime_error(
+                    "Decoder returned an inconsistent PCM block size");
             }
             if (got % ch != 0) {
                 throw std::runtime_error("Decoder returned an incomplete PCM frame");
@@ -1790,25 +1868,35 @@ void PlaybackEngine::playback_loop(std::uint64_t transport_generation) {
                 throw std::runtime_error(
                     "Decoder changed to an incompatible working PCM format");
             }
-            const std::uint16_t block_processing_bits = std::max(
-                decoder_block_format.bits_per_sample,
-                output_format_.bits_per_sample);
-            if (block_processing_bits != format_.bits_per_sample) {
-                const int bit_delta =
-                    static_cast<int>(block_processing_bits) -
-                    static_cast<int>(format_.bits_per_sample);
-                tone_filter.rescale_state(std::ldexp(1.0, bit_delta));
+            if (block.storage_format() != decoder_runtime_state.pcm_storage_format) {
+                throw std::runtime_error(
+                    "Decoder PCM block storage disagrees with runtime state");
+            }
+
+            const PcmOutputFormat active_output_format =
+                output_sample_format_.load(std::memory_order_acquire);
+            const std::uint16_t integer_output_bits =
+                pcm_output_integer_bits(active_output_format);
+            const std::uint16_t block_processing_bits = integer_output_bits > 0
+                ? std::max(decoder_block_format.bits_per_sample,
+                           integer_output_bits)
+                : decoder_block_format.bits_per_sample;
+            if (block_processing_bits != format_.bits_per_sample ||
+                block.storage_format() != working_storage) {
                 format_.bits_per_sample = block_processing_bits;
+                working_storage = block.storage_format();
+                pcm_storage_format_.store(working_storage,
+                                          std::memory_order_release);
                 {
                     std::lock_guard<std::mutex> lock(state_mutex_);
                     transport_working_format_ = format_;
                 }
                 processing_state_changed = true;
             }
-            if (decoder_block_format.bits_per_sample < format_.bits_per_sample) {
+            if (block.storage_format() == PcmStorageFormat::NativeInt32 &&
+                decoder_block_format.bits_per_sample < format_.bits_per_sample) {
                 widen_pcm_block_exact(
-                    block.data(),
-                    got,
+                    block.native().data(), got,
                     decoder_block_format.bits_per_sample,
                     format_.bits_per_sample);
             }
@@ -1836,27 +1924,26 @@ void PlaybackEngine::playback_loop(std::uint64_t transport_generation) {
 
             bool tone_processing_for_frame = tone_filter.requires_processing();
             const bool dsp_active =
-                current_soft_volume_percent < 100 ||
-                tone_processing_for_frame;
-            const bool narrowing_required =
-                output_format_.bits_per_sample < format_.bits_per_sample;
+                current_soft_volume_percent < 100 || tone_processing_for_frame;
+            const bool integer_output = integer_output_bits > 0;
+            const bool narrowing_required = integer_output &&
+                integer_output_bits < format_.bits_per_sample;
+            const bool storage_conversion_required = integer_output &&
+                block.storage_format() != PcmStorageFormat::NativeInt32;
             const DecoderPcmSampleKind decoded_sample_kind =
                 decoder_runtime_state.decoded_pcm_sample_kind;
             const bool decoded_s16 =
                 decoded_sample_kind == DecoderPcmSampleKind::S16 ||
                 decoded_sample_kind == DecoderPcmSampleKind::S16Planar;
-            const bool exact_s16_repack =
-                output_format_.bits_per_sample == 16 &&
-                narrowing_required && !dsp_active &&
+            const bool exact_s16_repack = integer_output &&
+                integer_output_bits == 16 && narrowing_required && !dsp_active &&
                 decoder_runtime_state.pcm16_quantization_stage_count > 0 &&
                 decoded_s16 &&
                 decoder_runtime_state.resampler_runtime_kind ==
                     ResamplerRuntimeKind::NotUsed;
-            const bool final_output_conversion =
-                narrowing_required && !exact_s16_repack;
-            const bool final_s16_quantization =
-                output_format_.bits_per_sample == 16 &&
-                (final_output_conversion || dsp_active);
+            const bool final_s16_quantization = integer_output &&
+                integer_output_bits == 16 && !exact_s16_repack &&
+                (dsp_active || narrowing_required || storage_conversion_required);
             const Pcm16QuantizationRuntimeKind current_pcm16_quantization_runtime_kind =
                 final_s16_quantization
                     ? (pcm16_quantization_mode_ == Pcm16QuantizationMode::Truncate
@@ -1879,118 +1966,265 @@ void PlaybackEngine::playback_loop(std::uint64_t transport_generation) {
             const bool measure_level =
                 level_meter_enabled_.load(std::memory_order_relaxed);
             const bool detect_clip =
+                dsp_active &&
                 clip_detection_enabled_.load(std::memory_order_relaxed);
-            const double full_scale =
-                static_cast<double>(pcm_full_scale(format_.bits_per_sample));
-            const double minimum_scale =
-                static_cast<double>(pcm_minimum_sample(format_.bits_per_sample));
 
             float peak = 0.0f;
             std::uint32_t clipped_samples = 0;
-            if (dsp_active) {
+            bool use_output_block = false;
+            if (active_output_format == PcmOutputFormat::Float32) {
+                if (!dsp_active &&
+                    block.storage_format() == PcmStorageFormat::Float32) {
+                    const Float32PcmBuffer& samples = block.float32();
+                    for (std::size_t i = 0; i < got; ++i) {
+                        const float sample = samples[i];
+                        if (!std::isfinite(sample)) {
+                            throw std::runtime_error(
+                                "Decoder produced a non-finite floating PCM sample");
+                        }
+                        if (measure_level) {
+                            peak = std::max(peak, std::fabs(sample));
+                        }
+                    }
+                } else {
+                    output_block.clear();
+                    output_block.ensure_storage(PcmStorageFormat::Float32);
+                    output_block.resize(got);
+                    Float32PcmBuffer& converted = output_block.float32();
+                    use_output_block = true;
+                    const double native_to_normalized_scale =
+                        block.storage_format() == PcmStorageFormat::NativeInt32
+                            ? 1.0 / native_pcm_units_per_unity(
+                                  format_.bits_per_sample)
+                            : 1.0;
+                    for (std::size_t i = 0; i < got; ++i) {
+                        const std::size_t channel_index = i % ch;
+                        const bool left = (ch == 1) || (channel_index == 0);
+                        double sample = normalized_sample(
+                            block, i, native_to_normalized_scale);
+                        if (dsp_active) {
+                            if (tone_processing_for_frame) {
+                                sample = tone_filter.process(sample, left);
+                                if (channel_index + 1 == ch) {
+                                    tone_filter.advance_frame();
+                                    tone_processing_for_frame =
+                                        tone_filter.requires_processing();
+                                }
+                            }
+                            sample *= user_volume;
+                        }
+                        if (!std::isfinite(sample)) {
+                            throw std::runtime_error(
+                                "DSP produced a non-finite floating PCM sample");
+                        }
+                        if (measure_level) {
+                            peak = std::max(
+                                peak, static_cast<float>(std::fabs(sample)));
+                        }
+                        if (detect_clip && (sample > 1.0 || sample < -1.0)) {
+                            ++clipped_samples;
+                        }
+                        const float final_sample = static_cast<float>(sample);
+                        if (!std::isfinite(final_sample)) {
+                            throw std::runtime_error(
+                                "Float32 output cannot represent a finite PCM sample");
+                        }
+                        // Deliberately do not clamp to nominal full scale here.
+                        // Float32 output preserves over-range PCM for downstream
+                        // ALSA/PipeWire processing or the eventual integer boundary.
+                        converted[i] = final_sample;
+                    }
+                }
+            } else if (active_output_format == PcmOutputFormat::Float64) {
+                if (!dsp_active &&
+                    block.storage_format() == PcmStorageFormat::Float64) {
+                    const Float64PcmBuffer& samples = block.float64();
+                    for (std::size_t i = 0; i < got; ++i) {
+                        const double sample = samples[i];
+                        if (!std::isfinite(sample)) {
+                            throw std::runtime_error(
+                                "Decoder produced a non-finite floating PCM sample");
+                        }
+                        if (measure_level) {
+                            peak = std::max(
+                                peak, static_cast<float>(std::fabs(sample)));
+                        }
+                    }
+                } else {
+                    output_block.clear();
+                    output_block.ensure_storage(PcmStorageFormat::Float64);
+                    output_block.resize(got);
+                    Float64PcmBuffer& converted = output_block.float64();
+                    use_output_block = true;
+                    const double native_to_normalized_scale =
+                        block.storage_format() == PcmStorageFormat::NativeInt32
+                            ? 1.0 / native_pcm_units_per_unity(
+                                  format_.bits_per_sample)
+                            : 1.0;
+                    for (std::size_t i = 0; i < got; ++i) {
+                        const std::size_t channel_index = i % ch;
+                        const bool left = (ch == 1) || (channel_index == 0);
+                        double sample = normalized_sample(
+                            block, i, native_to_normalized_scale);
+                        if (dsp_active) {
+                            if (tone_processing_for_frame) {
+                                sample = tone_filter.process(sample, left);
+                                if (channel_index + 1 == ch) {
+                                    tone_filter.advance_frame();
+                                    tone_processing_for_frame =
+                                        tone_filter.requires_processing();
+                                }
+                            }
+                            sample *= user_volume;
+                        }
+                        if (!std::isfinite(sample)) {
+                            throw std::runtime_error(
+                                "DSP produced a non-finite floating PCM sample");
+                        }
+                        if (measure_level) {
+                            peak = std::max(
+                                peak, static_cast<float>(std::fabs(sample)));
+                        }
+                        if (detect_clip && (sample > 1.0 || sample < -1.0)) {
+                            ++clipped_samples;
+                        }
+                        // Deliberately do not clamp to nominal full scale here.
+                        // Float64 output passes finite over-range PCM unchanged.
+                        converted[i] = sample;
+                    }
+                }
+            } else if (dsp_active) {
+                output_block.clear();
+                output_block.ensure_storage(PcmStorageFormat::NativeInt32);
+                output_block.resize(got);
+                PcmBuffer& converted = output_block.native();
+                use_output_block = true;
+                const double native_to_normalized_scale =
+                    block.storage_format() == PcmStorageFormat::NativeInt32
+                        ? 1.0 / native_pcm_units_per_unity(
+                              format_.bits_per_sample)
+                        : 1.0;
+                const NormalizedIntegerQuantizer normalized_quantizer =
+                    make_normalized_integer_quantizer(integer_output_bits);
                 for (std::size_t i = 0; i < got; ++i) {
                     const std::size_t channel_index = i % ch;
                     const bool left = (ch == 1) || (channel_index == 0);
-                    double sample = static_cast<double>(block[i]);
-
+                    double sample = normalized_sample(
+                        block, i, native_to_normalized_scale);
                     if (tone_processing_for_frame) {
                         sample = tone_filter.process(sample, left);
                         if (channel_index + 1 == ch) {
                             tone_filter.advance_frame();
-                            tone_processing_for_frame = tone_filter.requires_processing();
+                            tone_processing_for_frame =
+                                tone_filter.requires_processing();
                         }
                     }
                     sample *= user_volume;
-
-                    if (measure_level) {
-                        const double meter_mag = full_scale > 0.0
-                            ? std::fabs(sample) / full_scale
-                            : 0.0;
-                        if (meter_mag > static_cast<double>(peak)) {
-                            peak = static_cast<float>(meter_mag);
-                        }
+                    if (!std::isfinite(sample)) {
+                        throw std::runtime_error(
+                            "DSP produced a non-finite floating PCM sample");
                     }
-                    if (detect_clip &&
-                        (sample > full_scale || sample < minimum_scale)) {
+                    if (measure_level) {
+                        peak = std::max(
+                            peak, static_cast<float>(std::fabs(sample)));
+                    }
+                    if (detect_clip && (sample > 1.0 || sample < -1.0)) {
                         ++clipped_samples;
                     }
-
-                    const double pcm16_dither_code_units = final_s16_dither
+                    const double dither_code_units = final_s16_dither
                         ? pcm16_dither.next_code_units(channel_index)
                         : 0.0;
-                    if (output_format_.bits_per_sample < format_.bits_per_sample) {
-                        output_block[i] = quantize_working_sample_to_bits(
-                            sample,
-                            format_.bits_per_sample,
-                            output_format_.bits_per_sample,
-                            pcm16_quantization_mode_,
-                            pcm16_dither_code_units);
+                    converted[i] = quantize_normalized_sample_to_bits(
+                        sample, normalized_quantizer, pcm16_quantization_mode_,
+                        dither_code_units);
+                }
+            } else if (block.storage_format() != PcmStorageFormat::NativeInt32) {
+                output_block.clear();
+                output_block.ensure_storage(PcmStorageFormat::NativeInt32);
+                output_block.resize(got);
+                PcmBuffer& converted = output_block.native();
+                use_output_block = true;
+                const NormalizedIntegerQuantizer normalized_quantizer =
+                    make_normalized_integer_quantizer(integer_output_bits);
+                for (std::size_t i = 0; i < got; ++i) {
+                    const double sample = normalized_sample(block, i, 1.0);
+                    if (measure_level) {
+                        peak = std::max(
+                            peak, static_cast<float>(std::fabs(sample)));
+                    }
+                    if (exact_s16_repack) {
+                        converted[i] = quantize_normalized_sample_to_bits(
+                            sample, normalized_quantizer, pcm16_quantization_mode_);
                     } else {
-                        block[i] = quantize_processed_sample(
-                            sample,
-                            format_.bits_per_sample,
-                            pcm16_quantization_mode_,
-                            pcm16_dither_code_units);
+                        const double dither_code_units = final_s16_dither
+                            ? pcm16_dither.next_code_units(i % ch)
+                            : 0.0;
+                        converted[i] = quantize_normalized_sample_to_bits(
+                            sample, normalized_quantizer,
+                            pcm16_quantization_mode_, dither_code_units);
                     }
                 }
             } else {
+                const PcmBuffer& native = block.native();
                 if (measure_level) {
-                    std::int64_t peak_magnitude = 0;
+                    std::int64_t max_positive = 0;
+                    std::int64_t min_negative = 0;
                     for (std::size_t i = 0; i < got; ++i) {
-                        const std::int64_t sample = static_cast<std::int64_t>(block[i]);
-                        const std::int64_t magnitude = sample < 0 ? -sample : sample;
-                        if (magnitude > peak_magnitude) {
-                            peak_magnitude = magnitude;
-                        }
+                        const std::int64_t value =
+                            static_cast<std::int64_t>(native[i]);
+                        max_positive = std::max(max_positive, value);
+                        min_negative = std::min(min_negative, value);
                     }
-                    if (full_scale > 0.0) {
-                        peak = static_cast<float>(
-                            static_cast<double>(peak_magnitude) / full_scale);
-                    }
+                    const double positive_scale = static_cast<double>(
+                        pcm_full_scale(format_.bits_per_sample));
+                    const double negative_scale = -static_cast<double>(
+                        pcm_minimum_sample(format_.bits_per_sample));
+                    const float positive_peak = static_cast<float>(
+                        static_cast<double>(max_positive) / positive_scale);
+                    const float negative_peak = static_cast<float>(
+                        static_cast<double>(-min_negative) / negative_scale);
+                    peak = std::max(peak, std::max(positive_peak, negative_peak));
                 }
                 if (narrowing_required) {
+                    output_block.clear();
+                    output_block.ensure_storage(PcmStorageFormat::NativeInt32);
+                    output_block.resize(got);
+                    PcmBuffer& converted = output_block.native();
+                    use_output_block = true;
+                    NativeNarrowingQuantizer native_narrowing_quantizer;
+                    if (!exact_s16_repack) {
+                        native_narrowing_quantizer = make_native_narrowing_quantizer(
+                            format_.bits_per_sample, integer_output_bits,
+                            pcm16_quantization_mode_);
+                    }
                     for (std::size_t i = 0; i < got; ++i) {
                         if (exact_s16_repack) {
-                            output_block[i] = narrow_exact_working_sample(
-                                block[i],
-                                format_.bits_per_sample,
-                                output_format_.bits_per_sample);
-                        } else if (output_format_.bits_per_sample == 16) {
-                            if (final_s16_dither) {
-                                const double pcm16_dither_code_units =
-                                    pcm16_dither.next_code_units(i % ch);
-                                output_block[i] =
-                                    quantize_integer_working_sample_to_pcm16_with_dither(
-                                        block[i],
-                                        format_.bits_per_sample,
-                                        pcm16_quantization_mode_,
-                                        pcm16_dither_code_units);
-                            } else {
-                                output_block[i] = quantize_integer_working_sample_to_pcm16(
-                                    block[i],
-                                    format_.bits_per_sample,
-                                    pcm16_quantization_mode_);
-                            }
+                            converted[i] = narrow_exact_native_sample(
+                                native[i], format_.bits_per_sample,
+                                integer_output_bits);
                         } else {
-                            output_block[i] = quantize_working_sample_to_bits(
-                                static_cast<double>(block[i]),
-                                format_.bits_per_sample,
-                                output_format_.bits_per_sample,
-                                pcm16_quantization_mode_);
+                            const double dither_code_units = final_s16_dither
+                                ? pcm16_dither.next_code_units(i % ch)
+                                : 0.0;
+                            converted[i] = quantize_native_sample_to_bits(
+                                native[i], native_narrowing_quantizer,
+                                dither_code_units);
                         }
                     }
                 }
             }
 
-            backend_->write_samples(
-                narrowing_required ? output_block.data() : block.data(),
-                got);
+            const PcmBlock& backend_block = use_output_block
+                ? output_block
+                : block;
+            backend_->write_samples(backend_block, 0, got);
 
             // Publish visualization facts only after the PCM block has been
             // accepted by the output backend.  The GUI owns the display
             // ballistics; the playback thread only accumulates raw facts.
             if (measure_level) {
-                publish_meter_peak(level_meter_peak_units_, peak);
+                const float visible_peak = dsp_active ? peak : std::min(peak, 1.0f);
+                publish_meter_peak(level_meter_peak_units_, visible_peak);
             }
             if (detect_clip && clipped_samples > 0) {
                 std::uint32_t published_clips =

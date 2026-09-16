@@ -19,12 +19,13 @@ public:
     void open(const std::string& path) override;
     void open_at_sample(const std::string& path, std::uint64_t sample_index) override;
     const AudioFormat& format() const override;
-    std::size_t read_samples(PcmSample* destination, std::size_t max_samples) override;
+    std::size_t read_samples(PcmBlock& destination, std::size_t max_samples) override;
     bool eof() const override;
     std::uint64_t total_samples_per_channel() const override;
     std::string source_path() const override;
     PresentationEndKind presentation_end_kind() const noexcept override;
     TransportTruncationKind transport_truncation_kind() const noexcept override;
+    PcmStorageFormat pcm_storage_format() const noexcept override;
     ResamplerRuntimeKind resampler_runtime_kind() const noexcept override;
     Pcm16QuantizationRuntimeKind pcm16_quantization_runtime_kind() const noexcept override;
     std::uint32_t pcm16_quantization_stage_count() const noexcept override;

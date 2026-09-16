@@ -1,4 +1,4 @@
-# PCM Transport v0.9.119
+# PCM Transport v0.9.120
 
 **PCM Transport** is a Linux desktop audio player focused on direct PCM playback, predictable DSP, and clear signal-path reporting.
 
@@ -33,21 +33,21 @@ Portions copyright © 2026 PCM Transport contributors.
 
 - GTK 3 desktop interface
 - Direct ALSA output
-- Native FLAC decoding through libFLAC
+- Native FLAC decoding through libFLAC when sample-rate conversion is not required
 - Direct FFmpeg library decoding for MP3, M4A, OGG, WAV, AIFF, APE, WV and other formats
 - CUE support, including continuous CUE image playback
 - Local M3U / M3U8 playlist import
 - UTF-8 and Windows-1251 normalization for legacy metadata
-- Same-format gapless playback where possible
-- Optional SoXR sample-rate conversion and configurable output precision
-- Baxandall-style Bass/Treble controls
+- Gapless playback across compatible tracks
+- SoXR sample-rate conversion with FFmpeg SWR fallback and configurable output precision
+- Baxandall-like bass/treble controls
 - MPRIS integration (media keys, cover art)
 
 ---
 
 ## Supported formats
 
-Native / primary:
+Primary inputs:
 
 ```text
 *.flac
@@ -58,7 +58,7 @@ Native / primary:
 *.m3u8
 ```
 
-FFmpeg library-backed lossless / PCM / container formats:
+Additional FFmpeg-backed formats:
 
 ```text
 *.aif
@@ -75,11 +75,6 @@ FFmpeg library-backed lossless / PCM / container formats:
 *.tta
 *.dsf
 *.dff
-```
-
-FFmpeg library-backed lossy formats:
-
-```text
 *.mp3
 *.mp2
 *.m4a
@@ -104,17 +99,16 @@ FFmpeg library-backed lossy formats:
 *.mpp
 ```
 
-FFmpeg-backed formats use the libavformat, libavcodec, libavutil and
-libswresample shared libraries. The ffmpeg and ffprobe command-line
-tools are not required. Rare-format support depends on the local
-FFmpeg library build.
+Additional formats and conversion paths use the libavformat, libavcodec,
+libavutil and libswresample libraries directly. The ffmpeg and ffprobe
+command-line tools are not used. Codec support depends on the local FFmpeg build.
 
 ## Playback notes
 
-- For the cleanest ALSA path, select a direct `hw:X,Y` device and avoid forced conversion rules.
-- DSP is bypassed when Bass/Treble are neutral, volume is 100%, and Pre-EQ Headroom is 0 dB.
+- For a direct ALSA hardware path, select a `hw:X,Y` device and avoid forced conversion rules.
+- Tonal DSP is inactive at 0 dB bass/treble and 0 dB Pre-EQ headroom; soft volume is inactive at 100%.
 - The CLIP indicator reports DSP-path clipping only; it is not a full-chain detector.
-- Native FLAC is used when no Processing Rules are applied.
+- Native FLAC decoding is used when no sample-rate conversion is required.
 - DSD sources (DSF/DFF) are played via PCM conversion; native DSD output is not available.
 
 ---
@@ -208,9 +202,9 @@ baseline, unavailable optional capabilities degrade conservatively without
 disabling normal playback. Cross-major FFmpeg ABI compatibility is not
 assumed; build against the libraries supplied by the target distribution.
 
-FLAC decoding remains native through libFLAC when no Processing Rules
-are active. PCM Transport is also linked against the FFmpeg shared
-libraries for other formats, metadata fallback and conversion paths.
+FLAC decoding remains native through libFLAC when sample-rate conversion
+is not required. Other formats, metadata fallback and conversion paths use
+the FFmpeg libraries directly.
 The ffmpeg and ffprobe command-line tools are not used. RTKit support uses GLib/GIO 2.52+ D-Bus; no separate RTKit build dependency is required. Direct realtime permission can be granted through pkexec/setcap cap_sys_nice and requires a player restart.
 
 ---

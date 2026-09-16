@@ -99,7 +99,7 @@ public:
     void start(std::unique_ptr<IAudioDecoder> decoder,
                std::unique_ptr<IAudioBackend> backend,
                const std::string& device_name,
-               const std::vector<std::uint16_t>& output_precision_candidates,
+               const std::vector<PcmOutputFormat>& output_format_candidates,
                std::uint64_t initial_samples_per_channel = 0,
                std::vector<std::uint64_t> logical_segment_offsets = {},
                Pcm16QuantizationMode pcm16_quantization_mode =
@@ -124,6 +124,8 @@ public:
     void set_clip_detection_enabled(bool enabled);
     int bass_db() const;
     int treble_db() const;
+    PcmStorageFormat pcm_storage_format() const noexcept;
+    PcmOutputFormat output_format() const noexcept;
     ResamplerRuntimeKind resampler_runtime_kind() const noexcept;
     Pcm16QuantizationRuntimeKind pcm16_quantization_runtime_kind() const noexcept;
     std::uint32_t pcm16_quantization_stage_count() const noexcept;
@@ -194,6 +196,9 @@ private:
     std::atomic<std::uint64_t> live_segment_samples_per_channel_{0};
     std::atomic<ResamplerRuntimeKind> resampler_runtime_kind_{
         ResamplerRuntimeKind::NotUsed};
+    std::atomic<PcmStorageFormat> pcm_storage_format_{
+        PcmStorageFormat::NativeInt32};
+    std::atomic<PcmOutputFormat> output_sample_format_{PcmOutputFormat::S16};
     std::atomic<Pcm16QuantizationRuntimeKind> pcm16_quantization_runtime_kind_{
         Pcm16QuantizationRuntimeKind::NotUsed};
     std::atomic<std::uint32_t> pcm16_quantization_stage_count_{0};
@@ -227,7 +232,7 @@ private:
     std::atomic<int> bass_hz_{110};
     std::atomic<int> treble_hz_{10000};
     std::atomic<bool> level_meter_enabled_{true};
-    std::atomic<bool> clip_detection_enabled_{true};
+    std::atomic<bool> clip_detection_enabled_{false};
     // Valid values are Q24 peak magnitudes; all-bits-one means that no PCM
     // measurement has been published since the previous GUI consume.
     std::atomic<std::uint32_t> level_meter_peak_units_{~std::uint32_t{0}};

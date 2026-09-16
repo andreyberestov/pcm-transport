@@ -2226,6 +2226,16 @@ void set_swr_option_int(SwrContext* context, const char* name, std::int64_t valu
     }
 }
 
+void set_swr_option_sample_fmt(SwrContext* context,
+                               const char* name,
+                               AVSampleFormat format) {
+    const int result = av_opt_set_sample_fmt(context, name, format, 0);
+    if (result < 0) {
+        throw std::runtime_error(std::string("Cannot set FFmpeg resampler option ") +
+                                 name + ": " + av_error_string(result));
+    }
+}
+
 } // namespace
 
 struct ExternalAudioDecoder::Impl {
@@ -2242,11 +2252,15 @@ struct ExternalAudioDecoder::Impl {
     bool swr_drained = false;
     std::atomic<bool> abort_requested{false};
     InterruptState interrupt{};
-    std::vector<PcmSample> pending_samples;
+    PcmBlock pending_samples;
     std::size_t pending_offset = 0;
     std::vector<std::int16_t> conversion_buffer_s16;
     std::vector<std::int32_t> conversion_buffer_s32;
+    std::vector<float> conversion_buffer_float;
+    std::vector<double> conversion_buffer_double;
     std::vector<const std::uint8_t*> input_planes;
+    std::atomic<PcmStorageFormat> pcm_storage_format{
+        PcmStorageFormat::NativeInt32};
     std::atomic<ResamplerRuntimeKind> resampler_runtime_kind{
         ResamplerRuntimeKind::NotUsed};
     std::atomic<Pcm16QuantizationRuntimeKind> pcm16_quantization_runtime_kind{
@@ -2266,6 +2280,9 @@ struct ExternalAudioDecoder::Impl {
     int configured_input_rate = 0;
     AVSampleFormat configured_input_format = AV_SAMPLE_FMT_NONE;
     int configured_channels = 0;
+    PcmStorageFormat configured_pcm_storage_format =
+        PcmStorageFormat::NativeInt32;
+    bool pcm_storage_locked = false;
 #if PCMTP_FFMPEG_HAS_MODERN_CHANNEL_LAYOUT
     AVChannelLayout configured_input_layout{};
     bool configured_input_layout_valid = false;
@@ -2313,6 +2330,8 @@ struct ExternalAudioDecoder::Impl {
         swr_drained = false;
         pending_samples.clear();
         pending_offset = 0;
+        pcm_storage_format.store(
+            PcmStorageFormat::NativeInt32, std::memory_order_release);
         resampler_runtime_kind.store(
             ResamplerRuntimeKind::NotUsed, std::memory_order_release);
         pcm16_quantization_runtime_kind.store(
@@ -2329,6 +2348,8 @@ struct ExternalAudioDecoder::Impl {
         expected_input_timeline_sample = 0;
         expected_input_timeline_known = false;
         timestamp_discontinuity_reported = false;
+        configured_pcm_storage_format = PcmStorageFormat::NativeInt32;
+        pcm_storage_locked = false;
         consecutive_decode_errors = 0;
     }
 };
@@ -2533,10 +2554,55 @@ void ExternalAudioDecoder::close_decoder() {
 
 namespace {
 
+bool floating_sample_format(AVSampleFormat format) noexcept {
+    const AVSampleFormat packed = av_get_packed_sample_fmt(format);
+    return packed == AV_SAMPLE_FMT_FLT || packed == AV_SAMPLE_FMT_DBL;
+}
+
+bool double_sample_format(AVSampleFormat format) noexcept {
+    return av_get_packed_sample_fmt(format) == AV_SAMPLE_FMT_DBL;
+}
+
+bool high_precision_resample_quality(const std::string& quality) noexcept {
+    return quality == "high" || quality == "maximum";
+}
+
+PcmStorageFormat processed_pcm_storage_format(
+    AVSampleFormat input_format,
+    bool dsd_source,
+    bool lossless_source,
+    bool resampling_active,
+    std::uint16_t decoded_significant_bits,
+    const std::string& resample_quality) noexcept {
+    const bool processed = dsd_source || resampling_active || !lossless_source ||
+                           floating_sample_format(input_format);
+    if (!processed) {
+        return PcmStorageFormat::NativeInt32;
+    }
+    if (double_sample_format(input_format)) {
+        return PcmStorageFormat::Float64;
+    }
+    if (lossless_source && resampling_active && decoded_significant_bits > 24 &&
+        high_precision_resample_quality(resample_quality)) {
+        return PcmStorageFormat::Float64;
+    }
+    return PcmStorageFormat::Float32;
+}
+
 template <typename DecoderImpl>
 std::uint8_t* prepare_conversion_buffer(DecoderImpl& impl,
                                         const AudioFormat& output_format,
+                                        PcmStorageFormat storage_format,
                                         std::size_t sample_count) {
+    if (storage_format == PcmStorageFormat::Float64) {
+        impl.conversion_buffer_double.resize(sample_count);
+        return reinterpret_cast<std::uint8_t*>(
+            impl.conversion_buffer_double.data());
+    }
+    if (storage_format == PcmStorageFormat::Float32) {
+        impl.conversion_buffer_float.resize(sample_count);
+        return reinterpret_cast<std::uint8_t*>(impl.conversion_buffer_float.data());
+    }
     if (output_format.bits_per_sample <= 16) {
         impl.conversion_buffer_s16.resize(sample_count);
         return reinterpret_cast<std::uint8_t*>(impl.conversion_buffer_s16.data());
@@ -2548,18 +2614,33 @@ std::uint8_t* prepare_conversion_buffer(DecoderImpl& impl,
 template <typename DecoderImpl>
 void append_conversion_buffer(DecoderImpl& impl,
                               const AudioFormat& output_format,
+                              PcmStorageFormat storage_format,
                               std::size_t sample_count) {
-    const std::size_t old_size = impl.pending_samples.size();
-    impl.pending_samples.resize(old_size + sample_count);
+    if (sample_count == 0) {
+        return;
+    }
+    if (storage_format == PcmStorageFormat::Float64) {
+        impl.pending_samples.append(impl.conversion_buffer_double.data(), sample_count);
+        return;
+    }
+    if (storage_format == PcmStorageFormat::Float32) {
+        impl.pending_samples.append(impl.conversion_buffer_float.data(), sample_count);
+        return;
+    }
+
+    impl.pending_samples.ensure_storage(PcmStorageFormat::NativeInt32);
+    PcmBuffer& pending = impl.pending_samples.native();
+    const std::size_t old_size = pending.size();
+    pending.resize(old_size + sample_count);
     if (output_format.bits_per_sample <= 16) {
         for (std::size_t i = 0; i < sample_count; ++i) {
-            impl.pending_samples[old_size + i] = impl.conversion_buffer_s16[i];
+            pending[old_size + i] = impl.conversion_buffer_s16[i];
         }
     } else {
         const int shift = output_format.bits_per_sample == 24 ? 8 : 0;
         for (std::size_t i = 0; i < sample_count; ++i) {
             const std::int32_t input = impl.conversion_buffer_s32[i];
-            impl.pending_samples[old_size + i] = shift > 0 ? (input >> shift) : input;
+            pending[old_size + i] = shift > 0 ? (input >> shift) : input;
         }
     }
 }
@@ -2584,7 +2665,11 @@ int drain_resampler_chunk(DecoderImpl& impl, const AudioFormat& output_format) {
     const std::size_t sample_capacity =
         static_cast<std::size_t>(capacity) * output_format.channels;
     std::uint8_t* output_planes[1] = {
-        prepare_conversion_buffer(impl, output_format, sample_capacity)
+        prepare_conversion_buffer(
+            impl,
+            output_format,
+            impl.configured_pcm_storage_format,
+            sample_capacity)
     };
     const int frames = swr_convert(
         impl.swr_context, output_planes, capacity, nullptr, 0);
@@ -2596,6 +2681,7 @@ int drain_resampler_chunk(DecoderImpl& impl, const AudioFormat& output_format) {
         append_conversion_buffer(
             impl,
             output_format,
+            impl.configured_pcm_storage_format,
             static_cast<std::size_t>(frames) * output_format.channels);
     }
     return frames;
@@ -2797,6 +2883,36 @@ void configure_resampler(DecoderImpl& impl,
         impl.decoded_pcm_significant_bits,
         decoded_significant_bits) || runtime_state_changed;
 
+    const bool forced_rate_active =
+        forced_output_sample_rate > 0 &&
+        forced_output_sample_rate != source_format.sample_rate;
+    const bool resampling_active = forced_rate_active;
+    const PcmStorageFormat preferred_storage_format =
+        processed_pcm_storage_format(
+            input_format,
+            dsd_source,
+            lossless_source,
+            resampling_active,
+            decoded_significant_bits,
+            resample_quality);
+    PcmStorageFormat output_storage_format = preferred_storage_format;
+    if (impl.pcm_storage_locked) {
+        const PcmStorageFormat locked_storage =
+            impl.pcm_storage_format.load(std::memory_order_acquire);
+        const bool float64_to_float32_swr_fallback =
+            locked_storage == PcmStorageFormat::Float32 &&
+            preferred_storage_format == PcmStorageFormat::Float64 &&
+            impl.resampler_runtime_kind.load(std::memory_order_acquire) ==
+                ResamplerRuntimeKind::FfmpegSwr &&
+            !double_sample_format(input_format);
+        if (preferred_storage_format != locked_storage &&
+            !float64_to_float32_swr_fallback) {
+            throw std::runtime_error(
+                "Decoded PCM storage format changed within one audio stream");
+        }
+        output_storage_format = locked_storage;
+    }
+
 #if PCMTP_FFMPEG_HAS_MODERN_CHANNEL_LAYOUT
     ChannelLayoutGuard input_layout(
         resolved_input_layout(frame, impl.codec_context, channels));
@@ -2822,68 +2938,80 @@ void configure_resampler(DecoderImpl& impl,
     }
 
     if (impl.swr_context != nullptr) {
+        output_storage_format = impl.configured_pcm_storage_format;
         if (!impl.seeking) {
             drain_resampler_fully(impl, output_format);
         }
     }
 
-    const bool forced_rate_active =
-        forced_output_sample_rate > 0 &&
-        forced_output_sample_rate != source_format.sample_rate;
-    const bool resampling_active = forced_rate_active;
-    const AVSampleFormat output_sample_format =
-        output_format.bits_per_sample <= 16
-            ? AV_SAMPLE_FMT_S16
-            : AV_SAMPLE_FMT_S32;
+    const auto output_sample_format_for =
+        [&](PcmStorageFormat storage_format) {
+            if (storage_format == PcmStorageFormat::Float64) {
+                return AV_SAMPLE_FMT_DBL;
+            }
+            if (storage_format == PcmStorageFormat::Float32) {
+                return AV_SAMPLE_FMT_FLT;
+            }
+            return output_format.bits_per_sample <= 16
+                ? AV_SAMPLE_FMT_S16
+                : AV_SAMPLE_FMT_S32;
+        };
 #if PCMTP_FFMPEG_HAS_MODERN_CHANNEL_LAYOUT
     ChannelLayoutGuard output_layout;
     av_channel_layout_default(output_layout.get(), output_format.channels);
-    const auto allocate_resampler_context = [&]() -> SwrContext* {
-        SwrContext* context = nullptr;
-        const int result = swr_alloc_set_opts2(
-            &context,
-            output_layout.get(),
-            output_sample_format,
-            static_cast<int>(output_format.sample_rate),
-            input_layout.get(),
-            input_format,
-            input_rate,
-            0,
-            nullptr);
-        if (result < 0) {
-            swr_free(&context);
-            throw std::runtime_error(
-                "Cannot configure FFmpeg API resampler: " + av_error_string(result));
-        }
-        return context;
-    };
+    const auto allocate_resampler_context =
+        [&](PcmStorageFormat storage_format) -> SwrContext* {
+            SwrContext* context = nullptr;
+            const int result = swr_alloc_set_opts2(
+                &context,
+                output_layout.get(),
+                output_sample_format_for(storage_format),
+                static_cast<int>(output_format.sample_rate),
+                input_layout.get(),
+                input_format,
+                input_rate,
+                0,
+                nullptr);
+            if (result < 0) {
+                swr_free(&context);
+                throw std::runtime_error(
+                    "Cannot configure FFmpeg API resampler: " + av_error_string(result));
+            }
+            return context;
+        };
 #else
     const std::int64_t output_layout =
         av_get_default_channel_layout(output_format.channels);
-    const auto allocate_resampler_context = [&]() -> SwrContext* {
-        SwrContext* context = swr_alloc_set_opts(
-            nullptr,
-            output_layout,
-            output_sample_format,
-            static_cast<int>(output_format.sample_rate),
-            static_cast<std::int64_t>(input_layout),
-            input_format,
-            input_rate,
-            0,
-            nullptr);
-        if (context == nullptr) {
-            throw std::runtime_error("Cannot configure FFmpeg API resampler");
-        }
-        return context;
-    };
+    const auto allocate_resampler_context =
+        [&](PcmStorageFormat storage_format) -> SwrContext* {
+            SwrContext* context = swr_alloc_set_opts(
+                nullptr,
+                output_layout,
+                output_sample_format_for(storage_format),
+                static_cast<int>(output_format.sample_rate),
+                static_cast<std::int64_t>(input_layout),
+                input_format,
+                input_rate,
+                0,
+                nullptr);
+            if (context == nullptr) {
+                throw std::runtime_error("Cannot configure FFmpeg API resampler");
+            }
+            return context;
+        };
 #endif
 
-    const auto apply_output_options = [&](SwrContext* context) {
-        set_swr_option_int(context, "dither_method", SWR_DITHER_NONE);
-    };
+    const auto apply_output_options =
+        [&](SwrContext* context, PcmStorageFormat storage_format) {
+            set_swr_option_int(context, "dither_method", SWR_DITHER_NONE);
+            if (storage_format == PcmStorageFormat::Float64) {
+                set_swr_option_sample_fmt(
+                    context, "internal_sample_fmt", AV_SAMPLE_FMT_DBLP);
+            }
+        };
 
     SwrContextGuard new_context;
-    new_context.reset(allocate_resampler_context());
+    new_context.reset(allocate_resampler_context(output_storage_format));
     bool initialized = false;
     ResamplerRuntimeKind runtime_kind = ResamplerRuntimeKind::NotUsed;
     int soxr_failure = 0;
@@ -2899,7 +3027,7 @@ void configure_resampler(DecoderImpl& impl,
             option_result = av_opt_set_int(new_context.get(), "cheby", 0, 0);
         }
         if (option_result >= 0) {
-            apply_output_options(new_context.get());
+            apply_output_options(new_context.get(), output_storage_format);
             const int init_result = swr_init(new_context.get());
             if (init_result >= 0) {
                 initialized = true;
@@ -2919,12 +3047,19 @@ void configure_resampler(DecoderImpl& impl,
                 warning += ": " + av_error_string(soxr_failure);
             }
             Logger::instance().warning(warning);
-            new_context.reset(allocate_resampler_context());
+            if (preferred_storage_format == PcmStorageFormat::Float64 &&
+                !double_sample_format(input_format)) {
+                // Keep the built-in SWR fallback on Float32 for integer sources;
+                // Float64 is reserved for the high-precision SoXR path.
+                output_storage_format = PcmStorageFormat::Float32;
+            }
+            new_context.reset(
+                allocate_resampler_context(output_storage_format));
         }
     }
 
     if (!initialized) {
-        apply_output_options(new_context.get());
+        apply_output_options(new_context.get(), output_storage_format);
         const int init_result = swr_init(new_context.get());
         if (init_result < 0) {
             throw std::runtime_error(
@@ -2953,6 +3088,7 @@ void configure_resampler(DecoderImpl& impl,
     impl.configured_input_rate = input_rate;
     impl.configured_input_format = input_format;
     impl.configured_channels = channels;
+    impl.configured_pcm_storage_format = output_storage_format;
 #if PCMTP_FFMPEG_HAS_MODERN_CHANNEL_LAYOUT
     impl.configured_input_layout = retained_input_layout.release();
     impl.configured_input_layout_valid = true;
@@ -2960,6 +3096,8 @@ void configure_resampler(DecoderImpl& impl,
     impl.configured_input_layout = input_layout;
 #endif
     impl.swr_drained = false;
+    runtime_state_changed = impl.update_runtime_value(
+        impl.pcm_storage_format, output_storage_format) || runtime_state_changed;
     runtime_state_changed = impl.update_runtime_value(
         impl.resampler_runtime_kind, runtime_kind) || runtime_state_changed;
     const AVSampleFormat packed_input_format =
@@ -3089,8 +3227,17 @@ std::optional<std::size_t> append_native_lossless_frame_fast(
     }
     const std::size_t frames = static_cast<std::size_t>(frame->nb_samples);
     const std::size_t sample_count = frames * static_cast<std::size_t>(channels);
-    const std::size_t old_size = impl.pending_samples.size();
-    impl.pending_samples.resize(old_size + sample_count);
+    if (impl.pcm_storage_locked &&
+        impl.pcm_storage_format.load(std::memory_order_acquire) !=
+            PcmStorageFormat::NativeInt32) {
+        throw std::runtime_error(
+            "Decoded PCM storage format changed within one audio stream");
+    }
+    impl.pcm_storage_locked = true;
+    impl.pending_samples.ensure_storage(PcmStorageFormat::NativeInt32);
+    PcmBuffer& pending_samples = impl.pending_samples.native();
+    const std::size_t old_size = pending_samples.size();
+    pending_samples.resize(old_size + sample_count);
     const bool planar = av_sample_fmt_is_planar(input_format) != 0;
 
     if (direct_s16) {
@@ -3100,14 +3247,14 @@ std::optional<std::size_t> append_native_lossless_frame_fast(
                 for (int ch = 0; ch < channels; ++ch) {
                     const auto* plane = reinterpret_cast<const std::int16_t*>(
                         frame->extended_data[ch]);
-                    impl.pending_samples[out++] = static_cast<PcmSample>(plane[i]);
+                    pending_samples[out++] = static_cast<PcmSample>(plane[i]);
                 }
             }
         } else {
             const auto* input = reinterpret_cast<const std::int16_t*>(
                 frame->extended_data[0]);
             for (std::size_t i = 0; i < sample_count; ++i) {
-                impl.pending_samples[old_size + i] = static_cast<PcmSample>(input[i]);
+                pending_samples[old_size + i] = static_cast<PcmSample>(input[i]);
             }
         }
     } else {
@@ -3117,13 +3264,13 @@ std::optional<std::size_t> append_native_lossless_frame_fast(
                 for (int ch = 0; ch < channels; ++ch) {
                     const auto* plane = reinterpret_cast<const std::int32_t*>(
                         frame->extended_data[ch]);
-                    impl.pending_samples[out++] = static_cast<PcmSample>(plane[i]);
+                    pending_samples[out++] = static_cast<PcmSample>(plane[i]);
                 }
             }
         } else {
             const auto* input = reinterpret_cast<const std::int32_t*>(
                 frame->extended_data[0]);
-            std::copy_n(input, sample_count, impl.pending_samples.data() + old_size);
+            std::copy_n(input, sample_count, pending_samples.data() + old_size);
         }
     }
 
@@ -3135,6 +3282,9 @@ std::optional<std::size_t> append_native_lossless_frame_fast(
         bool runtime_state_changed = impl.update_runtime_value(
             impl.decoded_pcm_sample_kind,
             decoder_pcm_sample_kind_from_av(input_format));
+        runtime_state_changed = impl.update_runtime_value(
+            impl.pcm_storage_format,
+            PcmStorageFormat::NativeInt32) || runtime_state_changed;
         runtime_state_changed = impl.update_runtime_value(
             impl.decoded_pcm_significant_bits,
             source_format.bits_per_sample) || runtime_state_changed;
@@ -3150,6 +3300,7 @@ std::optional<std::size_t> append_native_lossless_frame_fast(
         impl.configured_input_rate = input_rate;
         impl.configured_input_format = input_format;
         impl.configured_channels = channels;
+        impl.configured_pcm_storage_format = PcmStorageFormat::NativeInt32;
         impl.publish_runtime_state_change(runtime_state_changed);
     }
     impl.swr_drained = true;
@@ -3206,7 +3357,11 @@ std::size_t append_converted_frame(DecoderImpl& impl,
     const std::size_t sample_capacity =
         static_cast<std::size_t>(output_capacity) * output_format.channels;
     std::uint8_t* output_planes[1] = {
-        prepare_conversion_buffer(impl, output_format, sample_capacity)
+        prepare_conversion_buffer(
+            impl,
+            output_format,
+            impl.configured_pcm_storage_format,
+            sample_capacity)
     };
 
     const int input_plane_count =
@@ -3230,7 +3385,14 @@ std::size_t append_converted_frame(DecoderImpl& impl,
     }
     const std::size_t sample_count =
         static_cast<std::size_t>(output_frames) * output_format.channels;
-    append_conversion_buffer(impl, output_format, sample_count);
+    append_conversion_buffer(
+        impl,
+        output_format,
+        impl.configured_pcm_storage_format,
+        sample_count);
+    if (sample_count > 0) {
+        impl.pcm_storage_locked = true;
+    }
     return sample_count;
 }
 
@@ -3340,6 +3502,14 @@ void ExternalAudioDecoder::open_at_sample(const std::string& path, std::uint64_t
     source_format_ = info.source_format.sample_rate > 0 ? info.source_format : info.format;
     dsd_source_ = info.dsd_source;
     lossless_source_ = info.lossless;
+    const bool forced_rate_active =
+        forced_output_sample_rate_ > 0 &&
+        forced_output_sample_rate_ != source_format_.sample_rate;
+    const bool floating_pcm_source =
+        info.codec_name.rfind("pcm_f", 0) == 0;
+    if (dsd_source_ || forced_rate_active || !lossless_source_ || floating_pcm_source) {
+        format_.bits_per_sample = 32;
+    }
     presentation_timeline_origin_sample_ = 0;
     if (info.source_presentation_start_known &&
         source_format_.sample_rate > 0 && format_.sample_rate > 0 &&
@@ -3378,11 +3548,12 @@ const AudioFormat& ExternalAudioDecoder::format() const {
 }
 
 
-std::size_t ExternalAudioDecoder::read_samples(PcmSample* destination, std::size_t max_samples) {
+std::size_t ExternalAudioDecoder::read_samples(PcmBlock& destination,
+                                               std::size_t max_samples) {
     if (!opened_ || impl_->format_context == nullptr || impl_->codec_context == nullptr) {
         throw std::runtime_error("Decoder not opened");
     }
-    if (destination == nullptr || max_samples == 0) {
+    if (max_samples == 0) {
         return 0;
     }
     if (impl_->abort_requested.load(std::memory_order_acquire)) {
@@ -3410,8 +3581,7 @@ std::size_t ExternalAudioDecoder::read_samples(PcmSample* destination, std::size
         std::size_t count = std::min(max_samples - written, available);
         count -= count % channels;
         if (count == 0) return;
-        std::copy_n(impl_->pending_samples.data() + impl_->pending_offset, count,
-                    destination + written);
+        destination.append_from(impl_->pending_samples, impl_->pending_offset, count);
         impl_->pending_offset += count;
         written += count;
         current_samples_per_channel_ += count / channels;
@@ -3448,11 +3618,8 @@ std::size_t ExternalAudioDecoder::read_samples(PcmSample* destination, std::size
             const std::size_t drop_samples =
                 static_cast<std::size_t>(drop_frames) * channels;
             if (drop_samples < produced_samples) {
-                impl_->pending_samples.erase(
-                    impl_->pending_samples.begin() +
-                        static_cast<std::ptrdiff_t>(pending_before),
-                    impl_->pending_samples.begin() +
-                        static_cast<std::ptrdiff_t>(pending_before + drop_samples));
+                impl_->pending_samples.erase_range(
+                    pending_before, pending_before + drop_samples);
             } else {
                 impl_->pending_samples.resize(pending_before);
                 return;
@@ -3668,6 +3835,13 @@ PresentationEndKind ExternalAudioDecoder::presentation_end_kind() const noexcept
     return presentation_end_kind_;
 }
 
+PcmStorageFormat ExternalAudioDecoder::pcm_storage_format() const noexcept {
+    if (!opened_ || impl_ == nullptr) {
+        return PcmStorageFormat::NativeInt32;
+    }
+    return impl_->pcm_storage_format.load(std::memory_order_acquire);
+}
+
 ResamplerRuntimeKind ExternalAudioDecoder::resampler_runtime_kind() const noexcept {
     if (!opened_ || impl_ == nullptr) {
         return ResamplerRuntimeKind::NotUsed;
@@ -3732,6 +3906,7 @@ DecoderRuntimeStateSnapshot ExternalAudioDecoder::runtime_state_snapshot() const
         return state;
     }
     state.generation = runtime_state_generation();
+    state.pcm_storage_format = pcm_storage_format();
     state.resampler_runtime_kind = resampler_runtime_kind();
     state.pcm16_quantization_runtime_kind = pcm16_quantization_runtime_kind();
     state.pcm16_quantization_stage_count = pcm16_quantization_stage_count();

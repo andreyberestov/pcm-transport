@@ -27,9 +27,12 @@ struct AlsaProbeCell {
 
 struct AlsaProbeMatrix {
     std::string device_name;
+    std::string plug_device_name;
     std::vector<unsigned> sample_rates;
     std::vector<std::string> format_names;
     std::vector<AlsaProbeCell> cells;
+    std::vector<bool> plug_float32_supported;
+    std::vector<bool> plug_float64_supported;
 };
 
 class AlsaPcmBackend final : public IAudioBackend {
@@ -37,19 +40,26 @@ public:
     AlsaPcmBackend() = default;
     ~AlsaPcmBackend() override;
 
-    void open(const std::string& device_name, const AudioFormat& format) override;
-    std::size_t write_samples(const PcmSample* samples, std::size_t sample_count) override;
+    void open(const std::string& device_name,
+              const AudioFormat& format,
+              PcmOutputFormat output_format) override;
+    std::size_t write_samples(const PcmBlock& samples,
+                              std::size_t offset,
+                              std::size_t sample_count) override;
     void drain() override;
     void close() override;
     std::string active_output_report() const override;
 
     void set_24bit_container_mode(Alsa24BitContainerMode mode);
 
-    static AlsaProbeMatrix probe_device_format_matrix(const std::string& device_name);
+    static AlsaProbeMatrix probe_device_format_matrix(
+        const std::string& device_name,
+        const std::string& plug_device_name = std::string());
 
 private:
     snd_pcm_t* handle_ = nullptr;
     AudioFormat format_{};
+    PcmOutputFormat output_format_ = PcmOutputFormat::S16;
     snd_pcm_uframes_t period_frames_ = 588;
     snd_pcm_uframes_t buffer_frames_ = 2352;
     snd_pcm_format_t pcm_container_format_ = SND_PCM_FORMAT_UNKNOWN;

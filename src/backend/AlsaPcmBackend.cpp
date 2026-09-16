@@ -70,13 +70,15 @@ struct PcmHandleDeleter {
 
 using UniquePcmHandle = std::unique_ptr<snd_pcm_t, PcmHandleDeleter>;
 
-std::vector<snd_pcm_format_t> format_candidates_for_bits(
-    std::uint16_t bits_per_sample,
+std::vector<snd_pcm_format_t> format_candidates_for_output(
+    PcmOutputFormat output_format,
     Alsa24BitContainerMode mode) {
     std::vector<snd_pcm_format_t> candidates;
-    if (bits_per_sample <= 16) {
+    switch (output_format) {
+    case PcmOutputFormat::S16:
         candidates.push_back(SND_PCM_FORMAT_S16_LE);
-    } else if (bits_per_sample <= 24) {
+        break;
+    case PcmOutputFormat::S24:
         switch (mode) {
         case Alsa24BitContainerMode::S24LE:
             candidates.push_back(SND_PCM_FORMAT_S24_LE);
@@ -94,8 +96,16 @@ std::vector<snd_pcm_format_t> format_candidates_for_bits(
             candidates.push_back(SND_PCM_FORMAT_S32_LE);
             break;
         }
-    } else {
+        break;
+    case PcmOutputFormat::S32:
         candidates.push_back(SND_PCM_FORMAT_S32_LE);
+        break;
+    case PcmOutputFormat::Float32:
+        candidates.push_back(SND_PCM_FORMAT_FLOAT);
+        break;
+    case PcmOutputFormat::Float64:
+        candidates.push_back(SND_PCM_FORMAT_FLOAT64);
+        break;
     }
     return candidates;
 }
@@ -350,59 +360,86 @@ PcmCandidateResult try_open_pcm_candidate(
     return result;
 }
 
+bool probe_pcm_format_rate(const std::string& device_name,
+                           snd_pcm_format_t format,
+                           unsigned requested_rate) {
+    snd_pcm_t* handle = nullptr;
+    const int open_result = snd_pcm_open(
+        &handle,
+        device_name.c_str(),
+        SND_PCM_STREAM_PLAYBACK,
+        SND_PCM_NONBLOCK);
+    if (open_result < 0 || handle == nullptr) {
+        return false;
+    }
+
+    bool supported = false;
+    snd_pcm_hw_params_t* hw_params = nullptr;
+    snd_pcm_hw_params_alloca(&hw_params);
+    if (snd_pcm_hw_params_any(handle, hw_params) >= 0 &&
+        snd_pcm_hw_params_set_access(
+            handle, hw_params, SND_PCM_ACCESS_RW_INTERLEAVED) >= 0 &&
+        snd_pcm_hw_params_set_format(handle, hw_params, format) >= 0 &&
+        snd_pcm_hw_params_set_channels(handle, hw_params, 2) >= 0) {
+        unsigned accepted_rate = requested_rate;
+        if (snd_pcm_hw_params_set_rate_near(
+                handle, hw_params, &accepted_rate, nullptr) >= 0 &&
+            accepted_rate == requested_rate &&
+            snd_pcm_hw_params(handle, hw_params) >= 0) {
+            supported = true;
+        }
+    }
+
+    snd_pcm_close(handle);
+    return supported;
+}
+
 } // namespace
 
 AlsaPcmBackend::~AlsaPcmBackend() {
     close();
 }
 
-void AlsaPcmBackend::open(const std::string& device_name, const AudioFormat& format) {
+void AlsaPcmBackend::open(const std::string& device_name,
+                         const AudioFormat& format,
+                         PcmOutputFormat output_format) {
     close();
 
-    Logger::instance().info("Opening ALSA device: " + device_name +
-                            " format=" + format.to_string());
+    Logger::instance().info(
+        "Opening ALSA device: " + device_name +
+        " format=" + std::string(pcm_output_format_name(output_format)) +
+        " / " + std::to_string(format.sample_rate) + " Hz / " +
+        std::to_string(format.channels) + " ch");
 
-    const Alsa24BitContainerMode active_mode =
-        format_24bit_mode_;
+    const Alsa24BitContainerMode active_mode = format_24bit_mode_;
     const std::vector<snd_pcm_format_t> candidates =
-        format_candidates_for_bits(format.bits_per_sample,
-                                   active_mode);
+        format_candidates_for_output(output_format, active_mode);
     const AlsaBufferPolicy target_buffer_policy =
         alsa_buffer_policy_for_sample_rate(format.sample_rate);
 
     Logger::instance().debug(
-        "ALSA 24-bit container mode: " +
-        container_mode_name(active_mode));
+        "ALSA 24-bit container mode: " + container_mode_name(active_mode));
 
     PcmCandidateResult negotiated;
     std::string last_unsupported_message;
-
-    for (std::size_t i = 0; i < candidates.size(); ++i) {
-        const snd_pcm_format_t candidate = candidates[i];
+    for (const snd_pcm_format_t candidate : candidates) {
         const char* candidate_name = format_name_or_unknown(candidate);
         Logger::instance().debug(
-            std::string("ALSA full negotiation attempt: ") +
-            candidate_name);
-
+            std::string("ALSA full negotiation attempt: ") + candidate_name);
         PcmCandidateResult attempt = try_open_pcm_candidate(
-            device_name,
-            format,
-            candidate,
-            target_buffer_policy);
+            device_name, format, candidate, target_buffer_policy);
         if (attempt.success()) {
             Logger::instance().info(
-                std::string("ALSA format negotiation: requested bits=") +
-                std::to_string(format.bits_per_sample) +
+                std::string("ALSA format negotiation: requested=") +
+                pcm_output_format_name(output_format) +
                 " container_mode=" + container_mode_name(active_mode) +
-                " accepted=" +
-                format_name_or_unknown(attempt.container_format));
+                " accepted=" + format_name_or_unknown(attempt.container_format));
             negotiated = std::move(attempt);
             break;
         }
-
         Logger::instance().debug(
-            std::string("ALSA negotiation rejected ") +
-            candidate_name + ": " + attempt.failure_message);
+            std::string("ALSA negotiation rejected ") + candidate_name +
+            ": " + attempt.failure_message);
         if (!attempt.format_unsupported) {
             throw std::runtime_error(attempt.failure_message.empty()
                 ? std::string("ALSA output setup failed")
@@ -412,11 +449,19 @@ void AlsaPcmBackend::open(const std::string& device_name, const AudioFormat& for
     }
 
     if (!negotiated.success()) {
-        if (format.bits_per_sample > 24) {
+        if (output_format == PcmOutputFormat::Float32) {
+            throw AudioFormatUnsupportedError(
+                "ALSA device does not support Float32 PCM");
+        }
+        if (output_format == PcmOutputFormat::Float64) {
+            throw AudioFormatUnsupportedError(
+                "ALSA device does not support Float64 PCM");
+        }
+        if (output_format == PcmOutputFormat::S32) {
             throw AudioFormatUnsupportedError(
                 "ALSA device does not support S32_LE required for 32-bit precision");
         }
-        if (format.bits_per_sample > 16) {
+        if (output_format == PcmOutputFormat::S24) {
             if (active_mode != Alsa24BitContainerMode::Auto) {
                 throw AudioFormatUnsupportedError(
                     std::string("ALSA device does not support selected 24-bit container ") +
@@ -434,6 +479,7 @@ void AlsaPcmBackend::open(const std::string& device_name, const AudioFormat& for
 
     handle_ = negotiated.handle.release();
     format_ = format;
+    output_format_ = output_format;
     pcm_container_format_ = negotiated.container_format;
     device_name_ = device_name;
     accepted_sample_rate_ = negotiated.sample_rate;
@@ -443,11 +489,9 @@ void AlsaPcmBackend::open(const std::string& device_name, const AudioFormat& for
 
     Logger::instance().debug(
         "ALSA target period/buffer=" +
-        std::to_string(static_cast<unsigned long long>(
-            target_buffer_policy.period_frames)) +
+        std::to_string(static_cast<unsigned long long>(target_buffer_policy.period_frames)) +
         "/" +
-        std::to_string(static_cast<unsigned long long>(
-            target_buffer_policy.buffer_frames)) +
+        std::to_string(static_cast<unsigned long long>(target_buffer_policy.buffer_frames)) +
         " actual=" +
         std::to_string(static_cast<unsigned long long>(period_frames_)) +
         "/" +
@@ -464,94 +508,113 @@ void AlsaPcmBackend::open(const std::string& device_name, const AudioFormat& for
         " model=ALSA PCM ring buffer");
 }
 
-std::size_t AlsaPcmBackend::write_samples(const PcmSample* samples, std::size_t sample_count) {
+std::size_t AlsaPcmBackend::write_samples(const PcmBlock& block,
+                                         std::size_t sample_offset,
+                                         std::size_t sample_count) {
     if (handle_ == nullptr) {
         throw std::runtime_error("ALSA backend not opened");
     }
+    if (sample_offset > block.size() || sample_count > block.size() - sample_offset) {
+        throw std::runtime_error("ALSA write received an invalid PCM block range");
+    }
 
-    std::size_t written_samples = 0;
     const std::size_t channels = format_.channels;
     if (channels == 0 || sample_count % channels != 0) {
         throw std::runtime_error("ALSA write received an incomplete PCM frame");
     }
+
+    if (output_format_ == PcmOutputFormat::Float32 &&
+        block.storage_format() != PcmStorageFormat::Float32) {
+        throw std::runtime_error("ALSA Float32 output received non-Float32 PCM storage");
+    }
+    if (output_format_ == PcmOutputFormat::Float64 &&
+        block.storage_format() != PcmStorageFormat::Float64) {
+        throw std::runtime_error("ALSA Float64 output received non-Float64 PCM storage");
+    }
+    if (!pcm_output_is_floating(output_format_) &&
+        block.storage_format() != PcmStorageFormat::NativeInt32) {
+        throw std::runtime_error("ALSA integer output received non-integer PCM storage");
+    }
+
+    std::size_t written_samples = 0;
     while (written_samples < sample_count) {
-        const snd_pcm_uframes_t frames_to_write =
-            static_cast<snd_pcm_uframes_t>((sample_count - written_samples) / channels);
-        if (frames_to_write == 0) {
-            break;
-        }
+        const snd_pcm_uframes_t frames_to_write = static_cast<snd_pcm_uframes_t>(
+            (sample_count - written_samples) / channels);
+        if (frames_to_write == 0) break;
+        const std::size_t chunk_samples =
+            static_cast<std::size_t>(frames_to_write) * channels;
+        const std::size_t base = sample_offset + written_samples;
 
         const void* write_ptr = nullptr;
-        if (pcm_container_format_ == SND_PCM_FORMAT_S16_LE) {
-            scratch_s16_.resize(static_cast<std::size_t>(frames_to_write) * channels);
-            if (format_.bits_per_sample != 16) {
-                throw std::runtime_error(
-                    "ALSA S16 container received non-16-bit logical PCM");
-            }
-            pack_s16_exact(samples + written_samples,
-                           scratch_s16_.size(),
-                           scratch_s16_.data());
-            write_ptr = scratch_s16_.data();
-        } else if (pcm_container_format_ == SND_PCM_FORMAT_S24_3LE) {
-            if (format_.bits_per_sample != 24) {
-                throw std::runtime_error(
-                    "ALSA S24_3LE container received non-24-bit logical PCM");
-            }
-            scratch_s24_.resize(
-                static_cast<std::size_t>(frames_to_write) * channels * 3u);
-            const std::int64_t hi = 8388607;
-            const std::int64_t lo = -8388608;
-            for (std::size_t i = 0; i < static_cast<std::size_t>(frames_to_write) * channels; ++i) {
-                const std::int64_t v =
-                    static_cast<std::int64_t>(samples[written_samples + i]);
-                if (v > hi || v < lo) {
-                    throw std::runtime_error(
-                        "ALSA S24_3LE packing received an out-of-range logical PCM sample");
-                }
-                const std::uint32_t u =
-                    static_cast<std::uint32_t>(static_cast<std::int32_t>(v));
-                scratch_s24_[i * 3u + 0u] = static_cast<unsigned char>(u & 0xFFu);
-                scratch_s24_[i * 3u + 1u] = static_cast<unsigned char>((u >> 8) & 0xFFu);
-                scratch_s24_[i * 3u + 2u] = static_cast<unsigned char>((u >> 16) & 0xFFu);
-            }
-            write_ptr = scratch_s24_.data();
+        if (pcm_container_format_ == SND_PCM_FORMAT_FLOAT) {
+            write_ptr = block.float32().data() + base;
+        } else if (pcm_container_format_ == SND_PCM_FORMAT_FLOAT64) {
+            write_ptr = block.float64().data() + base;
         } else {
-            scratch_s32_.resize(static_cast<std::size_t>(frames_to_write) * channels);
-            const bool s24_container = pcm_container_format_ == SND_PCM_FORMAT_S24_LE;
-            const bool s32_carrying_24 =
-                pcm_container_format_ == SND_PCM_FORMAT_S32_LE &&
-                format_.bits_per_sample == 24;
-            if (s24_container && format_.bits_per_sample != 24) {
-                throw std::runtime_error(
-                    "ALSA S24_LE container received non-24-bit logical PCM");
-            }
-            if (pcm_container_format_ == SND_PCM_FORMAT_S32_LE &&
-                format_.bits_per_sample != 24 && format_.bits_per_sample != 32) {
-                throw std::runtime_error(
-                    "ALSA S32_LE container received unsupported logical PCM precision");
-            }
-            for (std::size_t i = 0; i < scratch_s32_.size(); ++i) {
-                std::int64_t value =
-                    static_cast<std::int64_t>(samples[written_samples + i]);
-                if (format_.bits_per_sample == 24) {
-                    if (value > 8388607 || value < -8388608) {
-                        throw std::runtime_error(
-                            "ALSA 24-bit packing received an out-of-range logical PCM sample");
-                    }
-                    if (s32_carrying_24) {
-                        value *= 256;
-                    }
-                }
-                if (value > INT32_MAX || value < INT32_MIN) {
+            const PcmSample* samples = block.native().data();
+            if (pcm_container_format_ == SND_PCM_FORMAT_S16_LE) {
+                scratch_s16_.resize(chunk_samples);
+                if (format_.bits_per_sample != 16) {
                     throw std::runtime_error(
-                        "ALSA S32 packing received an out-of-range logical PCM sample");
+                        "ALSA S16 container received non-16-bit logical PCM");
                 }
-                scratch_s32_[i] = static_cast<std::int32_t>(value);
+                pack_s16_exact(samples + base, chunk_samples, scratch_s16_.data());
+                write_ptr = scratch_s16_.data();
+            } else if (pcm_container_format_ == SND_PCM_FORMAT_S24_3LE) {
+                if (format_.bits_per_sample != 24) {
+                    throw std::runtime_error(
+                        "ALSA S24_3LE container received non-24-bit logical PCM");
+                }
+                scratch_s24_.resize(chunk_samples * 3u);
+                for (std::size_t i = 0; i < chunk_samples; ++i) {
+                    const std::int64_t v = static_cast<std::int64_t>(samples[base + i]);
+                    if (v > 8388607 || v < -8388608) {
+                        throw std::runtime_error(
+                            "ALSA S24_3LE packing received an out-of-range logical PCM sample");
+                    }
+                    const std::uint32_t u =
+                        static_cast<std::uint32_t>(static_cast<std::int32_t>(v));
+                    scratch_s24_[i * 3u + 0u] = static_cast<unsigned char>(u & 0xFFu);
+                    scratch_s24_[i * 3u + 1u] = static_cast<unsigned char>((u >> 8) & 0xFFu);
+                    scratch_s24_[i * 3u + 2u] = static_cast<unsigned char>((u >> 16) & 0xFFu);
+                }
+                write_ptr = scratch_s24_.data();
+            } else {
+                scratch_s32_.resize(chunk_samples);
+                const bool s24_container = pcm_container_format_ == SND_PCM_FORMAT_S24_LE;
+                const bool s32_carrying_24 =
+                    pcm_container_format_ == SND_PCM_FORMAT_S32_LE &&
+                    format_.bits_per_sample == 24;
+                if (s24_container && format_.bits_per_sample != 24) {
+                    throw std::runtime_error(
+                        "ALSA S24_LE container received non-24-bit logical PCM");
+                }
+                if (pcm_container_format_ == SND_PCM_FORMAT_S32_LE &&
+                    format_.bits_per_sample != 24 && format_.bits_per_sample != 32) {
+                    throw std::runtime_error(
+                        "ALSA S32_LE container received unsupported logical PCM precision");
+                }
+                for (std::size_t i = 0; i < chunk_samples; ++i) {
+                    std::int64_t value = static_cast<std::int64_t>(samples[base + i]);
+                    if (format_.bits_per_sample == 24) {
+                        if (value > 8388607 || value < -8388608) {
+                            throw std::runtime_error(
+                                "ALSA 24-bit packing received an out-of-range logical PCM sample");
+                        }
+                        if (s32_carrying_24) value *= 256;
+                    }
+                    if (value > INT32_MAX || value < INT32_MIN) {
+                        throw std::runtime_error(
+                            "ALSA S32 packing received an out-of-range logical PCM sample");
+                    }
+                    scratch_s32_[i] = static_cast<std::int32_t>(value);
+                }
+                write_ptr = scratch_s32_.data();
             }
-            write_ptr = scratch_s32_.data();
         }
 
-        const snd_pcm_sframes_t result = snd_pcm_writei(handle_, write_ptr, frames_to_write);
+        const snd_pcm_sframes_t result =
+            snd_pcm_writei(handle_, write_ptr, frames_to_write);
         if (result == -EPIPE) {
             Logger::instance().debug("ALSA underrun, preparing again");
             check_alsa(snd_pcm_prepare(handle_),
@@ -567,10 +630,8 @@ std::size_t AlsaPcmBackend::write_samples(const PcmSample* samples, std::size_t 
             throw std::runtime_error(std::string("snd_pcm_writei failed: ") +
                                      snd_strerror(static_cast<int>(result)));
         }
-
         written_samples += static_cast<std::size_t>(result) * channels;
     }
-
     return written_samples;
 }
 
@@ -590,6 +651,7 @@ void AlsaPcmBackend::close() {
         pcm_container_format_ = SND_PCM_FORMAT_UNKNOWN;
         accepted_sample_rate_ = 0;
         active_significant_bits_ = 0;
+        output_format_ = PcmOutputFormat::S16;
     }
 }
 
@@ -603,10 +665,15 @@ std::string AlsaPcmBackend::active_output_report() const {
     }
     std::ostringstream ss;
     ss << "Device: " << (device_name_.empty() ? std::string("unknown") : device_name_) << '\n';
-    ss << "Requested PCM: " << format_.bits_per_sample << "-bit / "
+    if (device_name_.compare(0, 7, "plughw:") == 0) {
+        ss << "ALSA path: Plug\n";
+    } else if (device_name_.compare(0, 3, "hw:") == 0) {
+        ss << "ALSA path: Direct\n";
+    }
+    ss << "Requested PCM: " << pcm_output_format_name(output_format_) << " / "
        << format_.sample_rate << " Hz / " << static_cast<unsigned>(format_.channels) << " ch" << '\n';
     ss << "Container: " << format_name_or_unknown(pcm_container_format_) << '\n';
-    if (active_significant_bits_ > 0) {
+    if (!pcm_output_is_floating(output_format_) && active_significant_bits_ > 0) {
         ss << "ALSA significant bits: " << active_significant_bits_ << "-bit\n";
     }
     ss << "Rate: " << accepted_sample_rate_
@@ -621,7 +688,9 @@ std::string AlsaPcmBackend::active_output_report() const {
     return ss.str();
 }
 
-AlsaProbeMatrix AlsaPcmBackend::probe_device_format_matrix(const std::string& device_name) {
+AlsaProbeMatrix AlsaPcmBackend::probe_device_format_matrix(
+    const std::string& device_name,
+    const std::string& plug_device_name) {
     const std::vector<unsigned> rates = {
         44100, 48000, 88200, 96000, 176400, 192000,
         352800, 384000, 705600, 768000, 1411200, 1536000
@@ -630,43 +699,38 @@ AlsaProbeMatrix AlsaPcmBackend::probe_device_format_matrix(const std::string& de
         SND_PCM_FORMAT_S16_LE,
         SND_PCM_FORMAT_S24_LE,
         SND_PCM_FORMAT_S24_3LE,
-        SND_PCM_FORMAT_S32_LE
+        SND_PCM_FORMAT_S32_LE,
+        SND_PCM_FORMAT_FLOAT,
+        SND_PCM_FORMAT_FLOAT64
     };
 
     AlsaProbeMatrix matrix;
     matrix.device_name = device_name.empty() ? std::string("default") : device_name;
+    matrix.plug_device_name = plug_device_name;
     matrix.sample_rates = rates;
-    for (std::size_t f = 0; f < formats.size(); ++f) {
-        matrix.format_names.push_back(format_name_or_unknown(formats[f]));
+    for (const snd_pcm_format_t format : formats) {
+        matrix.format_names.push_back(format_name_or_unknown(format));
     }
 
-    for (std::size_t f = 0; f < formats.size(); ++f) {
-        const snd_pcm_format_t fmt = formats[f];
-        for (std::size_t r = 0; r < rates.size(); ++r) {
-            bool ok = false;
-            snd_pcm_t* handle = nullptr;
-            const int open_result = snd_pcm_open(&handle, matrix.device_name.c_str(), SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK);
-            if (open_result >= 0 && handle != nullptr) {
-                snd_pcm_hw_params_t* hw_params = nullptr;
-                snd_pcm_hw_params_alloca(&hw_params);
-                if (snd_pcm_hw_params_any(handle, hw_params) >= 0 &&
-                    snd_pcm_hw_params_set_access(handle, hw_params, SND_PCM_ACCESS_RW_INTERLEAVED) >= 0 &&
-                    snd_pcm_hw_params_set_format(handle, hw_params, fmt) >= 0 &&
-                    snd_pcm_hw_params_set_channels(handle, hw_params, 2) >= 0) {
-                    unsigned rate = rates[r];
-                    if (snd_pcm_hw_params_set_rate_near(handle, hw_params, &rate, nullptr) >= 0 &&
-                        rate == rates[r] &&
-                        snd_pcm_hw_params(handle, hw_params) >= 0) {
-                        ok = true;
-                    }
-                }
-                snd_pcm_close(handle);
-            }
+    for (const snd_pcm_format_t format : formats) {
+        for (const unsigned rate : rates) {
             AlsaProbeCell cell;
-            cell.format_name = format_name_or_unknown(fmt);
-            cell.sample_rate = rates[r];
-            cell.supported = ok;
+            cell.format_name = format_name_or_unknown(format);
+            cell.sample_rate = rate;
+            cell.supported = probe_pcm_format_rate(
+                matrix.device_name, format, rate);
             matrix.cells.push_back(cell);
+        }
+    }
+
+    if (!matrix.plug_device_name.empty()) {
+        matrix.plug_float32_supported.reserve(rates.size());
+        matrix.plug_float64_supported.reserve(rates.size());
+        for (const unsigned rate : rates) {
+            matrix.plug_float32_supported.push_back(probe_pcm_format_rate(
+                matrix.plug_device_name, SND_PCM_FORMAT_FLOAT, rate));
+            matrix.plug_float64_supported.push_back(probe_pcm_format_rate(
+                matrix.plug_device_name, SND_PCM_FORMAT_FLOAT64, rate));
         }
     }
 

@@ -57,6 +57,10 @@ std::complex<double> frequency_response(const ShelfCoefficients& c, double w) {
     return num / den;
 }
 
+// Mathematical background for the second-order low/high shelving filters:
+// R. Bristow-Johnson, Audio EQ Cookbook.
+// PCM Transport uses the standard shelf equations with S = 1.
+// PCM Transport implementation in this module is independently written.
 ShelfCoefficients make_shelf(bool high,
                              std::uint32_t sample_rate,
                              double gain_db,

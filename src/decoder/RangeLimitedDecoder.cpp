@@ -41,7 +41,7 @@ void RangeLimitedDecoder::open_at_sample(const std::string& path, std::uint64_t 
                              " source=" + inner_->source_path());
 }
 const AudioFormat& RangeLimitedDecoder::format() const { return inner_->format(); }
-std::size_t RangeLimitedDecoder::read_samples(PcmSample* destination, std::size_t max_samples) {
+std::size_t RangeLimitedDecoder::read_samples(PcmBlock& destination, std::size_t max_samples) {
     if (!opened_) throw std::runtime_error("RangeLimitedDecoder not opened");
     const std::uint16_t ch = std::max<std::uint16_t>(1, format().channels);
     const std::uint64_t rem = remaining_samples_per_channel();
@@ -66,6 +66,9 @@ PresentationEndKind RangeLimitedDecoder::presentation_end_kind() const noexcept 
 }
 TransportTruncationKind RangeLimitedDecoder::transport_truncation_kind() const noexcept {
     return TransportTruncationKind::ExactSampleBoundary;
+}
+PcmStorageFormat RangeLimitedDecoder::pcm_storage_format() const noexcept {
+    return inner_->pcm_storage_format();
 }
 ResamplerRuntimeKind RangeLimitedDecoder::resampler_runtime_kind() const noexcept {
     return inner_->resampler_runtime_kind();

@@ -29,13 +29,40 @@ AudioFormat working_format_for_track(const GaplessTrackSpec& spec) {
     return spec.format;
 }
 
-bool working_precision_changes(const std::vector<GaplessTrackSpec>& tracks,
-                               std::size_t current_index) {
-    if (current_index + 1 >= tracks.size()) {
-        return false;
-    }
-    return working_format_for_track(tracks[current_index]).bits_per_sample !=
-           working_format_for_track(tracks[current_index + 1]).bits_per_sample;
+struct PcmBlockProcessingSemantics {
+    PcmStorageFormat pcm_storage_format = PcmStorageFormat::NativeInt32;
+    bool exact_s16_repack_eligible = false;
+};
+
+bool decoded_sample_is_s16(DecoderPcmSampleKind kind) noexcept {
+    return kind == DecoderPcmSampleKind::S16 ||
+           kind == DecoderPcmSampleKind::S16Planar;
+}
+
+bool exact_s16_repack_eligible(
+    DecoderPcmSampleKind decoded_sample_kind,
+    std::uint32_t pcm16_quantization_stage_count,
+    ResamplerRuntimeKind resampler_runtime_kind) noexcept {
+    return decoded_sample_is_s16(decoded_sample_kind) &&
+           pcm16_quantization_stage_count > 0 &&
+           resampler_runtime_kind == ResamplerRuntimeKind::NotUsed;
+}
+
+PcmBlockProcessingSemantics block_processing_semantics(
+    const DecoderRuntimeStateSnapshot& state) noexcept {
+    return PcmBlockProcessingSemantics{
+        state.pcm_storage_format,
+        exact_s16_repack_eligible(
+            state.decoded_pcm_sample_kind,
+            state.pcm16_quantization_stage_count,
+            state.resampler_runtime_kind)};
+}
+
+bool same_block_processing_semantics(
+    const PcmBlockProcessingSemantics& a,
+    const PcmBlockProcessingSemantics& b) noexcept {
+    return a.pcm_storage_format == b.pcm_storage_format &&
+           a.exact_s16_repack_eligible == b.exact_s16_repack_eligible;
 }
 
 } // namespace
@@ -143,6 +170,7 @@ void GaplessChainDecoder::publish_runtime_state(
         }
     };
 
+    update_atomic(pcm_storage_format_, state.pcm_storage_format);
     update_atomic(resampler_runtime_kind_, state.resampler_runtime_kind);
     update_atomic(pcm16_quantization_runtime_kind_,
                   state.pcm16_quantization_runtime_kind);
@@ -218,7 +246,7 @@ const AudioFormat& GaplessChainDecoder::format() const {
 }
 
 
-std::size_t GaplessChainDecoder::read_samples(PcmSample* destination, std::size_t max_samples) {
+std::size_t GaplessChainDecoder::read_samples(PcmBlock& destination, std::size_t max_samples) {
     if (!opened_ || !current_decoder_) {
         throw std::runtime_error("GaplessChainDecoder not opened");
     }
@@ -260,9 +288,8 @@ std::size_t GaplessChainDecoder::read_samples(PcmSample* destination, std::size_
                         remaining_frames * channels));
                 }
                 take -= take % channels;
-                std::copy(current_prebuffer_.data() + current_prebuffer_offset_,
-                          current_prebuffer_.data() + current_prebuffer_offset_ + take,
-                          destination + copied);
+                destination.append_from(current_prebuffer_,
+                                        current_prebuffer_offset_, take);
                 current_prebuffer_offset_ += take;
                 copied += take;
                 current_track_position_ += static_cast<std::uint64_t>(take / channels);
@@ -283,7 +310,7 @@ std::size_t GaplessChainDecoder::read_samples(PcmSample* destination, std::size_
                 reached_eof_ = true;
                 break;
             }
-            if (copied > 0 && working_precision_changes(tracks_, current_index_)) {
+            if (copied > 0 && !prepared_next_can_share_output_block()) {
                 break;
             }
             const SwitchResult sw = stop_requested_after_current_segment()
@@ -320,7 +347,7 @@ std::size_t GaplessChainDecoder::read_samples(PcmSample* destination, std::size_
                 reached_eof_ = true;
                 break;
             }
-            if (copied > 0 && working_precision_changes(tracks_, current_index_)) {
+            if (copied > 0 && !prepared_next_can_share_output_block()) {
                 break;
             }
             const SwitchResult sw = stop_requested_after_current_segment()
@@ -334,7 +361,7 @@ std::size_t GaplessChainDecoder::read_samples(PcmSample* destination, std::size_
         }
 
         const std::size_t got = current_decoder_->read_samples(
-            destination + copied, request_samples);
+            destination, request_samples);
         const std::uint64_t runtime_generation =
             current_decoder_->runtime_state_generation();
         if (runtime_generation != current_decoder_runtime_generation_) {
@@ -354,7 +381,7 @@ std::size_t GaplessChainDecoder::read_samples(PcmSample* destination, std::size_
                 reached_eof_ = true;
                 break;
             }
-            if (copied > 0 && working_precision_changes(tracks_, current_index_)) {
+            if (copied > 0 && !prepared_next_can_share_output_block()) {
                 break;
             }
             const SwitchResult sw = stop_requested_after_current_segment()
@@ -406,6 +433,10 @@ TransportTruncationKind GaplessChainDecoder::transport_truncation_kind() const n
     return TransportTruncationKind::DecoderSegmentBoundary;
 }
 
+PcmStorageFormat GaplessChainDecoder::pcm_storage_format() const noexcept {
+    return pcm_storage_format_.load(std::memory_order_acquire);
+}
+
 ResamplerRuntimeKind GaplessChainDecoder::resampler_runtime_kind() const noexcept {
     return resampler_runtime_kind_.load(std::memory_order_acquire);
 }
@@ -438,6 +469,7 @@ std::uint64_t GaplessChainDecoder::runtime_state_generation() const noexcept {
 DecoderRuntimeStateSnapshot GaplessChainDecoder::runtime_state_snapshot() const {
     DecoderRuntimeStateSnapshot state;
     state.generation = runtime_state_generation();
+    state.pcm_storage_format = pcm_storage_format();
     state.resampler_runtime_kind = resampler_runtime_kind();
     state.pcm16_quantization_runtime_kind = pcm16_quantization_runtime_kind();
     state.pcm16_quantization_stage_count = pcm16_quantization_stage_count();
@@ -648,10 +680,14 @@ void GaplessChainDecoder::prepare_next_worker(std::size_t index,
             open_decoder_at_local_offset(*prepared.decoder, tracks_[index], 0);
         }
         if (!cancelled() && prepared.decoder != nullptr) {
-            prepared.prebuffer.resize(prebuffer_samples(index));
+            const std::size_t requested_prebuffer_samples = prebuffer_samples(index);
+            prepared.prebuffer.clear();
+            prepared.prebuffer.ensure_storage(
+                prepared.decoder->pcm_storage_format());
+            prepared.prebuffer.reserve(requested_prebuffer_samples);
             const std::size_t got = prepared.decoder->read_samples(
-                prepared.prebuffer.data(), prepared.prebuffer.size());
-            prepared.prebuffer.resize(got);
+                prepared.prebuffer, requested_prebuffer_samples);
+            prepared.working_format = prepared.decoder->format();
             prepared.runtime_state = prepared.decoder->runtime_state_snapshot();
             if (!cancelled()) {
                 prepared.ready = true;
@@ -790,6 +826,33 @@ bool GaplessChainDecoder::stop_requested_after_current_segment() const {
         requested_last_segment_index_.load(std::memory_order_relaxed);
     return requested_last != std::numeric_limits<std::size_t>::max() &&
            current_index_ >= requested_last;
+}
+
+bool GaplessChainDecoder::prepared_next_can_share_output_block() const {
+    if (current_index_ + 1 >= tracks_.size()) {
+        return false;
+    }
+
+    const std::size_t next_index = current_index_ + 1;
+    std::lock_guard<std::mutex> lock(prepare_mutex_);
+    if (!prepared_.ready || prepared_.index != next_index ||
+        prepared_.decoder == nullptr) {
+        return false;
+    }
+
+    const PcmBlockProcessingSemantics current_semantics{
+        pcm_storage_format_.load(std::memory_order_acquire),
+        exact_s16_repack_eligible(
+            decoded_pcm_sample_kind_.load(std::memory_order_acquire),
+            pcm16_quantization_stage_count_.load(std::memory_order_acquire),
+            resampler_runtime_kind_.load(std::memory_order_acquire))};
+    const PcmBlockProcessingSemantics prepared_semantics =
+        block_processing_semantics(prepared_.runtime_state);
+
+    return prepared_.working_format.sample_rate == format_.sample_rate &&
+           prepared_.working_format.channels == format_.channels &&
+           prepared_.working_format.bits_per_sample == format_.bits_per_sample &&
+           same_block_processing_semantics(current_semantics, prepared_semantics);
 }
 
 std::uint64_t GaplessChainDecoder::prepare_threshold_frames(std::size_t index) const {

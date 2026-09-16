@@ -64,48 +64,62 @@ inline PcmSample quantize_pcm16_code_units(
     return round_pcm16_to_nearest_even(sample);
 }
 
-inline PcmSample quantize_integer_working_sample_to_pcm16(
-    PcmSample sample,
+struct Pcm16IntegerQuantizer {
+    Pcm16QuantizationMode mode = Pcm16QuantizationMode::RoundToNearestEven;
+    std::int64_t divisor = 1;
+    std::uint64_t unsigned_divisor = 1;
+    std::uint64_t half_divisor = 0;
+    double divisor_double = 1.0;
+};
+
+inline Pcm16IntegerQuantizer make_pcm16_integer_quantizer(
     std::uint16_t working_bits,
     Pcm16QuantizationMode mode) {
     if (working_bits < 16 || working_bits > 32) {
         throw std::runtime_error("Unsupported PCM precision conversion");
     }
-    if (working_bits == 16) {
+    const unsigned shift = static_cast<unsigned>(working_bits - 16);
+    Pcm16IntegerQuantizer quantizer;
+    quantizer.mode = mode;
+    quantizer.divisor = std::int64_t{1} << shift;
+    quantizer.unsigned_divisor = static_cast<std::uint64_t>(quantizer.divisor);
+    quantizer.half_divisor = quantizer.unsigned_divisor / 2U;
+    quantizer.divisor_double = static_cast<double>(quantizer.unsigned_divisor);
+    return quantizer;
+}
+
+inline PcmSample quantize_integer_working_sample_to_pcm16(
+    PcmSample sample,
+    const Pcm16IntegerQuantizer& quantizer) {
+    if (quantizer.divisor == 1) {
         if (sample > 32767) return static_cast<PcmSample>(32767);
         if (sample < -32768) return static_cast<PcmSample>(-32768);
         return sample;
     }
 
-    const unsigned shift = static_cast<unsigned>(working_bits - 16);
-    const std::int64_t divisor = std::int64_t{1} << shift;
     const std::int64_t value = static_cast<std::int64_t>(sample);
-
     std::int64_t result = 0;
-    if (mode == Pcm16QuantizationMode::Truncate ||
-        mode == Pcm16QuantizationMode::RoundHalfUp) {
-        result = value / divisor;
-        std::int64_t remainder = value % divisor;
+    if (quantizer.mode == Pcm16QuantizationMode::Truncate ||
+        quantizer.mode == Pcm16QuantizationMode::RoundHalfUp) {
+        result = value / quantizer.divisor;
+        std::int64_t remainder = value % quantizer.divisor;
         if (remainder < 0) {
             --result;
-            remainder += divisor;
+            remainder += quantizer.divisor;
         }
-        if (mode == Pcm16QuantizationMode::RoundHalfUp &&
-            remainder >= divisor / 2) {
+        if (quantizer.mode == Pcm16QuantizationMode::RoundHalfUp &&
+            remainder >= quantizer.divisor / 2) {
             ++result;
         }
     } else {
         const bool negative = value < 0;
         const std::uint64_t magnitude = static_cast<std::uint64_t>(
             negative ? -value : value);
-        const std::uint64_t unsigned_divisor =
-            static_cast<std::uint64_t>(divisor);
-        std::uint64_t quotient = magnitude / unsigned_divisor;
-        const std::uint64_t remainder = magnitude % unsigned_divisor;
-        const std::uint64_t half = unsigned_divisor / 2U;
+        std::uint64_t quotient = magnitude / quantizer.unsigned_divisor;
+        const std::uint64_t remainder = magnitude % quantizer.unsigned_divisor;
 
-        if (remainder > half ||
-            (remainder == half && (quotient % 2U) != 0U)) {
+        if (remainder > quantizer.half_divisor ||
+            (remainder == quantizer.half_divisor && (quotient % 2U) != 0U)) {
             ++quotient;
         }
         result = negative
@@ -118,23 +132,33 @@ inline PcmSample quantize_integer_working_sample_to_pcm16(
     return static_cast<PcmSample>(result);
 }
 
+inline PcmSample quantize_integer_working_sample_to_pcm16(
+    PcmSample sample,
+    std::uint16_t working_bits,
+    Pcm16QuantizationMode mode) {
+    return quantize_integer_working_sample_to_pcm16(
+        sample, make_pcm16_integer_quantizer(working_bits, mode));
+}
+
+inline PcmSample quantize_integer_working_sample_to_pcm16_with_dither(
+    PcmSample sample,
+    const Pcm16IntegerQuantizer& quantizer,
+    double dither_code_units) {
+    const double code_units =
+        static_cast<double>(sample) / quantizer.divisor_double;
+    return quantize_pcm16_code_units(
+        code_units + dither_code_units, quantizer.mode);
+}
+
 inline PcmSample quantize_integer_working_sample_to_pcm16_with_dither(
     PcmSample sample,
     std::uint16_t working_bits,
     Pcm16QuantizationMode mode,
     double dither_code_units) {
-    if (working_bits < 16 || working_bits > 32) {
-        throw std::runtime_error("Unsupported PCM precision conversion");
-    }
-    if (working_bits == 16) {
-        return quantize_pcm16_code_units(
-            static_cast<double>(sample) + dither_code_units, mode);
-    }
-
-    const unsigned shift = static_cast<unsigned>(working_bits - 16);
-    const double divisor = static_cast<double>(std::uint64_t{1} << shift);
-    const double code_units = static_cast<double>(sample) / divisor;
-    return quantize_pcm16_code_units(code_units + dither_code_units, mode);
+    return quantize_integer_working_sample_to_pcm16_with_dither(
+        sample,
+        make_pcm16_integer_quantizer(working_bits, mode),
+        dither_code_units);
 }
 
 } // namespace pcmtp

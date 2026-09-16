@@ -283,7 +283,9 @@ std::string replace_resampler_runtime_line(
 std::string replace_output_conversion_runtime_line(
     const std::string& report,
     const AudioFormat& working_format,
-    const AudioFormat& output_format) {
+    const AudioFormat& output_format,
+    PcmStorageFormat working_storage,
+    PcmOutputFormat output_sample_format) {
     constexpr const char* prefix = "Output conversion: ";
     const std::size_t line_start = report.find(prefix);
     if (line_start == std::string::npos) {
@@ -291,8 +293,22 @@ std::string replace_output_conversion_runtime_line(
     }
     const std::size_t line_end = report.find('\n', line_start);
     std::string value = "inactive";
-    if (working_format.bits_per_sample > 0 && output_format.bits_per_sample > 0 &&
-        working_format.bits_per_sample != output_format.bits_per_sample) {
+    if (output_sample_format == PcmOutputFormat::Float32) {
+        if (working_storage != PcmStorageFormat::Float32) {
+            value = std::string(pcm_storage_format_name(working_storage)) +
+                    " → Float32";
+        }
+    } else if (output_sample_format == PcmOutputFormat::Float64) {
+        if (working_storage != PcmStorageFormat::Float64) {
+            value = std::string(pcm_storage_format_name(working_storage)) +
+                    " → Float64";
+        }
+    } else if (working_storage != PcmStorageFormat::NativeInt32) {
+        value = std::string(pcm_storage_format_name(working_storage)) + " → " +
+                std::to_string(output_format.bits_per_sample) + "-bit";
+    } else if (working_format.bits_per_sample > 0 &&
+               output_format.bits_per_sample > 0 &&
+               working_format.bits_per_sample != output_format.bits_per_sample) {
         value = std::to_string(working_format.bits_per_sample) + "-bit → " +
                 std::to_string(output_format.bits_per_sample) + "-bit";
     }
@@ -1337,8 +1353,17 @@ int alsa_24bit_mode_combo_index(const std::string& id) {
     return 0;
 }
 
+std::string normalize_alsa_path_id(const std::string& id) {
+    return id == "plug" ? "plug" : "direct";
+}
+
+int alsa_path_combo_index(const std::string& id) {
+    return normalize_alsa_path_id(id) == "plug" ? 1 : 0;
+}
+
 std::string normalize_output_precision_id(const std::string& id) {
-    if (id == "16" || id == "24" || id == "32") {
+    if (id == "16" || id == "24" || id == "32" ||
+        id == "float" || id == "float64") {
         return id;
     }
     return "auto";
@@ -1349,19 +1374,24 @@ int output_precision_combo_index(const std::string& id) {
     if (normalized == "16") return 1;
     if (normalized == "24") return 2;
     if (normalized == "32") return 3;
+    if (normalized == "float") return 4;
+    if (normalized == "float64") return 5;
     return 0;
 }
 
-std::vector<std::uint16_t> output_precision_candidates(
+std::vector<PcmOutputFormat> output_precision_candidates(
     const std::string& id,
     std::uint16_t auto_primary_bits) {
     const std::string normalized = normalize_output_precision_id(id);
-    if (normalized == "16") return {16};
-    if (normalized == "24") return {24};
-    if (normalized == "32") return {32};
-    if (auto_primary_bits == 24) return {24, 32, 16};
-    if (auto_primary_bits == 32) return {32, 24, 16};
-    return {32, 24, 16};
+    if (normalized == "16") return {PcmOutputFormat::S16};
+    if (normalized == "24") return {PcmOutputFormat::S24};
+    if (normalized == "32") return {PcmOutputFormat::S32};
+    if (normalized == "float") return {PcmOutputFormat::Float32};
+    if (normalized == "float64") return {PcmOutputFormat::Float64};
+    if (auto_primary_bits == 24) {
+        return {PcmOutputFormat::S24, PcmOutputFormat::S32, PcmOutputFormat::S16};
+    }
+    return {PcmOutputFormat::S32, PcmOutputFormat::S24, PcmOutputFormat::S16};
 }
 
 std::string output_precision_label(const std::string& id) {
@@ -1369,6 +1399,8 @@ std::string output_precision_label(const std::string& id) {
     if (normalized == "16") return "16-bit";
     if (normalized == "24") return "24-bit";
     if (normalized == "32") return "32-bit";
+    if (normalized == "float") return "Float32";
+    if (normalized == "float64") return "Float64";
     return "Auto";
 }
 
@@ -1495,8 +1527,19 @@ void show_alsa_probe_table_dialog(GtkWindow* parent, const AlsaProbeMatrix& matr
         ? std::string(valid_device_name)
         : std::string();
     g_free(valid_device_name);
-    GtkWidget* probe_context = gtk_label_new(
-        ("Device: " + device_name + "\nMode: playback, RW_INTERLEAVED, stereo").c_str());
+    std::string probe_context_text = "Device: " + device_name;
+    if (!matrix.plug_device_name.empty()) {
+        gchar* valid_plug_name = g_utf8_make_valid(
+            matrix.plug_device_name.data(),
+            static_cast<gssize>(matrix.plug_device_name.size()));
+        const std::string plug_name = valid_plug_name != nullptr
+            ? std::string(valid_plug_name)
+            : std::string();
+        g_free(valid_plug_name);
+        probe_context_text += "\nPlug: " + plug_name;
+    }
+    probe_context_text += "\nMode: playback, RW_INTERLEAVED, stereo";
+    GtkWidget* probe_context = gtk_label_new(probe_context_text.c_str());
     gtk_label_set_xalign(GTK_LABEL(probe_context), 0.0f);
     gtk_label_set_selectable(GTK_LABEL(probe_context), TRUE);
     gtk_box_pack_start(GTK_BOX(probe_header), probe_context, FALSE, FALSE, 0);
@@ -1541,7 +1584,68 @@ void show_alsa_probe_table_dialog(GtkWindow* parent, const AlsaProbeMatrix& matr
     }
     gtk_box_pack_start(GTK_BOX(box), scrolled, FALSE, FALSE, 0);
 
-    GtkWidget* note = gtk_label_new("This probe tests the selected ALSA PCM device directly. Other players may use plug/dmix or a different subdevice. Stop playback before probing for reliable results.");
+    const auto support_summary = [](const std::vector<bool>& support) {
+        if (support.empty()) {
+            return std::string("unavailable");
+        }
+        const std::size_t supported_count = static_cast<std::size_t>(
+            std::count(support.begin(), support.end(), true));
+        if (supported_count == 0) {
+            return std::string("unsupported");
+        }
+        if (supported_count == support.size()) {
+            return std::string("supported");
+        }
+        return std::string("partial");
+    };
+
+    const auto direct_float_support = [&](bool float64) {
+        std::vector<bool> support;
+        for (std::size_t f = 0; f < matrix.format_names.size(); ++f) {
+            const bool is_float64 =
+                matrix.format_names[f].find("FLOAT64") != std::string::npos;
+            const bool is_float =
+                matrix.format_names[f].find("FLOAT") != std::string::npos;
+            if (!is_float || is_float64 != float64) {
+                continue;
+            }
+            support.reserve(matrix.sample_rates.size());
+            for (std::size_t r = 0; r < matrix.sample_rates.size(); ++r) {
+                const std::size_t idx = f * matrix.sample_rates.size() + r;
+                support.push_back(
+                    idx < matrix.cells.size() && matrix.cells[idx].supported);
+            }
+            break;
+        }
+        return support;
+    };
+
+    const std::vector<bool> direct_float32_support =
+        direct_float_support(false);
+    const std::vector<bool> direct_float64_support =
+        direct_float_support(true);
+    const bool direct_hardware_pcm =
+        matrix.device_name.compare(0, 3, "hw:") == 0;
+    const std::string direct_prefix =
+        direct_hardware_pcm ? "Direct " : "Selected PCM ";
+    std::string capability_text =
+        direct_prefix + "Float32: " + support_summary(direct_float32_support) +
+        "\n" + direct_prefix + "Float64: " +
+        support_summary(direct_float64_support);
+    if (!matrix.plug_device_name.empty()) {
+        capability_text +=
+            "\nALSA plug Float32 input: " +
+            support_summary(matrix.plug_float32_supported) +
+            "\nALSA plug Float64 input: " +
+            support_summary(matrix.plug_float64_supported);
+    }
+    GtkWidget* capability = gtk_label_new(capability_text.c_str());
+    gtk_label_set_xalign(GTK_LABEL(capability), 0.0f);
+    gtk_label_set_selectable(GTK_LABEL(capability), TRUE);
+    gtk_box_pack_start(GTK_BOX(box), capability, FALSE, FALSE, 0);
+
+    GtkWidget* note = gtk_label_new(
+        "The table tests the selected PCM directly; plug Float32 and Float64 are tested separately when available. Stop playback before probing.");
     gtk_label_set_xalign(GTK_LABEL(note), 0.0f);
     gtk_label_set_line_wrap(GTK_LABEL(note), TRUE);
     gtk_label_set_line_wrap_mode(GTK_LABEL(note), PANGO_WRAP_WORD_CHAR);
@@ -1903,7 +2007,8 @@ DiagnosticRenderResult render_internal_path(const std::string& flac_path,
         throw std::runtime_error(
             "Diagnostic test received an unexpected internal PCM format");
     }
-    std::vector<PcmSample> block(4096);
+    PcmBlock block(PcmStorageFormat::NativeInt32);
+    block.reserve(4096);
     DiagnosticRenderResult result;
     result.bits_per_sample = fmt.bits_per_sample;
     result.samples.reserve(
@@ -1926,10 +2031,12 @@ DiagnosticRenderResult render_internal_path(const std::string& flac_path,
             cancel_requested->load(std::memory_order_relaxed)) {
             return DiagnosticRenderResult{};
         }
-        const std::size_t got = decoder.read_samples(block.data(), block.size());
+        block.clear();
+        const std::size_t got = decoder.read_samples(block, 4096);
         if (got == 0) break;
+        const PcmBuffer& native_block = block.native();
         for (std::size_t i = 0; i < got; ++i) {
-            double sample = static_cast<double>(block[i]);
+            double sample = static_cast<double>(native_block[i]);
             if (dsp_active) {
                 const bool left = ((i % 2) == 0);
                 sample *= pre_eq_gain;
@@ -1999,9 +2106,48 @@ CompareResult compare_samples(const std::vector<std::int16_t>& expected,
 
 int current_card_index(const std::vector<CardProfileInfo>& cards, const std::string& device_name) {
     for (const auto& card : cards) {
-        if (card.hw_device == device_name) return card.card_index;
+        if (card.hw_device == device_name || card.plughw_device == device_name) {
+            return card.card_index;
+        }
     }
     return -1;
+}
+
+std::string alsa_direct_device_name(const std::vector<CardProfileInfo>& cards,
+                                    const std::string& device_name) {
+    for (const auto& card : cards) {
+        if (card.hw_device == device_name || card.plughw_device == device_name) {
+            return card.hw_device;
+        }
+    }
+    return device_name;
+}
+
+std::string alsa_plug_device_name(const std::vector<CardProfileInfo>& cards,
+                                  const std::string& device_name) {
+    for (const auto& card : cards) {
+        if (card.hw_device == device_name || card.plughw_device == device_name) {
+            return card.plughw_device;
+        }
+    }
+    return std::string();
+}
+
+std::string effective_alsa_device_name(const std::vector<CardProfileInfo>& cards,
+                                       const std::string& device_name,
+                                       const std::string& alsa_path_mode) {
+    if (device_name.empty() || device_name == "default") {
+        return "default";
+    }
+
+    if (normalize_alsa_path_id(alsa_path_mode) == "plug") {
+        const std::string plug_device = alsa_plug_device_name(cards, device_name);
+        if (!plug_device.empty()) {
+            return plug_device;
+        }
+    }
+
+    return alsa_direct_device_name(cards, device_name);
 }
 
 std::string alsa_device_profile_name(const std::vector<CardProfileInfo>& cards,
@@ -3870,7 +4016,7 @@ void GtkPlayerWindow::build_ui(GtkApplication* app) {
     start_metadata_worker();
     window_ = gtk_application_window_new(app);
     gtk_window_set_icon_name(GTK_WINDOW(window_), kApplicationId);
-    gtk_window_set_title(GTK_WINDOW(window_), "PCM Transport v0.9.119");
+    gtk_window_set_title(GTK_WINDOW(window_), "PCM Transport v0.9.120");
     gtk_window_set_default_size(GTK_WINDOW(window_), kDefaultWindowWidth, kDefaultWindowHeight);
     gtk_container_set_border_width(GTK_CONTAINER(window_), 16);
 
@@ -3923,7 +4069,7 @@ void GtkPlayerWindow::build_ui(GtkApplication* app) {
 
     display_track_ = gtk_label_new("Track: --");
     display_time_ = gtk_label_new("00:00 / 00:00");
-    display_status_ = gtk_label_new("Open FLAC or CUE files");
+    display_status_ = gtk_label_new("Open audio files or CUE sheets");
     display_source_ = gtk_label_new("Device: default");
     display_path_ = gtk_label_new("Path: --");
     display_reserve_ = gtk_label_new(" ");
@@ -4521,6 +4667,9 @@ void GtkPlayerWindow::ensure_meter_timer_running() {
 }
 
 void GtkPlayerWindow::sync_meter_timer_to_settings() {
+    if (display_meter_ != nullptr) {
+        gtk_widget_queue_draw(display_meter_);
+    }
     if (level_meter_enabled_ || clip_detection_enabled_) {
         ensure_meter_timer_running();
         return;
@@ -6148,7 +6297,10 @@ gboolean GtkPlayerWindow::on_softvol_button_release(GtkWidget*, GdkEventButton* 
 
 gboolean GtkPlayerWindow::on_meter_draw(GtkWidget* widget, cairo_t* cr, gpointer user_data) {
     auto* self = static_cast<GtkPlayerWindow*>(user_data);
-    const double value = std::max(0.0, std::min(kMeterMaximumLevel, self->meter_level_));
+    const double visible_maximum = self->clip_detection_enabled_
+        ? kMeterMaximumLevel
+        : 1.0;
+    const double value = std::max(0.0, std::min(visible_maximum, self->meter_level_));
     GtkAllocation alloc{};
     gtk_widget_get_allocation(widget, &alloc);
     const double width = alloc.width;
@@ -6443,7 +6595,7 @@ std::string GtkPlayerWindow::output_precision_setting_for_entry(
     return normalize_output_precision_id(output_precision_32bit_);
 }
 
-std::vector<std::uint16_t> GtkPlayerWindow::output_precision_candidates_for_entry(
+std::vector<PcmOutputFormat> GtkPlayerWindow::output_precision_candidates_for_entry(
     const PlaylistEntry& entry) const {
     const std::string setting = output_precision_setting_for_entry(entry);
     if (setting != "auto") {
@@ -6474,8 +6626,8 @@ void GtkPlayerWindow::refresh_entry_processing_metadata(PlaylistEntry& entry) {
     entry.resampled = target_rate > 0 && target_rate != entry.source_sample_rate;
     entry.resampled_from_rate = entry.resampled ? entry.source_sample_rate : 0;
 
-    // Keep decode/resampling in a natural or wide integer domain. Final output
-    // precision is selected only at PlaybackEngine's output boundary.
+    // Keep decoder working precision independent of the final ALSA sample
+    // format. Decoder storage follows the active processing semantics.
     if (entry.dsd_source || entry.resampled || !entry.lossless_source) {
         entry.decoded_format.bits_per_sample = 32;
     }
@@ -7042,7 +7194,8 @@ std::uint32_t GtkPlayerWindow::current_tone_control_sample_rate() const {
 
 std::string GtkPlayerWindow::processing_rules_report_for_entry(
     const PlaylistEntry& entry,
-    const AudioFormat& active_output_format) const {
+    const AudioFormat& active_output_format,
+    PcmOutputFormat active_output_sample_format) const {
     std::ostringstream out;
 
     const std::uint32_t final_rate = active_output_format.sample_rate > 0
@@ -7054,9 +7207,10 @@ std::string GtkPlayerWindow::processing_rules_report_for_entry(
         ? active_output_format.bits_per_sample
         : entry.decoded_format.bits_per_sample;
     const std::string precision_setting = output_precision_setting_for_entry(entry);
-    const std::uint16_t working_bits = std::max(
-        entry.decoded_format.bits_per_sample,
-        output_bits);
+    const std::uint16_t working_bits =
+        pcm_output_is_floating(active_output_sample_format)
+            ? entry.decoded_format.bits_per_sample
+            : std::max(entry.decoded_format.bits_per_sample, output_bits);
 
     out << "Processing rules: " << (entry.resampled ? "applied" : "inactive") << '\n';
     if (entry.dsd_source) {
@@ -7069,7 +7223,9 @@ std::string GtkPlayerWindow::processing_rules_report_for_entry(
             << " → PCM " << format_rate_khz(entry.source_sample_rate) << '\n';
     }
     out << "Output precision: ";
-    if (precision_setting == "auto") {
+    if (pcm_output_is_floating(active_output_sample_format)) {
+        out << pcm_output_format_name(active_output_sample_format) << '\n';
+    } else if (precision_setting == "auto") {
         out << "Auto → " << output_bits << "-bit\n";
     } else {
         out << output_precision_label(precision_setting) << '\n';
@@ -7081,7 +7237,11 @@ std::string GtkPlayerWindow::processing_rules_report_for_entry(
         out << "Resampling: inactive\n";
     }
     out << "Resampler: " << (entry.resampled ? "initializing" : "inactive") << '\n';
-    if (working_bits != output_bits) {
+    if (pcm_output_is_floating(active_output_sample_format)) {
+        out << "Output conversion: "
+            << pcm_output_format_name(active_output_sample_format)
+            << " output\n";
+    } else if (working_bits != output_bits) {
         out << "Output conversion: " << working_bits << "-bit → "
             << output_bits << "-bit\n";
     } else {
@@ -7205,6 +7365,10 @@ std::string GtkPlayerWindow::current_decoder_processing_report() const {
     const PlaybackTransportSnapshot transport = engine_.transport_snapshot();
     const std::uint16_t channels = transport.format.channels;
 
+    if (!transport.playing || channels == 0) {
+        return "Decoder:\nState: inactive\n\nProcessing:\nState: inactive";
+    }
+
     out << "Decoder:\n";
     if (transport.playing && channels > 0) {
         const std::string source_codec = engine_.source_codec_name();
@@ -7228,11 +7392,20 @@ std::string GtkPlayerWindow::current_decoder_processing_report() const {
             out << " (" << decoded_significant_bits << " significant bits)";
         }
         out << '\n';
-        out << "Working PCM: S" << transport.working_format.bits_per_sample
-            << " / " << transport.working_format.sample_rate << " Hz / "
+        const PcmStorageFormat working_storage = engine_.pcm_storage_format();
+        out << "Working PCM: ";
+        if (working_storage == PcmStorageFormat::NativeInt32) {
+            out << "S" << transport.working_format.bits_per_sample;
+        } else {
+            out << pcm_storage_format_name(working_storage);
+        }
+        out << " / " << transport.working_format.sample_rate << " Hz / "
             << static_cast<unsigned>(transport.working_format.channels) << " ch\n";
-    } else {
-        out << "State: inactive\n";
+        if (working_storage == PcmStorageFormat::NativeInt32) {
+            out << "PCM domain: Exact integer\n";
+        } else {
+            out << "PCM domain: Floating (unity = 1.0)\n";
+        }
     }
 
     out << "\nProcessing:\n";
@@ -7248,7 +7421,8 @@ std::string GtkPlayerWindow::current_decoder_processing_report() const {
             active_track_transport_states_[report_index];
         std::string processing_report = state.processing_report;
         processing_report = replace_output_conversion_runtime_line(
-            processing_report, transport.working_format, transport.format);
+            processing_report, transport.working_format, transport.format,
+            engine_.pcm_storage_format(), engine_.output_format());
         if (state.resampler_runtime_reported) {
             processing_report = replace_resampler_runtime_line(
                 processing_report,
@@ -9954,9 +10128,11 @@ void GtkPlayerWindow::play_track_index_at_offset(std::size_t index,
         alsa_backend->set_24bit_container_mode(
             alsa_24bit_mode_from_id(alsa_24bit_container_mode_));
         engine_.set_realtime_priority_enabled(realtime_audio_priority_enabled_);
+        const std::string playback_device = effective_alsa_device_name(
+            cards_, current_device_, alsa_path_mode_);
         engine_.start(std::move(decoder),
                       std::move(alsa_backend),
-                      current_device_,
+                      playback_device,
                       output_precision_candidates_for_entry(track),
                       initial_offset,
                       std::move(logical_segment_offsets),
@@ -9971,20 +10147,21 @@ void GtkPlayerWindow::play_track_index_at_offset(std::size_t index,
                 if (playlist_index >= playlist_.size()) continue;
                 ActiveTrackTransportState& state = active_states[i];
                 state.processing_report = processing_rules_report_for_entry(
-                    playlist_[playlist_index], negotiated_output_format);
+                    playlist_[playlist_index], negotiated_output_format,
+                    engine_.output_format());
                 finalize_processing_state(state);
             }
         } else if (!active_states.empty()) {
             ActiveTrackTransportState& state = active_states.front();
             state.processing_report = processing_rules_report_for_entry(
-                track, negotiated_output_format);
+                track, negotiated_output_format, engine_.output_format());
             finalize_processing_state(state);
         }
 
         ensure_meter_timer_running();
         active_range_limited_transport_ = range_limited_transport;
         active_gapless_transport_kind_ = gapless_transport_kind;
-        active_output_device_ = current_device_;
+        active_output_device_ = playback_device;
         active_track_transport_states_ = std::move(active_states);
         clear_random_stopped_preview();
         record_track_started(index, start_reason);
@@ -10217,7 +10394,8 @@ void GtkPlayerWindow::open_settings_dialog() {
         const std::string label = card.hw_device + " — " + card.short_name +
                                   (!card.pcm_device_name.empty() ? " [" + card.pcm_device_name + "]" : "");
         gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(combo), card.hw_device.c_str(), label.c_str());
-        if (card.hw_device == current_device_) {
+        if (card.hw_device == current_device_ ||
+            card.plughw_device == current_device_) {
             active_index = combo_index;
         }
         ++combo_index;
@@ -10229,12 +10407,50 @@ void GtkPlayerWindow::open_settings_dialog() {
         gtk_widget_set_tooltip_text(combo, active_text);
         g_free(active_text);
     }
-    g_signal_connect(combo, "changed", G_CALLBACK(+[](GtkComboBox* combo_box, gpointer) {
+
+    bool current_device_is_plug = false;
+    for (const CardProfileInfo& card : cards_) {
+        if (card.plughw_device == current_device_) {
+            current_device_is_plug = true;
+            break;
+        }
+    }
+
+    GtkWidget* lbl_alsa_path = gtk_label_new("ALSA path:");
+    gtk_label_set_xalign(GTK_LABEL(lbl_alsa_path), 0.0f);
+    gtk_widget_set_valign(lbl_alsa_path, GTK_ALIGN_CENTER);
+    GtkWidget* alsa_path_combo = gtk_combo_box_text_new();
+    gtk_combo_box_text_append(
+        GTK_COMBO_BOX_TEXT(alsa_path_combo), "direct", "Direct");
+    gtk_combo_box_text_append(
+        GTK_COMBO_BOX_TEXT(alsa_path_combo), "plug", "Plug");
+    const std::string initial_alsa_path = current_device_is_plug
+        ? std::string("plug")
+        : normalize_alsa_path_id(alsa_path_mode_);
+    gtk_combo_box_set_active(
+        GTK_COMBO_BOX(alsa_path_combo),
+        active_index == 0 ? 0 : alsa_path_combo_index(initial_alsa_path));
+    gtk_widget_set_halign(alsa_path_combo, GTK_ALIGN_START);
+    gtk_widget_set_sensitive(alsa_path_combo, active_index != 0);
+    gtk_widget_set_tooltip_text(
+        alsa_path_combo,
+        "Direct opens the hardware PCM.\nPlug allows ALSA to convert format, rate or channels.");
+
+    g_signal_connect(combo, "changed", G_CALLBACK(+[](GtkComboBox* combo_box, gpointer user_data) {
+        GtkWidget* path_combo = GTK_WIDGET(user_data);
         gchar* active_text = gtk_combo_box_text_get_active_text(
             GTK_COMBO_BOX_TEXT(combo_box));
         gtk_widget_set_tooltip_text(GTK_WIDGET(combo_box), active_text);
         g_free(active_text);
-    }), nullptr);
+
+        const gchar* active_id = gtk_combo_box_get_active_id(combo_box);
+        const bool hardware_device =
+            active_id != nullptr && std::string(active_id) != "default";
+        gtk_widget_set_sensitive(path_combo, hardware_device ? TRUE : FALSE);
+        if (!hardware_device) {
+            gtk_combo_box_set_active_id(GTK_COMBO_BOX(path_combo), "direct");
+        }
+    }), alsa_path_combo);
 
     GtkWidget* advanced_title = gtk_label_new(nullptr);
     gtk_label_set_markup(GTK_LABEL(advanced_title), "<b>Advanced audio:</b>");
@@ -10247,6 +10463,8 @@ void GtkPlayerWindow::open_settings_dialog() {
         gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(combo_box), "16", "16-bit");
         gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(combo_box), "24", "24-bit");
         gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(combo_box), "32", "32-bit");
+        gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(combo_box), "float", "Float32");
+        gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(combo_box), "float64", "Float64");
         gtk_combo_box_set_active(
             GTK_COMBO_BOX(combo_box), output_precision_combo_index(setting));
         gtk_widget_set_halign(combo_box, GTK_ALIGN_START);
@@ -10260,7 +10478,7 @@ void GtkPlayerWindow::open_settings_dialog() {
     GtkWidget* precision_16bit_combo =
         create_precision_combo(
             output_precision_16bit_lossy_,
-            "Sets logical output precision.\nAuto: 32 → 24 → 16.");
+            "Sets ALSA output format.\nAuto: S32 → S24 → S16.");
 
     GtkWidget* lbl_24bit_precision = gtk_label_new("24-bit source output:");
     gtk_label_set_xalign(GTK_LABEL(lbl_24bit_precision), 0.0f);
@@ -10268,7 +10486,7 @@ void GtkPlayerWindow::open_settings_dialog() {
     GtkWidget* precision_24bit_combo =
         create_precision_combo(
             output_precision_24bit_,
-            "Sets logical output precision.\nAuto: 24 → 32 → 16.");
+            "Sets ALSA output format.\nAuto: S24 → S32 → S16.");
 
     GtkWidget* lbl_32bit_precision = gtk_label_new("32-bit source output:");
     gtk_label_set_xalign(GTK_LABEL(lbl_32bit_precision), 0.0f);
@@ -10276,7 +10494,7 @@ void GtkPlayerWindow::open_settings_dialog() {
     GtkWidget* precision_32bit_combo =
         create_precision_combo(
             output_precision_32bit_,
-            "Sets logical output precision.\nAuto: 32 → 24 → 16.");
+            "Sets ALSA output format.\nAuto: S32 → S24 → S16.");
 
     GtkWidget* lbl_16bit_quantization = gtk_label_new("16-bit quantization:");
     gtk_label_set_xalign(GTK_LABEL(lbl_16bit_quantization), 0.0f);
@@ -10296,7 +10514,8 @@ void GtkPlayerWindow::open_settings_dialog() {
         quantization_16bit_combo,
         "Round to nearest (even): ties to even.\n"
         "Round half up: ties toward +infinity.\n"
-        "Truncate: discards low bits.");
+        "Truncate: discards low bits.\n"
+        "Takes effect on next playback start.");
 
     GtkWidget* lbl_16bit_dither = gtk_label_new("16-bit dither:");
     gtk_label_set_xalign(GTK_LABEL(lbl_16bit_dither), 0.0f);
@@ -10315,7 +10534,8 @@ void GtkPlayerWindow::open_settings_dialog() {
     gtk_widget_set_tooltip_text(
         dither_16bit_combo,
         "Classic: first-difference high-pass TPDF.\n"
-        "Mild: mild high-pass TPDF.");
+        "Mild: mild high-pass TPDF.\n"
+        "Takes effect on next playback start.");
 
     GtkWidget* lbl_alsa_24 = gtk_label_new("24-bit ALSA container:");
     gtk_label_set_xalign(GTK_LABEL(lbl_alsa_24), 0.0f);
@@ -10354,7 +10574,7 @@ void GtkPlayerWindow::open_settings_dialog() {
         "Restart required after changing this permission.";
     gtk_widget_set_tooltip_text(rt_permission_status, direct_rt_tooltip);
 
-    GtkWidget* rt_grant_button = gtk_button_new_with_label("Grant direct RT permission");
+    GtkWidget* rt_grant_button = gtk_button_new_with_label("Grant");
     GtkWidget* rt_revoke_button = gtk_button_new_with_label("Revoke");
     if (appimage_runtime) {
         const char* appimage_rt_tooltip =
@@ -10406,9 +10626,12 @@ void GtkPlayerWindow::open_settings_dialog() {
     GtkWidget* ui_title = gtk_label_new(nullptr);
     gtk_label_set_markup(GTK_LABEL(ui_title), "<b>UI / display:</b>");
     gtk_label_set_xalign(GTK_LABEL(ui_title), 0.0f);
-    GtkWidget* level_meter_check = gtk_check_button_new_with_label("Enable level meter");
+    GtkWidget* level_meter_check = gtk_check_button_new_with_label("Level meter");
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(level_meter_check), level_meter_enabled_ ? TRUE : FALSE);
-    GtkWidget* clip_detect_check = gtk_check_button_new_with_label("Enable DSP clip detection");
+    gtk_widget_set_tooltip_text(
+        level_meter_check,
+        "Shows the current playback level.");
+    GtkWidget* clip_detect_check = gtk_check_button_new_with_label("DSP clip detection");
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(clip_detect_check), clip_detection_enabled_ ? TRUE : FALSE);
     gtk_widget_set_tooltip_text(
         clip_detect_check,
@@ -10416,8 +10639,11 @@ void GtkPlayerWindow::open_settings_dialog() {
     GtkWidget* progress_blink_check = gtk_check_button_new_with_label("Animate progress indicator");
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(progress_blink_check), progress_blink_enabled_ ? TRUE : FALSE);
     GtkWidget* playlist_search_check =
-        gtk_check_button_new_with_label("Enable playlist search");
+        gtk_check_button_new_with_label("Playlist search");
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(playlist_search_check), playlist_search_enabled_ ? TRUE : FALSE);
+    gtk_widget_set_tooltip_text(
+        playlist_search_check,
+        "Shows a search field for filtering the playlist.");
 
     GtkWidget* playlist_column_widths_check =
         gtk_check_button_new_with_label("Remember playlist column widths");
@@ -10426,8 +10652,7 @@ void GtkPlayerWindow::open_settings_dialog() {
         playlist_column_widths_remember_enabled_ ? TRUE : FALSE);
     gtk_widget_set_tooltip_text(
         playlist_column_widths_check,
-        "Remembers manual playlist column widths.\n"
-        "Long text is shown with an ellipsis.");
+        "Remembers manual playlist column widths.");
 
     GtkWidget* window_size_row = gtk_grid_new();
     gtk_grid_set_column_spacing(GTK_GRID(window_size_row), kGuiColumnSpacing);
@@ -10472,7 +10697,7 @@ void GtkPlayerWindow::open_settings_dialog() {
     GtkWidget* log_title = gtk_label_new(nullptr);
     gtk_label_set_markup(GTK_LABEL(log_title), "<b>Logging:</b>");
     gtk_label_set_xalign(GTK_LABEL(log_title), 0.0f);
-    GtkWidget* log_check = gtk_check_button_new_with_label("Enable log");
+    GtkWidget* log_check = gtk_check_button_new_with_label("Enable logging");
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(log_check), logging_enabled_ ? TRUE : FALSE);
     GtkWidget* log_mode_combo = gtk_combo_box_text_new();
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(log_mode_combo), "All events");
@@ -10517,6 +10742,8 @@ void GtkPlayerWindow::open_settings_dialog() {
     gtk_widget_set_hexpand(combo, TRUE);
     gtk_grid_attach(GTK_GRID(device_grid), lbl_device, 0, 0, 1, 1);
     gtk_grid_attach(GTK_GRID(device_grid), combo, 1, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(device_grid), lbl_alsa_path, 0, 1, 1, 1);
+    gtk_grid_attach(GTK_GRID(device_grid), alsa_path_combo, 1, 1, 1, 1);
 
     GtkWidget* advanced_section = gtk_box_new(GTK_ORIENTATION_VERTICAL, kGuiRowSpacing);
     gtk_widget_set_hexpand(advanced_section, TRUE);
@@ -10539,8 +10766,8 @@ void GtkPlayerWindow::open_settings_dialog() {
     gtk_widget_set_valign(ui_section, GTK_ALIGN_START);
     gtk_box_pack_start(GTK_BOX(ui_section), ui_title, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(ui_section), level_meter_check, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(ui_section), clip_detect_check, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(ui_section), progress_blink_check, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(ui_section), clip_detect_check, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(ui_section), playlist_search_check, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(ui_section), playlist_column_widths_check, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(ui_section), window_size_row, FALSE, FALSE, 0);
@@ -10706,6 +10933,14 @@ void GtkPlayerWindow::open_settings_dialog() {
         if (selected != nullptr) {
             current_device_ = std::string(selected);
         }
+        const gchar* alsa_path_id =
+            gtk_combo_box_get_active_id(GTK_COMBO_BOX(alsa_path_combo));
+        alsa_path_mode_ = current_device_ == "default"
+            ? std::string("direct")
+            : normalize_alsa_path_id(
+                  alsa_path_id != nullptr
+                      ? std::string(alsa_path_id)
+                      : std::string("direct"));
         const gchar* alsa24_id = gtk_combo_box_get_active_id(GTK_COMBO_BOX(alsa_24_combo));
         alsa_24bit_container_mode_ = normalize_alsa_24bit_mode_id(alsa24_id != nullptr ? std::string(alsa24_id) : std::string("auto"));
         const auto selected_precision = [](GtkWidget* combo_box) {
@@ -10861,7 +11096,7 @@ void GtkPlayerWindow::open_about_dialog() {
     }
 
     GtkWidget* title = gtk_label_new(nullptr);
-    gtk_label_set_markup(GTK_LABEL(title), "<b>PCM Transport 0.9.119</b>");
+    gtk_label_set_markup(GTK_LABEL(title), "<b>PCM Transport 0.9.120</b>");
     gtk_label_set_xalign(GTK_LABEL(title), 0.5f);
     GtkWidget* subtitle = gtk_label_new("Digital Audio Player");
     gtk_label_set_xalign(GTK_LABEL(subtitle), 0.5f);
@@ -11265,7 +11500,7 @@ void GtkPlayerWindow::open_bitperfect_test_dialog(GtkWidget* parent_dialog, int 
                 return;
             }
             post_diagnostics_update(text_view, progress, close_button,
-                "PCM Transport FLAC bit-perfect test\nVersion: 0.9.119\nScope: native libFLAC path before ALSA; resampling excluded\nFFmpeg API: not used\n", 0.02, false);
+                "PCM Transport FLAC bit-perfect test\nVersion: 0.9.120\nScope: native libFLAC path before ALSA; resampling excluded\nFFmpeg API: not used\n", 0.02, false);
             std::ostringstream ctx;
             ctx << "Duration: " << duration_seconds << " sec\n"
                 << "Generated signal: deterministic 16-bit / 44.1 kHz / stereo stress pattern\n"
@@ -11409,14 +11644,14 @@ void GtkPlayerWindow::open_eq_dialog() {
     gtk_widget_set_hexpand(root, TRUE);
     gtk_widget_set_vexpand(root, TRUE);
     set_pcm_outer_margins(root);
-    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), root, gtk_label_new("Tone Controls"));
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), root, gtk_label_new("Tone controls"));
 
     GtkWidget* processing_root =
         gtk_box_new(GTK_ORIENTATION_VERTICAL, kGuiSectionSpacing);
     gtk_widget_set_hexpand(processing_root, TRUE);
     gtk_widget_set_vexpand(processing_root, TRUE);
     set_pcm_outer_margins(processing_root);
-    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), processing_root, gtk_label_new("Processing Rules"));
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), processing_root, gtk_label_new("Processing rules"));
 
     GtkWidget* dsd_scrolled = gtk_scrolled_window_new(nullptr, nullptr);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(dsd_scrolled),
@@ -11438,7 +11673,7 @@ void GtkPlayerWindow::open_eq_dialog() {
         return page;
     };
     GtkWidget* alsa_diagnostics_root =
-        create_notebook_page("ALSA Output Diagnostics");
+        create_notebook_page("Playback diagnostics");
     diagnostics_page_ = alsa_diagnostics_root;
     diagnostics_page_active_ = false;
     g_signal_connect(notebook, "switch-page", G_CALLBACK(+[](
@@ -11490,7 +11725,7 @@ void GtkPlayerWindow::open_eq_dialog() {
     GtkWidget* dsd_rate_section =
         gtk_box_new(GTK_ORIENTATION_VERTICAL, kGuiRowSpacing);
     GtkWidget* dsd_header = make_header(
-        "DSD to PCM Conversion",
+        "DSD to PCM conversion",
         "Select PCM output rates for DSD decoded through the FFmpeg API.\n"
         "Native DSD and DoP output are not used.");
     gtk_box_pack_start(GTK_BOX(dsd_rate_section), dsd_header, FALSE, FALSE, 0);
@@ -11590,7 +11825,7 @@ void GtkPlayerWindow::open_eq_dialog() {
             if (!selected_in_standard_list && selected_rate <= definition.ffmpeg_pcm_rate) {
                 append_rate(selected_rate);
             }
-            gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(combo), "0", "FFmpeg API output — no additional resampling");
+            gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(combo), "0", "FFmpeg output — no resampling");
             gtk_combo_box_set_active_id(GTK_COMBO_BOX(combo), std::to_string(selected_rate).c_str());
 
             g_object_set_data(G_OBJECT(combo), "pcm-dsd-rate", GUINT_TO_POINTER(definition.dsd_sample_rate));
@@ -11633,14 +11868,14 @@ void GtkPlayerWindow::open_eq_dialog() {
         gtk_box_new(GTK_ORIENTATION_VERTICAL, kGuiRowSpacing);
     gtk_box_pack_start(
         GTK_BOX(dsd_precision_section),
-        make_header("DSD Output",
-                    "Sets final PCM precision after DSD conversion and DSP."),
+        make_header("DSD output",
+                    "Sets final PCM output format after DSD conversion and DSP."),
         FALSE, FALSE, 0);
     GtkWidget* dsd_precision_grid = gtk_grid_new();
     gtk_grid_set_row_spacing(GTK_GRID(dsd_precision_grid), kGuiRowSpacing);
     gtk_grid_set_column_spacing(GTK_GRID(dsd_precision_grid), kGuiColumnSpacing);
     gtk_widget_set_valign(dsd_precision_grid, GTK_ALIGN_START);
-    GtkWidget* dsd_precision_label = gtk_label_new("DSD output precision:");
+    GtkWidget* dsd_precision_label = gtk_label_new("DSD output format:");
     gtk_label_set_xalign(GTK_LABEL(dsd_precision_label), 0.0f);
     gtk_widget_set_valign(dsd_precision_label, GTK_ALIGN_CENTER);
     GtkWidget* dsd_precision_combo = gtk_combo_box_text_new();
@@ -11652,13 +11887,17 @@ void GtkPlayerWindow::open_eq_dialog() {
         GTK_COMBO_BOX_TEXT(dsd_precision_combo), "24", "24-bit");
     gtk_combo_box_text_append(
         GTK_COMBO_BOX_TEXT(dsd_precision_combo), "32", "32-bit");
+    gtk_combo_box_text_append(
+        GTK_COMBO_BOX_TEXT(dsd_precision_combo), "float", "Float32");
+    gtk_combo_box_text_append(
+        GTK_COMBO_BOX_TEXT(dsd_precision_combo), "float64", "Float64");
     gtk_combo_box_set_active(
         GTK_COMBO_BOX(dsd_precision_combo),
         output_precision_combo_index(dsd_output_precision_));
     gtk_widget_set_halign(dsd_precision_combo, GTK_ALIGN_START);
     gtk_widget_set_tooltip_text(
         dsd_precision_combo,
-        "Sets logical output precision.\nAuto: 32 → 24 → 16.");
+        "Sets ALSA output format after DSD conversion.\nAuto: S32 → S24 → S16.");
     gtk_grid_attach(GTK_GRID(dsd_precision_grid), dsd_precision_label, 0, 0, 1, 1);
     gtk_grid_attach(GTK_GRID(dsd_precision_grid), dsd_precision_combo, 1, 0, 1, 1);
     gtk_box_pack_start(
@@ -11699,7 +11938,7 @@ void GtkPlayerWindow::open_eq_dialog() {
         gtk_box_new(GTK_ORIENTATION_VERTICAL, kGuiRowSpacing);
     gtk_widget_set_hexpand(volume_section, TRUE);
     gtk_box_pack_start(GTK_BOX(volume_section),
-                       make_header("Master DSP Volume",
+                       make_header("Master DSP volume",
                                    "Shared soft-volume stage for all DSP processing."),
                        FALSE, FALSE, 0);
     GtkWidget* volume_grid = gtk_grid_new();
@@ -11727,7 +11966,7 @@ void GtkPlayerWindow::open_eq_dialog() {
     GtkWidget* headroom_grid = gtk_grid_new();
     gtk_grid_set_row_spacing(GTK_GRID(headroom_grid), row_spacing);
     gtk_grid_set_column_spacing(GTK_GRID(headroom_grid), col_spacing);
-    GtkWidget* headroom_label = gtk_label_new("Pre-EQ Headroom:");
+    GtkWidget* headroom_label = gtk_label_new("Pre-EQ headroom:");
     gtk_widget_set_valign(headroom_label, GTK_ALIGN_CENTER);
     gtk_label_set_xalign(GTK_LABEL(headroom_label), 0.0f);
     gtk_size_group_add_widget(tone_label_size_group, headroom_label);
@@ -11745,8 +11984,8 @@ void GtkPlayerWindow::open_eq_dialog() {
         gtk_box_new(GTK_ORIENTATION_VERTICAL, kGuiRowSpacing);
     gtk_widget_set_hexpand(tone_section, TRUE);
     gtk_box_pack_start(GTK_BOX(tone_section),
-                       make_header("Bass / Treble",
-                                   "Musical Baxandall-like shelves for low and high tone shaping."),
+                       make_header("Bass / treble",
+                                   "Baxandall-like low and high shelving filters."),
                        FALSE, FALSE, 0);
     GtkWidget* tone_grid = gtk_grid_new();
     gtk_grid_set_row_spacing(GTK_GRID(tone_grid), row_spacing);
@@ -11874,7 +12113,7 @@ data->self->draw_tone_response_graph(cr, alloc.width, alloc.height);
         gtk_box_new(GTK_ORIENTATION_VERTICAL, kGuiRowSpacing);
     gtk_box_pack_start(
         GTK_BOX(processing_policy_section),
-        make_header("Processing Rules",
+        make_header("Processing rules",
                     "Optional sample-rate conversion rules."),
         FALSE, FALSE, 0);
 
@@ -11909,7 +12148,7 @@ data->self->draw_tone_response_graph(cr, alloc.width, alloc.height);
     GtkWidget* sample_rate_rules_section =
         gtk_box_new(GTK_ORIENTATION_VERTICAL, kGuiRowSpacing);
     GtkWidget* resample_header = make_header(
-        "Sample-rate Rules",
+        "Sample-rate rules",
         "Maps source sample rates to output sample rates.");
     gtk_box_pack_start(
         GTK_BOX(sample_rate_rules_section), resample_header, FALSE, FALSE, 0);
@@ -12214,7 +12453,7 @@ data->self->draw_tone_response_graph(cr, alloc.width, alloc.height);
     auto* diag_btn_data = new BitPerfectButtonData{this, dialog, diag_duration_combo};
     g_signal_connect_data(diag_run_button, "clicked", G_CALLBACK(GtkPlayerWindow::on_run_bitperfect_test_clicked), diag_btn_data, destroy_bitperfect_button_data, static_cast<GConnectFlags>(0));
 
-    attach_alsa_diagnostics(make_header("ALSA output diagnostics", "Shows the active ALSA path, playback transport, gapless state, processing rules and selected PCM device capabilities."));
+    attach_alsa_diagnostics(make_header("Playback diagnostics", "Shows the active decoder, processing, ALSA output and transport state."));
     GtkWidget* alsa_diag_section =
         gtk_box_new(GTK_ORIENTATION_VERTICAL, kGuiRowSpacing);
     gtk_widget_set_margin_start(alsa_diag_section, section_indent);
@@ -12298,7 +12537,12 @@ data->self->draw_tone_response_graph(cr, alloc.width, alloc.height);
     g_signal_connect(probe_alsa_button, "clicked", G_CALLBACK(+[](GtkButton*, gpointer user_data) {
         auto* self = static_cast<GtkPlayerWindow*>(user_data);
         if (self == nullptr) return;
-        const AlsaProbeMatrix matrix = AlsaPcmBackend::probe_device_format_matrix(self->current_device_);
+        const std::string direct_device =
+            alsa_direct_device_name(self->cards_, self->current_device_);
+        const std::string plug_device =
+            alsa_plug_device_name(self->cards_, self->current_device_);
+        const AlsaProbeMatrix matrix = AlsaPcmBackend::probe_device_format_matrix(
+            direct_device, plug_device);
         show_alsa_probe_table_dialog(GTK_WINDOW(self->window_), matrix);
     }), this);
 
@@ -12520,12 +12764,16 @@ void GtkPlayerWindow::refresh_display(const PlaybackStatusSnapshot& status,
             status.playing, status.format, track);
         const std::string output_precision_setting =
             output_precision_setting_for_entry(track);
+        const PcmOutputFormat active_output_sample_format =
+            engine_.output_format();
         const std::string shown_bits_text =
-            status.playing && status.format.bits_per_sample > 0
-                ? std::to_string(status.format.bits_per_sample)
-                : (output_precision_setting == "auto"
-                       ? std::string("Auto")
-                       : output_precision_setting);
+            status.playing && pcm_output_is_floating(active_output_sample_format)
+                ? std::string(pcm_output_format_name(active_output_sample_format))
+                : (status.playing && status.format.bits_per_sample > 0
+                       ? std::to_string(status.format.bits_per_sample)
+                       : (output_precision_setting == "auto"
+                              ? std::string("Auto")
+                              : output_precision_label(output_precision_setting)));
         const ActiveTrackTransportState* active_state =
             status.playing ? active_track_transport_state() : nullptr;
         if (active_state != nullptr && !active_state->processing_path.empty()) {
@@ -14072,6 +14320,8 @@ void GtkPlayerWindow::load_preferences() {
             have_last_active_track_cue_flag = true;
         } else if (key == "current_device") {
             current_device_ = value;
+        } else if (key == "alsa_path_mode") {
+            alsa_path_mode_ = normalize_alsa_path_id(value);
         } else if (key == "soft_volume_percent") {
             try { soft_volume_percent_ = std::stoi(value); } catch (...) {}
             if (soft_volume_percent_ < 0) soft_volume_percent_ = 0;
@@ -14217,6 +14467,7 @@ void GtkPlayerWindow::load_preferences() {
     saved_last_open_directory_ = last_open_directory_;
     current_loaded_sources_initialized_ = false;
 
+    alsa_path_mode_ = normalize_alsa_path_id(alsa_path_mode_);
     alsa_24bit_container_mode_ =
         normalize_alsa_24bit_mode_id(alsa_24bit_container_mode_);
     output_precision_16bit_lossy_ =
@@ -14267,6 +14518,7 @@ std::string GtkPlayerWindow::serialize_preferences() const {
         }
     }
     out << "current_device=" << current_device_ << '\n';
+    out << "alsa_path_mode=" << normalize_alsa_path_id(alsa_path_mode_) << '\n';
     out << "soft_volume_percent=" << soft_volume_percent_ << '\n';
     out << "bass_db=" << bass_db_ << '\n';
     out << "treble_db=" << treble_db_ << '\n';

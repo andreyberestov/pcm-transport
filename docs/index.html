@@ -2,8 +2,8 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>PCM Transport — Linux FLAC/WAV Player with GTK, ALSA and DSP Studio</title>
-  <meta name="description" content="PCM Transport is a lightweight open-source Linux audio player with native FLAC playback through libFLAC, direct ALSA output, GTK interface, DSP Studio and transparent signal-path diagnostics.">
+  <title>PCM Transport — Linux Audio Player with ALSA and DSP</title>
+  <meta name="description" content="PCM Transport is an open-source Linux audio player with native FLAC decoding, FFmpeg library decoding, direct ALSA output, optional DSP and signal-path diagnostics.">
   <meta name="viewport" content="width=device-width, initial-scale=1">
 
   <meta name="google-site-verification" content="LaX8w2fVCSqvaE7lpvXAm_Dbg1c70HW8lHM2qU0yz1k">
@@ -12,16 +12,16 @@
   <link rel="icon" type="image/png" href="icon.png">
 
   <meta property="og:type" content="website">
-  <meta property="og:title" content="PCM Transport — Linux FLAC/WAV Player">
-  <meta property="og:description" content="A lightweight open-source Linux audio player with native FLAC playback, direct ALSA output, DSP Studio and transparent signal-path diagnostics.">
+  <meta property="og:title" content="PCM Transport — Linux Audio Player">
+  <meta property="og:description" content="Open-source Linux audio player with native FLAC decoding, FFmpeg library decoding, direct ALSA output, optional DSP and signal-path diagnostics.">
   <meta property="og:url" content="https://andreyberestov.github.io/pcm-transport/">
   <meta property="og:site_name" content="PCM Transport">
   <meta property="og:image" content="https://raw.githubusercontent.com/andreyberestov/pcm-transport/refs/heads/main/screenshots/main.png">
   <meta property="og:image:alt" content="PCM Transport main window showing playback controls and diagnostics">
 
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="PCM Transport — Linux FLAC/WAV Player">
-  <meta name="twitter:description" content="Native FLAC via libFLAC, direct ALSA output, DSP Studio and honest playback diagnostics for Linux.">
+  <meta name="twitter:title" content="PCM Transport — Linux Audio Player">
+  <meta name="twitter:description" content="Native FLAC decoding, FFmpeg library decoding, direct ALSA output, optional DSP and signal-path diagnostics for Linux.">
   <meta name="twitter:image" content="https://raw.githubusercontent.com/andreyberestov/pcm-transport/refs/heads/main/screenshots/main.png">
 
   <script type="application/ld+json">
@@ -31,7 +31,7 @@
     "name": "PCM Transport",
     "applicationCategory": "MultimediaApplication",
     "operatingSystem": "Linux",
-    "description": "PCM Transport is a lightweight open-source Linux audio player with native FLAC playback through libFLAC, direct ALSA output, GTK interface, DSP Studio and transparent signal-path diagnostics.",
+    "description": "PCM Transport is an open-source Linux audio player with native FLAC decoding, FFmpeg library decoding, direct ALSA output, optional DSP and signal-path diagnostics.",
     "author": {
       "@type": "Person",
       "name": "Andrey Berestov"
@@ -438,8 +438,8 @@
       </div>
 
       <p class="subtitle">
-        A lightweight Linux desktop audio player focused on transparent PCM transport,
-        native FLAC playback, direct ALSA output, predictable DSP and honest signal-path diagnostics.
+        Linux desktop audio player with native FLAC decoding, FFmpeg library decoding,
+        direct ALSA output, optional DSP and signal-path diagnostics.
       </p>
 
       <div class="buttons">
@@ -472,10 +472,10 @@
       </figure>
     </div>
 
-    <h2>What it is</h2>
+    <h2>Overview</h2>
     <p class="section-intro">
-      PCM Transport is a compact Linux desktop audio player focused on direct PCM playback,
-      transparent signal-path reporting, native FLAC decoding and optional DSP processing.
+      PCM Transport is a Linux desktop audio player for direct PCM playback,
+      optional DSP processing and explicit signal-path diagnostics.
     </p>
 
     <div class="grid">
@@ -487,7 +487,7 @@
           </svg>
         </div>
         <h3>Native FLAC playback</h3>
-        <p>Native FLAC decoding via libFLAC</p>
+        <p>FLAC uses the native libFLAC path when sample-rate conversion is not required.</p>
       </div>
 
       <div class="card">
@@ -497,8 +497,8 @@
             <path d="M11 9h2M19 9h2M11 14h2M19 14h2M11 19h2M19 19h2M11 24h2M19 24h2"/>
           </svg>
         </div>
-        <h3>Additional formats via FFmpeg API</h3>
-        <p>MP3, OGG, WAV, AIFF, APE, WV, DSF/DFF and more via the FFmpeg API</p>
+        <h3>Additional formats via FFmpeg libraries</h3>
+        <p>MP3, OGG, WAV, AIFF, APE, WV, DSF/DFF and other formats via FFmpeg libraries.</p>
       </div>
 
       <div class="card">
@@ -534,8 +534,8 @@
             <path d="M13 16h10"/>
           </svg>
         </div>
-        <h3>Gapless-oriented playback</h3>
-        <p>Continuous CUE image playback, local M3U/M3U8 import and same-format file chaining where possible.</p>
+        <h3>Gapless playback</h3>
+        <p>Continuous CUE image playback and gapless chaining across compatible tracks.</p>
       </div>
 
       <div class="card">
@@ -548,46 +548,42 @@
           </svg>
         </div>
         <h3>DSP Studio</h3>
-        <p>Bass/Treble controls and optional processing rules.</p>
+        <p>Bass/treble controls and optional processing rules.</p>
       </div>
 
     </div>
 
-    <h2>Why another Linux audio player?</h2>
+    <h2>Scope</h2>
     <div class="text-panel">
       <p>
-        PCM Transport is a focused, lightweight FLAC player for Linux — direct ALSA output, native libFLAC decoding, CUE/gapless support, and optional DSP that can be fully bypassed.
+        PCM Transport is a playback-focused Linux audio player with direct ALSA output, gapless playback, optional DSP and signal-path diagnostics.
       </p>
       <p>
-        Not a music library manager, just honest playback with a visible signal path.
+        It is not a music library manager.
       </p>
     </div>
 
     <h2>Supported formats</h2>
     <p class="section-intro">
-      Native FLAC playback is handled through libFLAC. Additional formats use the FFmpeg API directly. The ffmpeg and ffprobe command-line tools are not required.
-      DSF and DFF sources, including DST-compressed DFF, are converted to PCM; native DSD and DoP output are not used. Rare-format support depends on the local FFmpeg build.
+      FLAC uses the native libFLAC path when sample-rate conversion is not required. Other formats and conversion paths use FFmpeg libraries directly.
+      The ffmpeg and ffprobe command-line tools are not used. DSF and DFF sources, including DST-compressed DFF, are converted to PCM; native DSD and DoP output are not used. Codec support depends on the local FFmpeg build.
     </p>
 
     <div class="grid">
       <div class="card">
-        <h3>Native / primary</h3>
+        <h3>Primary inputs</h3>
         <p><code>*.flac</code>, <code>*.wav</code>, <code>*.wave</code>, <code>*.cue</code>, <code>*.m3u</code>, <code>*.m3u8</code></p>
       </div>
       <div class="card">
-        <h3>FFmpeg-backed lossless / PCM / containers</h3>
-        <p><code>*.aif</code>, <code>*.aiff</code>, <code>*.ape</code>, <code>*.wv</code>, <code>*.w64</code>, <code>*.bwf</code>, <code>*.au</code>, <code>*.snd</code>, <code>*.caf</code>, <code>*.voc</code>, <code>*.tak</code>, <code>*.tta</code>, <code>*.dsf</code>, <code>*.dff</code></p>
-      </div>
-      <div class="card">
-        <h3>FFmpeg-backed lossy</h3>
-        <p><code>*.mp3</code>, <code>*.mp2</code>, <code>*.m4a</code>, <code>*.m4r</code>, <code>*.aac</code>, <code>*.ac3</code>, <code>*.dts</code>, <code>*.ogg</code>, <code>*.oga</code>, <code>*.opus</code>, <code>*.spx</code>, <code>*.ra</code>, <code>*.wma</code>, <code>*.asf</code>, <code>*.xwma</code>, <code>*.wmv</code>, <code>*.oma</code>, <code>*.aa3</code>, <code>*.at3</code>, <code>*.mpc</code>, <code>*.mp+</code>, <code>*.mpp</code></p>
+        <h3>Additional FFmpeg-backed formats</h3>
+        <p><code>*.aif</code>, <code>*.aiff</code>, <code>*.ape</code>, <code>*.wv</code>, <code>*.w64</code>, <code>*.bwf</code>, <code>*.au</code>, <code>*.snd</code>, <code>*.caf</code>, <code>*.voc</code>, <code>*.tak</code>, <code>*.tta</code>, <code>*.dsf</code>, <code>*.dff</code>, <code>*.mp3</code>, <code>*.mp2</code>, <code>*.m4a</code>, <code>*.m4r</code>, <code>*.aac</code>, <code>*.ac3</code>, <code>*.dts</code>, <code>*.ogg</code>, <code>*.oga</code>, <code>*.opus</code>, <code>*.spx</code>, <code>*.ra</code>, <code>*.wma</code>, <code>*.asf</code>, <code>*.xwma</code>, <code>*.wmv</code>, <code>*.oma</code>, <code>*.aa3</code>, <code>*.at3</code>, <code>*.mpc</code>, <code>*.mp+</code>, <code>*.mpp</code></p>
       </div>
     </div>
 
     <h2>Download and run</h2>
     <p class="section-intro">
-      The easiest way to try PCM Transport is the ready-to-run Linux x86_64 AppImage from GitHub Releases.
-      Source build instructions are provided below for development and packaging.
+      A ready-to-run Linux x86_64 AppImage is available from GitHub Releases.
+      Source build instructions are provided below.
     </p>
 
     <div class="build-box">
@@ -678,15 +674,15 @@ cmake --build build -j</code></pre>
       conservatively disable optional capabilities unavailable on the
       supported baseline.
 
-      FLAC decoding remains native through libFLAC. Other formats,
-      metadata fallback and conversion paths use the FFmpeg API
+      FLAC decoding remains native through libFLAC when sample-rate conversion is not required. Other formats,
+      metadata fallback and conversion paths use FFmpeg libraries
       directly. The ffmpeg and ffprobe command-line tools are not used.
       Realtime audio priority is optional and can use RTKit or direct CAP_SYS_NICE scheduling.
     </p>
 
     <h2>Project goals</h2>
     <p>
-      A small, understandable Linux player focused on stability, transparent signal path and predictable DSP.
+      Playback-focused Linux audio player with direct ALSA output, optional DSP and explicit signal-path diagnostics.
     </p>
 
     <h2>Source code</h2>

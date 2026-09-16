@@ -49,13 +49,14 @@ public:
     void open(const std::string& path) override;
     void open_at_sample(const std::string& path, std::uint64_t sample_index) override;
     const AudioFormat& format() const override;
-    std::size_t read_samples(PcmSample* destination, std::size_t max_samples) override;
+    std::size_t read_samples(PcmBlock& destination, std::size_t max_samples) override;
     bool eof() const override;
     std::uint64_t total_samples_per_channel() const override;
     std::string source_path() const override;
     PresentationEndKind presentation_end_kind() const noexcept override;
     DecoderSegmentPosition segment_position() const noexcept override;
     TransportTruncationKind transport_truncation_kind() const noexcept override;
+    PcmStorageFormat pcm_storage_format() const noexcept override;
     ResamplerRuntimeKind resampler_runtime_kind() const noexcept override;
     Pcm16QuantizationRuntimeKind pcm16_quantization_runtime_kind() const noexcept override;
     std::uint32_t pcm16_quantization_stage_count() const noexcept override;
@@ -73,7 +74,8 @@ private:
     struct PreparedNext {
         std::size_t index = 0;
         std::unique_ptr<IAudioDecoder> decoder;
-        PcmBuffer prebuffer;
+        PcmBlock prebuffer;
+        AudioFormat working_format{};
         DecoderRuntimeStateSnapshot runtime_state{};
         bool ready = false;
         bool failed = false;
@@ -98,6 +100,7 @@ private:
     bool requested_segment_end_reached() const;
     std::uint64_t prepare_threshold_frames(std::size_t index) const;
     std::size_t prebuffer_samples(std::size_t index) const;
+    bool prepared_next_can_share_output_block() const;
     void publish_runtime_state(const DecoderRuntimeStateSnapshot& state);
 
     std::vector<GaplessTrackSpec> tracks_;
@@ -112,6 +115,8 @@ private:
     mutable std::mutex decoder_mutex_;
     std::atomic<ResamplerRuntimeKind> resampler_runtime_kind_{
         ResamplerRuntimeKind::NotUsed};
+    std::atomic<PcmStorageFormat> pcm_storage_format_{
+        PcmStorageFormat::NativeInt32};
     std::atomic<Pcm16QuantizationRuntimeKind> pcm16_quantization_runtime_kind_{
         Pcm16QuantizationRuntimeKind::NotUsed};
     std::atomic<std::uint32_t> pcm16_quantization_stage_count_{0};
@@ -133,7 +138,7 @@ private:
     mutable std::mutex prepare_mutex_;
     std::thread prepare_thread_;
     PreparedNext prepared_;
-    PcmBuffer current_prebuffer_;
+    PcmBlock current_prebuffer_;
     std::size_t current_prebuffer_offset_ = 0;
     bool preparing_ = false;
     IAudioDecoder* preparing_decoder_ = nullptr;

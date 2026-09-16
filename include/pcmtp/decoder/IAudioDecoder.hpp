@@ -33,6 +33,7 @@ struct DecoderSegmentPosition {
 
 struct DecoderRuntimeStateSnapshot {
     std::uint64_t generation = 0;
+    PcmStorageFormat pcm_storage_format = PcmStorageFormat::NativeInt32;
     ResamplerRuntimeKind resampler_runtime_kind = ResamplerRuntimeKind::NotUsed;
     Pcm16QuantizationRuntimeKind pcm16_quantization_runtime_kind =
         Pcm16QuantizationRuntimeKind::NotUsed;
@@ -56,7 +57,11 @@ public:
         }
     }
     virtual const AudioFormat& format() const = 0;
-    virtual std::size_t read_samples(PcmSample* destination, std::size_t max_samples) = 0;
+    // Appends at most max_samples interleaved samples to destination. A decoder
+    // may append only when destination is empty or already uses the same PCM
+    // storage format. This permits gapless concatenation without an extra copy.
+    virtual std::size_t read_samples(PcmBlock& destination,
+                                     std::size_t max_samples) = 0;
     virtual bool eof() const = 0;
     virtual std::uint64_t total_samples_per_channel() const = 0;
     virtual std::string source_path() const = 0;
@@ -68,6 +73,9 @@ public:
     }
     virtual TransportTruncationKind transport_truncation_kind() const noexcept {
         return TransportTruncationKind::None;
+    }
+    virtual PcmStorageFormat pcm_storage_format() const noexcept {
+        return PcmStorageFormat::NativeInt32;
     }
     virtual ResamplerRuntimeKind resampler_runtime_kind() const noexcept {
         return ResamplerRuntimeKind::NotUsed;
@@ -91,6 +99,7 @@ public:
     virtual DecoderRuntimeStateSnapshot runtime_state_snapshot() const {
         DecoderRuntimeStateSnapshot state;
         state.generation = runtime_state_generation();
+        state.pcm_storage_format = pcm_storage_format();
         state.resampler_runtime_kind = resampler_runtime_kind();
         state.pcm16_quantization_runtime_kind = pcm16_quantization_runtime_kind();
         state.pcm16_quantization_stage_count = pcm16_quantization_stage_count();

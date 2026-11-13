@@ -4016,7 +4016,7 @@ void GtkPlayerWindow::build_ui(GtkApplication* app) {
     start_metadata_worker();
     window_ = gtk_application_window_new(app);
     gtk_window_set_icon_name(GTK_WINDOW(window_), kApplicationId);
-    gtk_window_set_title(GTK_WINDOW(window_), "PCM Transport v0.9.120");
+    gtk_window_set_title(GTK_WINDOW(window_), "PCM Transport v0.9.121");
     gtk_window_set_default_size(GTK_WINDOW(window_), kDefaultWindowWidth, kDefaultWindowHeight);
     gtk_container_set_border_width(GTK_CONTAINER(window_), 16);
 
@@ -4911,7 +4911,6 @@ void GtkPlayerWindow::handle_transport_finished_event() {
     }
 
     cancel_progress_deadline();
-
     // Preserve the old ordering: logical gapless/CUE transitions are committed
     // before Random/Repeat/Next handles the physical transport completion.
     update_gapless_chain_track_from_status(status);
@@ -8875,6 +8874,7 @@ void GtkPlayerWindow::set_pending_metadata_playback(std::size_t index,
     pending_metadata_playback_.update_mpris_track = update_mpris_track;
     pending_metadata_playback_.preserve_explicit_selection = preserve_explicit_selection;
     pending_metadata_playback_.start_reason = start_reason;
+    pending_metadata_playback_.test_start_silence_ms = test_start_silence_ms_;
     pending_metadata_playback_.waiting_path = playlist_[index].audio_file_path;
     current_track_index_ = index;
     sync_playlist_selection_after_transport_change(index, preserve_explicit_selection);
@@ -8984,6 +8984,9 @@ void GtkPlayerWindow::try_start_pending_metadata_play(const std::string& path) {
 
     const PendingMetadataPlayback pending = pending_metadata_playback_;
     clear_pending_metadata_play();
+    // Restore the one-shot Test value only while opening the deferred PCM
+    // transport. Ordinary metadata-triggered starts retain saved settings.
+    test_start_silence_ms_ = pending.test_start_silence_ms;
     play_track_index_at_offset(pending.index,
                                pending.offset_samples,
                                pending.start_playback,
@@ -8991,6 +8994,11 @@ void GtkPlayerWindow::try_start_pending_metadata_play(const std::string& path) {
                                pending.update_mpris_track,
                                pending.preserve_explicit_selection,
                                pending.start_reason);
+    test_start_silence_ms_.reset();
+    if (pending.test_start_silence_ms.has_value() && engine_.is_playing()) {
+        start_silence_test_generation_ = engine_.transport_generation();
+    }
+    refresh_start_silence_test_button();
 }
 
 bool GtkPlayerWindow::current_track_metadata_ready() const {
@@ -10127,6 +10135,8 @@ void GtkPlayerWindow::play_track_index_at_offset(std::size_t index,
         auto alsa_backend = std::make_unique<AlsaPcmBackend>();
         alsa_backend->set_24bit_container_mode(
             alsa_24bit_mode_from_id(alsa_24bit_container_mode_));
+        alsa_backend->set_start_silence_ms(
+            test_start_silence_ms_.value_or(start_silence_ms_));
         engine_.set_realtime_priority_enabled(realtime_audio_priority_enabled_);
         const std::string playback_device = effective_alsa_device_name(
             cards_, current_device_, alsa_path_mode_);
@@ -10355,7 +10365,7 @@ void GtkPlayerWindow::open_directory_dialog() {
 void GtkPlayerWindow::open_settings_dialog() {
     refresh_device_list();
 
-    enum { RESPONSE_APPLY_CLOSE = 1002 };
+    enum { RESPONSE_APPLY_CLOSE = 1002, RESPONSE_TEST_SILENCE = 1003 };
     GtkWidget* dialog = gtk_dialog_new_with_buttons("Audio settings",
                                                     GTK_WINDOW(window_),
                                                     GTK_DIALOG_MODAL,
@@ -10554,6 +10564,41 @@ void GtkPlayerWindow::open_settings_dialog() {
         "Sets ALSA container for 24 significant bits.\n"
         "Auto: S24_LE → S24_3LE → S32_LE.");
 
+    GtkWidget* lbl_start_silence = gtk_label_new("Start silence:");
+    gtk_label_set_xalign(GTK_LABEL(lbl_start_silence), 0.0f);
+    gtk_widget_set_valign(lbl_start_silence, GTK_ALIGN_CENTER);
+    GtkWidget* start_silence_spin = gtk_spin_button_new_with_range(0, 2000, 10);
+    gtk_spin_button_set_digits(GTK_SPIN_BUTTON(start_silence_spin), 0);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(start_silence_spin), start_silence_ms_);
+    gtk_widget_set_halign(start_silence_spin, GTK_ALIGN_START);
+    const char* start_silence_hint =
+        "Increase if the device cuts off the beginning of playback.";
+    gtk_widget_set_tooltip_text(lbl_start_silence, start_silence_hint);
+    gtk_widget_set_tooltip_text(start_silence_spin,
+        "PCM silence before the first audio block. 0 disables it.");
+    GtkWidget* start_silence_unit = gtk_label_new("ms");
+    GtkWidget* start_silence_test = gtk_toggle_button_new_with_label("Test");
+    gtk_widget_set_tooltip_text(start_silence_test,
+        "Play selected track with this value.");
+    start_silence_test_button_ = start_silence_test;
+    start_silence_test_clicked_handler_id_ = 0;
+    start_silence_test_generation_ = 0;
+    gtk_widget_set_sensitive(start_silence_test, playlist_.empty() ? FALSE : TRUE);
+    GtkWidget* start_silence_controls = gtk_box_new(GTK_ORIENTATION_HORIZONTAL,
+                                                     kGuiButtonSpacing);
+    gtk_widget_set_halign(start_silence_controls, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(start_silence_controls), start_silence_spin,
+                       FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(start_silence_controls), start_silence_unit,
+                       FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(start_silence_controls), start_silence_test,
+                       FALSE, FALSE, 0);
+    start_silence_test_clicked_handler_id_ = g_signal_connect(
+        start_silence_test, "clicked", G_CALLBACK(+[](
+            GtkButton*, gpointer user_data) {
+            gtk_dialog_response(GTK_DIALOG(user_data), RESPONSE_TEST_SILENCE);
+        }), dialog);
+
     const bool appimage_runtime = is_appimage_runtime();
     engine_.refresh_realtime_priority_status();
     const RealtimePriorityStatusSnapshot rt_status_snapshot =
@@ -10750,6 +10795,13 @@ void GtkPlayerWindow::open_settings_dialog() {
     gtk_widget_set_vexpand(advanced_section, FALSE);
     gtk_widget_set_valign(advanced_section, GTK_ALIGN_START);
     gtk_box_pack_start(GTK_BOX(advanced_section), advanced_title, FALSE, FALSE, 0);
+    // Share the precision form columns; the grid's 8 px row spacing
+    // supplies both separator boundaries without extra widget margins.
+    GtkWidget* silence_sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_widget_set_hexpand(silence_sep, TRUE);
+    gtk_grid_attach(GTK_GRID(precision_grid), silence_sep, 0, 6, 2, 1);
+    gtk_grid_attach(GTK_GRID(precision_grid), lbl_start_silence, 0, 7, 1, 1);
+    gtk_grid_attach(GTK_GRID(precision_grid), start_silence_controls, 1, 7, 1, 1);
     gtk_box_pack_start(GTK_BOX(advanced_section), precision_grid, FALSE, FALSE, 0);
 
     GtkWidget* realtime_section = gtk_box_new(GTK_ORIENTATION_VERTICAL, kGuiRowSpacing);
@@ -10943,6 +10995,9 @@ void GtkPlayerWindow::open_settings_dialog() {
                       : std::string("direct"));
         const gchar* alsa24_id = gtk_combo_box_get_active_id(GTK_COMBO_BOX(alsa_24_combo));
         alsa_24bit_container_mode_ = normalize_alsa_24bit_mode_id(alsa24_id != nullptr ? std::string(alsa24_id) : std::string("auto"));
+        gtk_spin_button_update(GTK_SPIN_BUTTON(start_silence_spin));
+        start_silence_ms_ = static_cast<unsigned>(
+            gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(start_silence_spin)));
         const auto selected_precision = [](GtkWidget* combo_box) {
             const gchar* id = gtk_combo_box_get_active_id(GTK_COMBO_BOX(combo_box));
             return normalize_output_precision_id(
@@ -11059,10 +11114,64 @@ void GtkPlayerWindow::open_settings_dialog() {
             apply_settings_from_dialog();
             break;
         }
+        if (response == RESPONSE_TEST_SILENCE) {
+            const bool testing_active = start_silence_test_generation_ != 0 &&
+                start_silence_test_generation_ == engine_.transport_generation() &&
+                engine_.is_playing();
+            const bool testing_pending = pending_metadata_playback_valid() &&
+                pending_metadata_playback_.test_start_silence_ms.has_value();
+            if (testing_active || testing_pending) {
+                stop_playback();
+            } else if (playback_available()) {
+                gtk_spin_button_update(GTK_SPIN_BUTTON(start_silence_spin));
+                test_start_silence_ms_ = static_cast<unsigned>(
+                    gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(start_silence_spin)));
+                // The regular transport starts the selected track with a temporary value.
+                cancel_pending_last_active_track_restore_for_user_action();
+                start_current_track(false);
+                test_start_silence_ms_.reset();
+                if (engine_.is_playing()) {
+                    start_silence_test_generation_ = engine_.transport_generation();
+                }
+            }
+            refresh_start_silence_test_button();
+            continue;
+        }
         break;
     }
 
+    start_silence_test_button_ = nullptr;
+    start_silence_test_clicked_handler_id_ = 0;
+    start_silence_test_generation_ = 0;
+    test_start_silence_ms_.reset();
     gtk_widget_destroy(dialog);
+}
+
+void GtkPlayerWindow::refresh_start_silence_test_button() {
+    if (start_silence_test_button_ == nullptr) return;
+    const bool transport_testing = start_silence_test_generation_ != 0 &&
+        start_silence_test_generation_ == engine_.transport_generation() &&
+        engine_.is_playing();
+    const bool pending_testing = pending_metadata_playback_valid() &&
+        pending_metadata_playback_.test_start_silence_ms.has_value();
+    const bool testing = transport_testing || pending_testing;
+    if (!transport_testing) start_silence_test_generation_ = 0;
+    // GTK may emit "clicked" from set_active(); do not dispatch Test/Stop
+    // while synchronizing the button with transport state.
+    if (gtk_toggle_button_get_active(
+            GTK_TOGGLE_BUTTON(start_silence_test_button_)) != (testing ? TRUE : FALSE)) {
+        g_signal_handler_block(start_silence_test_button_,
+                               start_silence_test_clicked_handler_id_);
+        gtk_toggle_button_set_active(
+            GTK_TOGGLE_BUTTON(start_silence_test_button_), testing ? TRUE : FALSE);
+        g_signal_handler_unblock(start_silence_test_button_,
+                                 start_silence_test_clicked_handler_id_);
+    }
+    gtk_widget_set_tooltip_text(start_silence_test_button_, testing
+        ? "Stop test playback."
+        : "Play selected track with this value.");
+    gtk_widget_set_sensitive(start_silence_test_button_,
+                             (testing || !playlist_.empty()) ? TRUE : FALSE);
 }
 
 void GtkPlayerWindow::open_about_dialog() {
@@ -11096,7 +11205,7 @@ void GtkPlayerWindow::open_about_dialog() {
     }
 
     GtkWidget* title = gtk_label_new(nullptr);
-    gtk_label_set_markup(GTK_LABEL(title), "<b>PCM Transport 0.9.120</b>");
+    gtk_label_set_markup(GTK_LABEL(title), "<b>PCM Transport 0.9.121</b>");
     gtk_label_set_xalign(GTK_LABEL(title), 0.5f);
     GtkWidget* subtitle = gtk_label_new("Digital Audio Player");
     gtk_label_set_xalign(GTK_LABEL(subtitle), 0.5f);
@@ -11500,7 +11609,7 @@ void GtkPlayerWindow::open_bitperfect_test_dialog(GtkWidget* parent_dialog, int 
                 return;
             }
             post_diagnostics_update(text_view, progress, close_button,
-                "PCM Transport FLAC bit-perfect test\nVersion: 0.9.120\nScope: native libFLAC path before ALSA; resampling excluded\nFFmpeg API: not used\n", 0.02, false);
+                "PCM Transport FLAC bit-perfect test\nVersion: 0.9.121\nScope: native libFLAC path before ALSA; resampling excluded\nFFmpeg API: not used\n", 0.02, false);
             std::ostringstream ctx;
             ctx << "Duration: " << duration_seconds << " sec\n"
                 << "Generated signal: deterministic 16-bit / 44.1 kHz / stereo stress pattern\n"
@@ -12715,6 +12824,7 @@ void GtkPlayerWindow::refresh_display(const PlaybackStatusSnapshot& status,
         return;
     }
 
+    refresh_start_silence_test_button();
     refresh_stereo_tonal_dsp_controls(status.playing, status.format.channels);
     refresh_tone_dsp_signal_path_state(status);
 
@@ -14412,6 +14522,12 @@ void GtkPlayerWindow::load_preferences() {
             treble_shelf_hz_ = tone::clamp_treble_hz(treble_shelf_hz_);
         } else if (key == "resample_quality") {
             resample_quality_ = value;
+        } else if (key == "start_silence_ms") {
+            try {
+                const int parsed = std::stoi(value);
+                start_silence_ms_ = static_cast<unsigned>(
+                    std::max(0, std::min(2000, parsed)));
+            } catch (...) {}
         } else if (key == "alsa_24bit_container_preference") {
             alsa_24bit_container_mode_ = normalize_alsa_24bit_mode_id(value);
         } else if (key == "output_precision_16bit_lossy") {
@@ -14543,6 +14659,7 @@ std::string GtkPlayerWindow::serialize_preferences() const {
     out << "bass_shelf_hz=" << bass_shelf_hz_ << '\n';
     out << "treble_shelf_hz=" << treble_shelf_hz_ << '\n';
     out << "resample_quality=" << resample_quality_ << '\n';
+    out << "start_silence_ms=" << start_silence_ms_ << '\n';
     out << "alsa_24bit_container_preference="
         << normalize_alsa_24bit_mode_id(alsa_24bit_container_mode_) << '\n';
     out << "output_precision_16bit_lossy="

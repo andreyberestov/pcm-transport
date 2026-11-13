@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.9.121
+
+- Added configurable ALSA startup silence (0–2000 ms) for playback and seek.
+- Added ALSA hardware pause/resume with software fallback.
+
 ## 0.9.120
 
 - Added typed NativeInt32, Float32 and selective Float64 PCM paths while preserving exact native integer playback.

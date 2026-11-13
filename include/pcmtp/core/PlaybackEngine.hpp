@@ -173,7 +173,8 @@ private:
     void clear_pending_playback_events() noexcept;
     RealtimePriorityStatusSnapshot verified_realtime_priority_status(long tid) const;
     static void format_realtime_priority_status(RealtimePriorityStatusSnapshot& status);
-    void wait_if_paused();
+    bool wait_if_paused();
+    bool write_pending_start_silence();
     void set_error(const std::string& message);
     void join_threads();
 

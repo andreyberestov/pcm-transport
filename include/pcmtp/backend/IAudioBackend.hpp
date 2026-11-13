@@ -54,6 +54,15 @@ public:
     virtual std::size_t write_samples(const PcmBlock& samples,
                                       std::size_t offset,
                                       std::size_t sample_count) = 0;
+    // One bounded startup-silence write. Returns true while silence remains.
+    // Called from the playback worker before the first musical PCM block.
+    virtual bool write_start_silence_chunk() { return false; }
+    // Invoked only by the playback worker, never concurrently with write_samples().
+    // False retains the existing software-pause behavior.
+    virtual bool pause_device() { return false; }
+    virtual void resume_device() {}
+    virtual void resume_software_pause() {}
+    virtual void log_transport_state(const char*) {}
     virtual void drain() = 0;
     virtual void close() = 0;
     virtual std::string active_output_report() const { return std::string(); }

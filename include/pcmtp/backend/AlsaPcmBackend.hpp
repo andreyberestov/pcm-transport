@@ -4,6 +4,7 @@
 #pragma once
 
 #include <alsa/asoundlib.h>
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -46,11 +47,17 @@ public:
     std::size_t write_samples(const PcmBlock& samples,
                               std::size_t offset,
                               std::size_t sample_count) override;
+    bool write_start_silence_chunk() override;
+    bool pause_device() override;
+    void resume_device() override;
+    void resume_software_pause() override;
+    void log_transport_state(const char* event) override;
     void drain() override;
     void close() override;
     std::string active_output_report() const override;
 
     void set_24bit_container_mode(Alsa24BitContainerMode mode);
+    void set_start_silence_ms(unsigned milliseconds);
 
     static AlsaProbeMatrix probe_device_format_matrix(
         const std::string& device_name,
@@ -70,6 +77,23 @@ private:
     std::vector<std::int32_t> scratch_s32_;
     std::vector<std::int16_t> scratch_s16_;
     std::vector<unsigned char> scratch_s24_;
+    std::vector<unsigned char> scratch_start_silence_;
+    unsigned start_silence_ms_ = 0;
+    std::uint64_t start_silence_total_frames_ = 0;
+    std::uint64_t start_silence_remaining_frames_ = 0;
+    bool start_silence_started_ = false;
+    unsigned start_silence_recoveries_ = 0;
+    bool hw_pause_supported_ = false;
+    bool hw_pause_active_ = false;
+    bool software_resume_check_pending_ = false;
+    bool diagnostic_enabled_ = false;
+    std::uint64_t diagnostic_session_id_ = 0;
+    bool diagnostic_first_write_attempted_ = false;
+    bool diagnostic_first_write_succeeded_ = false;
+    std::uint64_t diagnostic_epipe_count_ = 0;
+    std::uint64_t diagnostic_suspend_count_ = 0;
+    std::chrono::steady_clock::time_point diagnostic_open_started_at_{};
+    std::chrono::steady_clock::time_point diagnostic_open_ready_at_{};
 };
 
 } // namespace pcmtp

@@ -1,4 +1,4 @@
-# PCM Transport v0.9.120
+# PCM Transport v0.9.121
 
 **PCM Transport** is a Linux desktop audio player focused on direct PCM playback, predictable DSP, and clear signal-path reporting.
 

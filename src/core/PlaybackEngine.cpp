@@ -766,6 +766,7 @@ void PlaybackEngine::pause() {
     if (!snapshot_.playing) {
         return;
     }
+    Logger::instance().debug("Playback transport: Pause requested");
     pause_requested_.store(true, std::memory_order_release);
     meter_transport_active_.store(false, std::memory_order_release);
     snapshot_.paused = true;
@@ -778,6 +779,7 @@ void PlaybackEngine::resume() {
         if (!snapshot_.playing) {
             return;
         }
+        Logger::instance().debug("Playback transport: Resume requested");
         pause_requested_.store(false, std::memory_order_release);
         meter_transport_active_.store(true, std::memory_order_release);
         snapshot_.paused = false;
@@ -1815,8 +1817,9 @@ void PlaybackEngine::playback_loop(std::uint64_t transport_generation) {
                 ? pre_eq_headroom_tenths_db_.load(std::memory_order_relaxed)
                 : 0};
         ToneFilterCrossfade tone_filter(format_.sample_rate, initial_tone_target);
+        bool first_music_write_pending = true;
         while (!stop_requested_ && !decoder_->eof()) {
-            wait_if_paused();
+            const bool software_resumed_before_decode = wait_if_paused();
             if (stop_requested_) break;
 
             block.clear();
@@ -2217,7 +2220,22 @@ void PlaybackEngine::playback_loop(std::uint64_t transport_generation) {
             const PcmBlock& backend_block = use_output_block
                 ? output_block
                 : block;
+            // Prime once on a new PCM stream, and again only after a software
+            // Resume. Ordinary musical blocks never query ALSA pre-roll state.
+            const bool software_resumed_before_write = wait_if_paused();
+            if (stop_requested_.load(std::memory_order_acquire)) break;
+            if (first_music_write_pending || software_resumed_before_decode ||
+                software_resumed_before_write) {
+                do {
+                    if (!write_pending_start_silence()) break;
+                    // A pause immediately before the first music write may
+                    // require re-priming after a software XRUN recovery.
+                } while (wait_if_paused() &&
+                         !stop_requested_.load(std::memory_order_acquire));
+                if (stop_requested_.load(std::memory_order_acquire)) break;
+            }
             backend_->write_samples(backend_block, 0, got);
+            first_music_write_pending = false;
 
             // Publish visualization facts only after the PCM block has been
             // accepted by the output backend.  The GUI owns the display
@@ -2354,10 +2372,39 @@ void PlaybackEngine::playback_loop(std::uint64_t transport_generation) {
         expected_tid, 0, std::memory_order_relaxed);
 }
 
-void PlaybackEngine::wait_if_paused() {
-    if (!pause_requested_) return;
+bool PlaybackEngine::write_pending_start_silence() {
+    // The worker owns ALSA. Pause and Stop remain interruptible between
+    // bounded PCM writes; the backend owns the remaining-silence count.
+    while (!stop_requested_.load(std::memory_order_acquire)) {
+        wait_if_paused();
+        if (stop_requested_.load(std::memory_order_acquire)) return false;
+        if (!backend_->write_start_silence_chunk()) return true;
+    }
+    return false;
+}
+
+bool PlaybackEngine::wait_if_paused() {
+    if (!pause_requested_.load(std::memory_order_acquire) ||
+        stop_requested_.load(std::memory_order_acquire)) return false;
+    // The playback worker owns every ALSA state transition and PCM write.
+    // Do not hold pause_mutex_ while calling the backend.
+    const bool hardware_paused = backend_ != nullptr && backend_->pause_device();
+    if (backend_) backend_->log_transport_state(
+        hardware_paused ? "pause_wait_hardware" : "pause_wait_software");
     std::unique_lock<std::mutex> lock(pause_mutex_);
     pause_cv_.wait(lock, [this]() { return !pause_requested_ || stop_requested_; });
+    lock.unlock();
+    if (stop_requested_.load(std::memory_order_acquire)) return false;
+    if (backend_) {
+        if (hardware_paused) {
+            backend_->resume_device();
+        } else {
+            backend_->resume_software_pause();
+        }
+        backend_->log_transport_state(
+            hardware_paused ? "resume_worker_hardware" : "resume_worker_software");
+    }
+    return !hardware_paused;
 }
 void PlaybackEngine::set_error(const std::string& message) {
     meter_transport_active_.store(false, std::memory_order_release);

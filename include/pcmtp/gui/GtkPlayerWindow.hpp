@@ -228,6 +228,7 @@ private:
         bool update_mpris_track = true;
         bool preserve_explicit_selection = false;
         PlaybackStartReason start_reason = PlaybackStartReason::Manual;
+        std::optional<unsigned> test_start_silence_ms;
         std::string waiting_path;
     };
 
@@ -415,6 +416,7 @@ private:
     void open_file_dialog();
     void open_directory_dialog();
     void open_settings_dialog();
+    void refresh_start_silence_test_button();
     void open_about_dialog();
     void open_eq_dialog();
     void open_alsamixer_for_current_device();
@@ -888,6 +890,11 @@ private:
     gulong playlist_key_press_handler_id_ = 0;
     gulong playlist_focus_in_handler_id_ = 0;
     std::string alsa_24bit_container_mode_ = "auto";
+    unsigned start_silence_ms_ = 0;
+    std::optional<unsigned> test_start_silence_ms_;
+    GtkWidget* start_silence_test_button_ = nullptr; // Owned by the settings dialog.
+    gulong start_silence_test_clicked_handler_id_ = 0;
+    std::uint64_t start_silence_test_generation_ = 0;
     std::string output_precision_16bit_lossy_ = "auto";
     std::string output_precision_24bit_ = "auto";
     std::string output_precision_32bit_ = "auto";
